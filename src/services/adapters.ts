@@ -2,14 +2,24 @@
  * Modular Service Adapters (Quackathon — PES Hackathon Team Finder)
  *
  * Clearly separates:
- * - Demo Mode deterministic simulations (explicitly labeled as Demo Mode)
+ * - Demo Mode deterministic simulations (explicitly labeled as Demo Mode, never reported as live API calls)
  * - Live API Mode client calls to the Express backend (/api/github/fetch, /api/gemini/extract-profile,
  *   /api/events/extract-url, /api/events/extract-file, /api/events/verify-url, /api/pesu-oauth/*)
- *
- * Never reports simulated responses as successful live API calls.
  */
 
-import { CampusType, EventCandidate, EventType, ProfileEvidenceDraft } from '../types/domain';
+import {
+  CampusType,
+  EventCandidate,
+  EventType,
+  ProfileEvidenceDraft,
+} from '../types/domain';
+import {
+  DeveloperDiagnosticTelemetry,
+  ExtractEventFileResponse,
+  ExtractEventUrlResponse,
+  ExtractionMethodUsed,
+  VerifyUrlResponse,
+} from '../types/apiContracts';
 
 const ALLOWED_PUBLIC_EVENT_HOSTS = [
   'events.pes.edu',
@@ -110,7 +120,7 @@ export function validateSubmittedEventUrl(rawInput: string): UrlValidationResult
       allowed: true,
       normalizedUrl: parsed.toString(),
       host: hostname,
-      blockedReason: `Host "${hostname}" is not on the Demo Mode allowlist. Switch to Live API Mode to fetch public metadata from any safe HTTPS host, or fill event fields manually.`,
+      blockedReason: `Host "${hostname}" is not on the Demo Mode allowlist. Switch to Live Test Mode to fetch public metadata from any safe HTTPS host, or fill event fields manually.`,
       requiresManualEntryFallback: true,
     };
   }
@@ -211,6 +221,7 @@ export function classifyEventCandidateText(params: {
  * DEMO MODE ONLY: Simulates deterministic public metadata preview for preset test URLs.
  */
 export function extractPublicEventPreview(rawUrl: string): {
+  isLiveApiResult: false;
   validation: UrlValidationResult;
   draft: Partial<EventCandidate>;
   warnings: string[];
@@ -218,6 +229,7 @@ export function extractPublicEventPreview(rawUrl: string): {
   const validation = validateSubmittedEventUrl(rawUrl);
   if (!validation.allowed || validation.requiresManualEntryFallback) {
     return {
+      isLiveApiResult: false,
       validation,
       draft: {
         source: 'submitted_public_url',
@@ -246,6 +258,7 @@ export function extractPublicEventPreview(rawUrl: string): {
       maxTeamSize: null,
     });
     return {
+      isLiveApiResult: false,
       validation,
       draft: {
         source: 'submitted_public_url',
@@ -283,6 +296,7 @@ export function extractPublicEventPreview(rawUrl: string): {
 
   if (lowerUrl.includes('unstop.com')) {
     return {
+      isLiveApiResult: false,
       validation,
       draft: {
         source: 'submitted_public_url',
@@ -325,6 +339,7 @@ export function extractPublicEventPreview(rawUrl: string): {
   }
 
   return {
+    isLiveApiResult: false,
     validation,
     draft: {
       source: 'submitted_public_url',
@@ -360,8 +375,46 @@ export function extractPublicEventPreview(rawUrl: string): {
         reason: 'Verified 24h team buildathon with explicit 2–4 team size bounds.',
       },
     },
-    warnings: ['[Demo Mode] Preview generated from synthetic preset. Switch to Live API Mode to fetch real URLs.'],
+    warnings: ['[Demo Mode] Preview generated from synthetic preset. Switch to Live Test Mode to fetch real URLs.'],
   };
+}
+
+/**
+ * LIVE API MODE: Calls server-side /api/events/verify-url using the shared VerifyUrlResponse contract.
+ */
+export async function verifyLiveEventUrl(rawUrl: string): Promise<VerifyUrlResponse> {
+  const start = Date.now();
+  try {
+    const resp = await fetch('/api/events/verify-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: rawUrl }),
+    });
+    const data = (await resp.json()) as VerifyUrlResponse;
+    return data;
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      live: true,
+      status: 'broken',
+      httpStatus: 0,
+      submittedUrl: rawUrl,
+      finalUrl: null,
+      canonicalUrl: null,
+      verifiedCanonicalUrl: null,
+      redirectChain: [],
+      userMessage: 'Network error while verifying event URL.',
+      error: err instanceof Error ? err.message : String(err),
+      errorCategory: 'NETWORK_ERROR',
+      diagnostics: {
+        serviceName: 'event_url_extractor',
+        httpStatus: 0,
+        errorCategory: 'NETWORK_ERROR',
+        retryAttempts: 0,
+        durationMs: Date.now() - start,
+      },
+    };
+  }
 }
 
 /**
@@ -369,10 +422,13 @@ export function extractPublicEventPreview(rawUrl: string): {
  */
 export async function extractLiveEventUrlMetadata(rawUrl: string): Promise<{
   ok: boolean;
+  isLiveApiResult: true;
   draft?: Partial<EventCandidate>;
   warnings: string[];
   errorMessage?: string;
   redirectChain?: string[];
+  extractionMethod?: ExtractionMethodUsed;
+  diagnostics?: DeveloperDiagnosticTelemetry;
 }> {
   try {
     const resp = await fetch('/api/events/extract-url', {
@@ -380,24 +436,29 @@ export async function extractLiveEventUrlMetadata(rawUrl: string): Promise<{
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: rawUrl, useGeminiFallback: true }),
     });
-    const data = await resp.json();
+    const payload = (await resp.json()) as ExtractEventUrlResponse;
 
-    if (!resp.ok || !data.ok) {
+    if (!resp.ok || !payload.ok) {
       return {
         ok: false,
-        warnings: [],
-        errorMessage: data.message ?? `Server returned HTTP ${resp.status}`,
-        redirectChain: data.redirectChain,
+        isLiveApiResult: true,
+        warnings: payload.warnings ?? [],
+        errorMessage:
+          payload.userMessage ?? `Could not retrieve event page (HTTP ${resp.status}).`,
+        redirectChain: payload.redirectChain,
+        extractionMethod: payload.extractionMethod,
+        diagnostics: payload.diagnostics,
       };
     }
 
-    const det = data.deterministic ?? {};
-    const ai = data.aiSupplement ?? {};
+    const d = payload.data;
+    const det = payload.deterministic ?? {};
+    const ai = payload.aiSupplement ?? {};
 
-    const title = ai.title || det.title || '';
-    const description = det.description || '';
-    const minTeam = ai.minTeamSize ?? det.minTeamSize ?? null;
-    const maxTeam = ai.maxTeamSize ?? det.maxTeamSize ?? null;
+    const title = d?.title ?? ai.title ?? det.title ?? '';
+    const description = d?.description ?? det.description ?? '';
+    const minTeam = d?.minTeamSize ?? ai.minTeamSize ?? det.minTeamSize ?? null;
+    const maxTeam = d?.maxTeamSize ?? ai.maxTeamSize ?? det.maxTeamSize ?? null;
 
     const cls = classifyEventCandidateText({
       title: title || 'Extracted Event',
@@ -406,56 +467,62 @@ export async function extractLiveEventUrlMetadata(rawUrl: string): Promise<{
       maxTeamSize: maxTeam,
     });
 
-    const warnings: string[] = [...(data.warnings ?? [])];
+    const warnings: string[] = [...(payload.warnings ?? [])];
     if (minTeam === null || maxTeam === null) {
       warnings.push(
         'Team size (min/max) was not explicitly found on the source page and remains unconfirmed (null).'
       );
     }
 
+    const resolvedCanonical =
+      payload.verifiedCanonicalUrl ?? payload.canonicalUrl ?? payload.finalUrl ?? rawUrl;
+
     return {
       ok: true,
-      redirectChain: data.redirectChain,
+      isLiveApiResult: true,
+      redirectChain: payload.redirectChain,
+      extractionMethod: payload.extractionMethod,
+      diagnostics: payload.diagnostics,
       warnings,
       draft: {
         source: 'submitted_public_url',
-        sourceUrl: data.verifiedCanonicalUrl ?? rawUrl,
-        originalSubmissionUrl: data.submittedUrl ?? rawUrl,
-        verifiedCanonicalUrl: data.verifiedCanonicalUrl ?? rawUrl,
+        sourceUrl: resolvedCanonical,
+        originalSubmissionUrl: payload.submittedUrl ?? rawUrl,
+        verifiedCanonicalUrl: resolvedCanonical,
         sourceUrlStatus:
-          (data.redirectChain?.length ?? 0) > 1 ? 'redirected_valid' : 'verified',
+          (payload.redirectChain?.length ?? 0) > 1 ? 'redirected_valid' : 'verified',
         title,
-        organizer: ai.organizer || det.organizer || '',
-        eventType: (ai.eventType as EventType) || cls.eventType,
+        organizer: d?.organizer ?? ai.organizer ?? det.organizer ?? '',
+        eventType: (d?.eventType as EventType) ?? cls.eventType,
         matchable: cls.matchable,
         themes:
-          Array.isArray(ai.themes) && ai.themes.length > 0
-            ? ai.themes
-            : ['Applied AI/ML', 'Web/Mobile'],
+          Array.isArray(d?.themes) && d.themes.length > 0
+            ? d.themes
+            : ['Applied AI/ML', 'Developer Tools'],
         description,
-        startAt: ai.startAt ?? det.startAt ?? null,
-        endAt: ai.endAt ?? det.endAt ?? null,
-        registrationDeadline: ai.registrationDeadline ?? null,
+        startAt: d?.startAt ?? ai.startAt ?? det.startAt ?? null,
+        endAt: d?.endAt ?? ai.endAt ?? det.endAt ?? null,
+        registrationDeadline: d?.registrationDeadline ?? ai.registrationDeadline ?? null,
         timezone: 'Asia/Kolkata',
         venue: {
-          campus: (ai.campus as CampusType) ?? null,
-          name: ai.venueName ?? null,
+          campus: (d?.campus as CampusType) ?? null,
+          name: d?.venueName ?? null,
         },
-        format: ai.format ?? 'unknown',
+        format: d?.format ?? 'unknown',
         teamSize: {
           min: minTeam,
           max: maxTeam,
         },
-        registrationUrl: ai.registrationUrl ?? data.verifiedCanonicalUrl ?? null,
-        eligibilityNotes: ai.eligibilityNotes ?? null,
+        registrationUrl: d?.registrationUrl ?? resolvedCanonical ?? null,
+        eligibilityNotes: d?.eligibilityNotes ?? null,
         fieldEvidence: {
           source: [
             {
-              sourceUrl: data.verifiedCanonicalUrl ?? rawUrl,
+              sourceUrl: resolvedCanonical,
               excerpt:
-                ai.evidenceQuote ??
+                d?.extractedTextEvidence ??
                 det.teamSizeExcerpt ??
-                `Fetched live from ${data.verifiedCanonicalUrl ?? rawUrl}`,
+                `Fetched live from ${resolvedCanonical}`,
             },
           ],
         },
@@ -469,10 +536,11 @@ export async function extractLiveEventUrlMetadata(rawUrl: string): Promise<{
   } catch (err: unknown) {
     return {
       ok: false,
+      isLiveApiResult: true,
       warnings: [],
-      errorMessage: `Network error calling /api/events/extract-url: ${
+      errorMessage: `Could not connect to server to extract URL metadata (${
         err instanceof Error ? err.message : String(err)
-      }`,
+      }).`,
     };
   }
 }
@@ -486,9 +554,13 @@ export async function extractLiveEventFileMetadata(file: {
   base64Data: string;
 }): Promise<{
   ok: boolean;
+  isLiveApiResult: true;
+  fileAccepted: boolean;
+  extractionMethod?: ExtractionMethodUsed;
   draft?: Partial<EventCandidate>;
   warnings: string[];
   errorMessage?: string;
+  diagnostics?: DeveloperDiagnosticTelemetry;
 }> {
   try {
     const resp = await fetch('/api/events/extract-file', {
@@ -496,17 +568,23 @@ export async function extractLiveEventFileMetadata(file: {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(file),
     });
-    const payload = await resp.json();
+    const payload = (await resp.json()) as ExtractEventFileResponse;
 
     if (!resp.ok || !payload.ok) {
       return {
         ok: false,
-        warnings: [],
-        errorMessage: payload.message ?? `Upload extraction failed (HTTP ${resp.status})`,
+        isLiveApiResult: true,
+        fileAccepted: Boolean(payload.fileAccepted),
+        extractionMethod: payload.extractionMethod,
+        warnings: payload.warnings ?? [],
+        errorMessage:
+          payload.userMessage ??
+          "AI extraction is temporarily unavailable. Your poster was accepted, but its details couldn't be extracted. Retry extraction or enter the information manually.",
+        diagnostics: payload.diagnostics,
       };
     }
 
-    const d = payload.data ?? {};
+    const d = payload.data!;
     const minTeam = typeof d.minTeamSize === 'number' ? d.minTeamSize : null;
     const maxTeam = typeof d.maxTeamSize === 'number' ? d.maxTeamSize : null;
 
@@ -517,14 +595,13 @@ export async function extractLiveEventFileMetadata(file: {
       maxTeamSize: maxTeam,
     });
 
-    const warnings: string[] = [];
-    if (minTeam === null || maxTeam === null) {
-      warnings.push('Team size bounds were not found in the uploaded file and remain null.');
-    }
-
     return {
       ok: true,
-      warnings,
+      isLiveApiResult: true,
+      fileAccepted: true,
+      extractionMethod: payload.extractionMethod,
+      warnings: payload.warnings ?? [],
+      diagnostics: payload.diagnostics,
       draft: {
         source: 'uploaded_brochure_or_poster',
         originalSubmissionUrl: d.officialSourceUrl ?? null,
@@ -534,7 +611,7 @@ export async function extractLiveEventFileMetadata(file: {
           fileName: payload.fileName,
           mimeType: payload.mimeType,
           byteSize: payload.byteSize,
-          extractedEvidenceQuote: d.extractedTextEvidence,
+          extractedEvidenceQuote: d.extractedTextEvidence ?? undefined,
         },
         title: d.title ?? '',
         organizer: d.organizer ?? '',
@@ -575,10 +652,18 @@ export async function extractLiveEventFileMetadata(file: {
   } catch (err: unknown) {
     return {
       ok: false,
+      isLiveApiResult: true,
+      fileAccepted: true,
       warnings: [],
-      errorMessage: `File extraction request failed: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      errorMessage:
+        "AI extraction is temporarily unavailable. Your poster was accepted, but its details couldn't be extracted. Retry extraction or enter the information manually.",
+      diagnostics: {
+        serviceName: 'file_processor',
+        httpStatus: 0,
+        errorCategory: 'NETWORK_ERROR',
+        retryAttempts: 0,
+        durationMs: 0,
+      },
     };
   }
 }
@@ -642,7 +727,7 @@ export function runBoundedGitHubEnrichmentDraft(params: {
     sourceUrl: `https://github.com/${cleanUser}`,
     repoName: `${cleanUser} (Demo Simulation)`,
     rawEvidenceSummary:
-      '[Demo Mode] Simulated public repository metadata. Switch to Live API Mode to fetch your actual GitHub repositories and run real Gemini extraction.',
+      '[Demo Mode] Simulated public repository metadata. Switch to Live Test Mode to fetch your actual GitHub repositories and run real Gemini extraction.',
     suggestedSkills: [
       {
         name: 'TypeScript',
@@ -687,9 +772,11 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
   githubUsername: string;
 }): Promise<{
   ok: boolean;
+  isLiveApiResult: true;
   draft?: ProfileEvidenceDraft;
   errorMessage?: string;
   githubRateLimit?: { remaining?: string | null; limit?: string | null };
+  diagnostics?: DeveloperDiagnosticTelemetry;
 }> {
   // Step 1: Call real GitHub REST API via server
   const ghResp = await fetch('/api/github/fetch', {
@@ -702,8 +789,11 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
   if (!ghResp.ok || !ghJson.ok) {
     return {
       ok: false,
-      errorMessage: ghJson.message ?? `GitHub fetch failed (HTTP ${ghResp.status})`,
+      isLiveApiResult: true,
+      errorMessage:
+        ghJson.userMessage ?? ghJson.message ?? `GitHub fetch failed (HTTP ${ghResp.status})`,
       githubRateLimit: ghJson.rateLimit,
+      diagnostics: ghJson.diagnostics,
     };
   }
 
@@ -718,8 +808,13 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
   if (!geminiResp.ok || !geminiJson.ok) {
     return {
       ok: false,
-      errorMessage: geminiJson.message ?? `Gemini extraction failed (HTTP ${geminiResp.status})`,
+      isLiveApiResult: true,
+      errorMessage:
+        geminiJson.userMessage ??
+        geminiJson.message ??
+        `Gemini extraction failed (HTTP ${geminiResp.status})`,
       githubRateLimit: ghJson.rateLimit,
+      diagnostics: geminiJson.diagnostics,
     };
   }
 
@@ -762,7 +857,9 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
 
   return {
     ok: true,
+    isLiveApiResult: true,
     githubRateLimit: ghJson.rateLimit,
+    diagnostics: geminiJson.diagnostics,
     draft: {
       id: `live_draft_${Date.now()}`,
       uid: params.uid,
@@ -774,7 +871,9 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
         ghJson.repositories?.length ?? 0
       } non-fork repositories (${
         ghJson.profile?.publicReposCount ?? 0
-      } total public repos) and extracted structured suggestions via Gemini (gemini-4-hydrogen).`,
+      } total public repos) and extracted structured suggestions via Gemini (${
+        geminiJson.model ?? 'configured model'
+      }).`,
       suggestedSkills: skills,
       suggestedProjects: projects,
       suggestedProject: primaryProject,

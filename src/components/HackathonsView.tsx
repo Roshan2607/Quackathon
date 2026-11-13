@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
+  Code2,
   ExternalLink,
   FileSearch,
   FileText,
@@ -10,9 +11,9 @@ import {
   Loader2,
   Lock,
   Plus,
+  RefreshCw,
   Search,
   ShieldAlert,
-  Sparkles,
   Upload,
   Users,
 } from 'lucide-react';
@@ -25,6 +26,7 @@ import {
   PrivateAcademyHint,
   User,
 } from '../types/domain';
+import { DeveloperDiagnosticTelemetry } from '../types/apiContracts';
 import {
   classifyEventCandidateText,
   extractLiveEventFileMetadata,
@@ -93,6 +95,51 @@ function createSamplePosterDataUrl(): {
   };
 }
 
+/**
+ * Generates a valid PDF brochure containing embedded selectable text (`BT ... ET`)
+ * so the server-side deterministic PDF text parser can extract fields without calling Gemini.
+ */
+function createSamplePdfBrochurePayload(): {
+  fileName: string;
+  mimeType: string;
+  base64Data: string;
+} {
+  const pdfContent = `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 495 >>
+stream
+BT
+(Title: PES Autonomous Systems & AI Buildathon 2026) Tj
+(Organizer: PES Robotics & AI Society) Tj
+(Start Date: 2026-11-21) Tj
+(End Date: 2026-11-22) Tj
+(Registration Deadline: 2026-11-18) Tj
+(Venue: MRD Auditorium, RR Campus, Bengaluru) Tj
+(Team Size: 2 to 4 members per team) Tj
+(Eligibility: Open to all B.Tech students across RR and EC campuses) Tj
+(Tracks: Applied AI/ML, Robotics/Edge Hardware, Developer Tools) Tj
+(Official Website: https://events.pes.edu/11515/) Tj
+ET
+endstream
+endobj
+%%EOF`;
+  const base64Data = `data:application/pdf;base64,${window.btoa(pdfContent)}`;
+  return {
+    fileName: 'PES_Autonomous_Systems_Brochure_2026.pdf',
+    mimeType: 'application/pdf',
+    base64Data,
+  };
+}
+
 export const HackathonsView: React.FC<HackathonsViewProps> = ({
   currentUser,
   executionMode,
@@ -115,13 +162,21 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   const [isExtracting, setIsExtracting] = useState(false);
   const [previewWarnings, setPreviewWarnings] = useState<string[]>([]);
   const [extractionError, setExtractionError] = useState<string | null>(null);
+  const [extractionDiagnostics, setExtractionDiagnostics] =
+    useState<DeveloperDiagnosticTelemetry | null>(null);
+  const [showDiagnosticsDrawer, setShowDiagnosticsDrawer] = useState(false);
 
-  // Uploaded file state
+  // Uploaded file state + preserved payload for 1-click Retry without re-uploading
   const [uploadedFileMeta, setUploadedFileMeta] = useState<{
     fileName: string;
     mimeType: string;
     byteSize: number;
     extractedEvidenceQuote?: string;
+  } | null>(null);
+  const [lastUploadedPayload, setLastUploadedPayload] = useState<{
+    fileName: string;
+    mimeType: string;
+    base64Data: string;
   } | null>(null);
 
   // Editable Preview Fields (Requirement #3)
@@ -194,17 +249,22 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   };
 
   const handleRunUrlPreview = async (targetUrl?: string, forceMode?: ExecutionMode) => {
+    if (isExtracting) return;
     const urlToTest = targetUrl ?? urlInput;
     if (targetUrl) setUrlInput(targetUrl);
     const activeMode = forceMode ?? executionMode;
 
     setExtractionError(null);
+    setExtractionDiagnostics(null);
     setPreviewWarnings([]);
     setIsExtracting(true);
 
     try {
       if (activeMode === 'live') {
         const liveRes = await extractLiveEventUrlMetadata(urlToTest);
+        if (liveRes.diagnostics) {
+          setExtractionDiagnostics(liveRes.diagnostics);
+        }
         if (!liveRes.ok || !liveRes.draft) {
           setExtractionError(
             liveRes.errorMessage ?? 'Could not extract live metadata. You can still enter fields manually below.'
@@ -227,7 +287,9 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   };
 
   const handleFileUpload = async (file: File) => {
+    if (isExtracting) return;
     setExtractionError(null);
+    setExtractionDiagnostics(null);
     setPreviewWarnings([]);
 
     if (!ALLOWED_UPLOAD_TYPES.includes(file.type)) {
@@ -261,13 +323,20 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
     mimeType: string;
     base64Data: string;
   }) => {
+    if (isExtracting) return;
+    setLastUploadedPayload(payload);
     setIsExtracting(true);
     setExtractionError(null);
+    setExtractionDiagnostics(null);
     try {
       const res = await extractLiveEventFileMetadata(payload);
+      if (res.diagnostics) {
+        setExtractionDiagnostics(res.diagnostics);
+      }
       if (!res.ok || !res.draft) {
         setExtractionError(
-          res.errorMessage ?? 'Could not extract from file automatically. You can fill the preview form manually.'
+          res.errorMessage ??
+            "AI extraction is temporarily unavailable. Your poster was accepted, but its details couldn't be extracted. Retry extraction or enter the information manually."
         );
         setUploadedFileMeta({
           fileName: payload.fileName,
@@ -291,7 +360,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
 
   const handleStageCandidate = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!draftTitle.trim()) return;
+    if (isExtracting || !draftTitle.trim()) return;
 
     const minVal = draftMinTeam.trim() ? Number(draftMinTeam) : null;
     const maxVal = draftMaxTeam.trim() ? Number(draftMaxTeam) : null;
@@ -884,22 +953,37 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                     Upload Event Brochure (PDF) or Poster (PNG, JPG, WebP · Max 10 MB)
                   </span>
                   <span className="text-slate-500">
-                    Uses Gemini multimodal extraction on the server. Missing fields remain explicitly blank/unconfirmed.
+                    PDFs with selectable text use deterministic zero-LLM extraction first; image posters use Gemini multimodal vision with bounded retry and fallback.
                   </span>
                 </div>
 
-                <button
-                  type="button"
-                  disabled={isExtracting}
-                  onClick={() => {
-                    const sample = createSamplePosterDataUrl();
-                    processUploadedFilePayload(sample);
-                  }}
-                  className="px-3 py-1.5 font-semibold text-blue-600 dark:text-blue-400 bg-white dark:bg-slate-900 border border-blue-200 dark:border-blue-800 rounded-lg cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5"
-                >
-                  <ImageIcon className="w-3.5 h-3.5" />
-                  Test with Sample Hackathon Poster
-                </button>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    disabled={isExtracting}
+                    onClick={() => {
+                      const samplePdf = createSamplePdfBrochurePayload();
+                      processUploadedFilePayload(samplePdf);
+                    }}
+                    className="px-3 py-1.5 font-semibold text-emerald-700 dark:text-emerald-300 bg-white dark:bg-slate-900 border border-emerald-200 dark:border-emerald-800 rounded-lg cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    Test Sample PDF (0 LLM Calls)
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isExtracting}
+                    onClick={() => {
+                      const sample = createSamplePosterDataUrl();
+                      processUploadedFilePayload(sample);
+                    }}
+                    className="px-3 py-1.5 font-semibold text-blue-600 dark:text-blue-400 bg-white dark:bg-slate-900 border border-blue-200 dark:border-blue-800 rounded-lg cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <ImageIcon className="w-3.5 h-3.5" />
+                    Test Sample Poster (Vision)
+                  </button>
+                </div>
               </div>
 
               <label className="flex flex-col items-center justify-center p-5 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl bg-white dark:bg-slate-950 hover:border-blue-500 transition-colors cursor-pointer">
@@ -914,6 +998,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                   type="file"
                   accept=".pdf,image/png,image/jpeg,image/webp"
                   className="hidden"
+                  disabled={isExtracting}
                   onChange={(e) => {
                     const f = e.target.files?.[0];
                     if (f) handleFileUpload(f);
@@ -922,20 +1007,36 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
               </label>
 
               {uploadedFileMeta && (
-                <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg flex items-center justify-between">
+                <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 text-emerald-900 dark:text-emerald-200">
                     <FileText className="w-4 h-4 text-emerald-600 shrink-0" />
                     <span>
                       Attached: <strong>{uploadedFileMeta.fileName}</strong> ({uploadedFileMeta.mimeType})
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setUploadedFileMeta(null)}
-                    className="text-slate-500 hover:text-red-600 underline cursor-pointer"
-                  >
-                    Remove
-                  </button>
+                  <div className="flex items-center gap-3">
+                    {lastUploadedPayload && (
+                      <button
+                        type="button"
+                        disabled={isExtracting}
+                        onClick={() => processUploadedFilePayload(lastUploadedPayload)}
+                        className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 font-semibold hover:underline cursor-pointer disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isExtracting ? 'animate-spin' : ''}`} />
+                        Retry Extraction
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUploadedFileMeta(null);
+                        setLastUploadedPayload(null);
+                      }}
+                      className="text-slate-500 hover:text-red-600 underline cursor-pointer"
+                    >
+                      Remove
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -943,12 +1044,69 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
 
           {/* Extraction Error or Policy Block Notice */}
           {extractionError && (
-            <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg flex items-start gap-2.5 text-xs text-red-800 dark:text-red-300">
-              <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
-              <div>
-                <span className="font-semibold block">Extraction / Security Gate Notice</span>
-                {extractionError}
+            <div className="p-3.5 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg space-y-2 text-xs text-red-800 dark:text-red-300">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-semibold block">Extraction Notice</span>
+                    <p className="mt-0.5">{extractionError}</p>
+                  </div>
+                </div>
+
+                {lastUploadedPayload && sourceTab === 'file' && (
+                  <button
+                    type="button"
+                    disabled={isExtracting}
+                    onClick={() => processUploadedFilePayload(lastUploadedPayload)}
+                    className="px-3 py-1.5 font-semibold text-white bg-red-700 hover:bg-red-800 rounded-lg inline-flex items-center gap-1.5 shrink-0 cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isExtracting ? 'animate-spin' : ''}`} />
+                    Retry Extraction
+                  </button>
+                )}
               </div>
+
+              {extractionDiagnostics && (
+                <div className="pt-2 border-t border-red-200/70 dark:border-red-800/70">
+                  <button
+                    type="button"
+                    onClick={() => setShowDiagnosticsDrawer((prev) => !prev)}
+                    className="inline-flex items-center gap-1 text-[11px] font-mono underline cursor-pointer"
+                  >
+                    <Code2 className="w-3.5 h-3.5" />
+                    {showDiagnosticsDrawer ? 'Hide Developer Diagnostics' : 'Show Developer Diagnostics'}
+                  </button>
+                  {showDiagnosticsDrawer && (
+                    <div className="mt-2 p-2.5 bg-white/90 dark:bg-slate-900/90 border border-red-200 dark:border-red-900 rounded font-mono text-[11px] text-slate-700 dark:text-slate-300 grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      <div>
+                        <span className="text-slate-400 block">Service:</span>
+                        {extractionDiagnostics.serviceName}
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block">HTTP Status:</span>
+                        {extractionDiagnostics.httpStatus}
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block">Error Category:</span>
+                        {extractionDiagnostics.errorCategory}
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block">Model Used:</span>
+                        {extractionDiagnostics.modelUsed ?? 'none (deterministic)'}
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block">Retry Attempts:</span>
+                        {extractionDiagnostics.retryAttempts}
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block">Duration / Request ID:</span>
+                        {extractionDiagnostics.durationMs} ms · {extractionDiagnostics.requestId ?? 'n/a'}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
