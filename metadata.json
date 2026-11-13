@@ -1,0 +1,6 @@
+{
+  "name": "Assemble — PES Hackathon Team Finder",
+  "description": "Student-only hackathon teammate discovery and team formation platform for PES University with hybrid People/Teams discovery, interest-first onboarding, deterministic TF-IDF matching, and provenance-verified event ingestion.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
