@@ -16,6 +16,7 @@ import {
   User,
 } from '../types/domain';
 import { generateTechnicalIcebreakerDrafts } from '../services/matchingEngine';
+import { Modal } from './Modal';
 
 interface MatchesAndChatViewProps {
   currentUser: User;
@@ -272,16 +273,19 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = ({
         </div>
       )}
 
-      {/* Report Modal */}
+      {/* Standardized Report Modal (Requirement #6) */}
       {reportModalOpen && activeConv && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl max-w-md w-full p-6 space-y-4">
-            <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
-              Submit Safety Report to Moderator Queue
-            </h3>
-            <p className="text-xs text-slate-500">
-              Reporting {activeConv.title}. Reports are logged privately for moderator review without user confrontation.
-            </p>
+        <Modal
+          onClose={() => {
+            setReportModalOpen(false);
+            setReportReason('');
+          }}
+          title="Submit Safety Report to Moderator Queue"
+          subtitle={`Reporting ${activeConv.title}. Reports are logged privately for moderator review.`}
+          maxWidthClass="max-w-md"
+          hasUnsavedChanges={reportReason.trim().length > 0}
+        >
+          <div className="space-y-4">
             <textarea
               rows={3}
               value={reportReason}
@@ -290,12 +294,6 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = ({
               className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
             />
             <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setReportModalOpen(false)}
-                className="px-3 py-1.5 text-xs text-slate-600 cursor-pointer"
-              >
-                Cancel
-              </button>
               <button
                 onClick={() => {
                   if (!reportReason.trim()) return;
@@ -308,13 +306,14 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = ({
                   setReportReason('');
                   setReportModalOpen(false);
                 }}
-                className="px-3.5 py-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg cursor-pointer"
+                disabled={!reportReason.trim()}
+                className="px-4 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-50 rounded-lg cursor-pointer"
               >
                 Submit Report
               </button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

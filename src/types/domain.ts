@@ -1,8 +1,13 @@
 /**
- * PES Hackathon Team Finder (Assemble) — v0.3 Domain Model & Type Contracts
- * Mirrors Section 6, Section 7, Section 8, Section 9, and Section 10 of Architecture v0.3.
+ * Quackathon (PES Hackathon Team Finder) — Domain Model & Type Contracts
+ * Preserves full compatibility with existing profiles, teams, and hackathons while adding:
+ * - Distinct originalSubmissionUrl, verifiedCanonicalUrl, registrationUrl, and sourceUrlStatus
+ * - Custom complementary specializations (customSpecializations[]) on Teams and CandidateCards
+ * - Uploaded brochure/poster metadata on EventCandidates
+ * - Demo Mode vs. Live API Test Mode types
  */
 
+export type ExecutionMode = 'demo' | 'live';
 export type CampusType = 'RR Campus' | 'EC Campus' | 'Online / Multi-Campus';
 export type DiscoveryMode = 'people' | 'teams';
 export type ParticipationIntent = 'looking' | 'recruiting' | 'open';
@@ -37,7 +42,14 @@ export type EventSourceType =
   | 'pes_public_events'
   | 'approved_organizer'
   | 'academy_opt_in_hint'
-  | 'submitted_public_url';
+  | 'submitted_public_url'
+  | 'uploaded_brochure_or_poster';
+
+export type SourceUrlVerificationStatus =
+  | 'verified'
+  | 'redirected_valid'
+  | 'unverified'
+  | 'unavailable';
 
 export type RequestDirection = 'application' | 'invitation';
 export type RequestStatus = 'pending' | 'accepted' | 'rejected' | 'withdrawn' | 'expired';
@@ -97,6 +109,7 @@ export interface ProfileEvidenceDraft {
   id: string;
   uid: string;
   source: 'github' | 'manual';
+  isLiveApiResult?: boolean;
   sourceUrl: string;
   repoName: string;
   rawEvidenceSummary: string;
@@ -105,6 +118,13 @@ export interface ProfileEvidenceDraft {
     category: string;
     confidence: 'high' | 'medium' | 'low';
     reason: string;
+    approved: boolean;
+  }[];
+  suggestedProjects?: {
+    title: string;
+    description: string;
+    sourceUrl?: string;
+    tags: string[];
     approved: boolean;
   }[];
   suggestedProject: {
@@ -131,7 +151,7 @@ export interface Hackathon {
   name: string;
   description: string;
   eventType: EventType;
-  matchable: boolean; // False for workshops, tech talks, solo-only CTFs, or unverified constraints
+  matchable: boolean;
   themes: string[];
   venue: {
     name: string | null;
@@ -140,13 +160,17 @@ export interface Hackathon {
     room?: string | null;
   };
   format: 'onsite' | 'online' | 'hybrid' | 'unknown';
-  startAt: string | null; // ISO or date-only string; never invent missing midnight
+  startAt: string | null;
   datePrecision: 'exact_instant' | 'date_only' | 'unknown';
   endAt: string | null;
   timezone: string;
   registrationDeadline: string | null;
+  // Distinct URL tracking (Requirement #4)
+  originalSubmissionUrl?: string | null;
+  verifiedCanonicalUrl?: string | null;
   registrationUrl: string | null;
-  minTeamSize: number | null; // Null when unconfirmed — never guess numeric bounds
+  sourceUrlStatus?: SourceUrlVerificationStatus;
+  minTeamSize: number | null;
   maxTeamSize: number | null;
   eligibilityNotes: string | null;
   organizer: string;
@@ -169,8 +193,17 @@ export interface EventCandidate {
   id: string;
   source: EventSourceType;
   sourceUrl?: string;
+  originalSubmissionUrl?: string | null;
+  verifiedCanonicalUrl?: string | null;
+  sourceUrlStatus?: SourceUrlVerificationStatus;
+  uploadedAttachment?: {
+    fileName: string;
+    mimeType: string;
+    byteSize: number;
+    extractedEvidenceQuote?: string;
+  };
   submittedByUid?: string;
-  externalFingerprint: string; // normalized organizer + title + start date
+  externalFingerprint: string;
   duplicateOfHackathonId?: string;
   updatesExistingHackathonId?: string;
   proposedDiffs?: {
@@ -223,7 +256,7 @@ export interface PrivateAcademyHint {
 }
 
 export interface Participation {
-  id: string; // deterministic: `${hackathonId}_${uid}`
+  id: string;
   hackathonId: string;
   uid: string;
   intent: ParticipationIntent;
@@ -245,10 +278,12 @@ export interface Team {
   pitch: string;
   projectIdea?: string;
   rolesNeeded: string[];
+  // Custom free-text specializations (Requirement #5)
+  customSpecializations?: string[];
   desiredDomains: string[];
   availabilitySummary: string;
   workStyleTags: string[];
-  targetSize: number; // Bounded by hackathon minTeamSize..maxTeamSize
+  targetSize: number;
   memberCount: number;
   status: 'open' | 'full' | 'locked';
   visibility: 'public' | 'unlisted';
@@ -256,7 +291,7 @@ export interface Team {
 }
 
 export interface Membership {
-  id: string; // deterministic: `${hackathonId}_${uid}`
+  id: string;
   hackathonId: string;
   teamId: string;
   uid: string;
@@ -266,7 +301,7 @@ export interface Membership {
 }
 
 export interface Interest {
-  id: string; // deterministic: `${hackathonId}_${fromUid}_${targetType}_${targetId}`
+  id: string;
   hackathonId: string;
   fromUid: string;
   targetType: 'user' | 'team';
@@ -320,6 +355,8 @@ export interface CandidateCard {
   isFirstTimeHacker?: boolean;
   skills: string[];
   rolesOfferedOrNeeded: string[];
+  customSpecializations?: string[];
+  matchedSpecializations?: string[];
   rolesWantToLearn?: string[];
   featuredEvidence: { title: string; description: string; url?: string; isCoursework?: boolean }[];
   compatibilityReasons: string[];
@@ -333,7 +370,6 @@ export interface CandidateCard {
   sharedInterests: string[];
   complementaryRoles: string[];
   icebreakerDrafts: string[];
-  // Internal feature breakdown for the transparent ranking inspector (never shown as a public score of a person)
   featureBreakdown: {
     mode: 'peer' | 'team_candidate';
     primaryFitLabel: string;
@@ -365,7 +401,7 @@ export interface ReportRecord {
 }
 
 export interface BlockRecord {
-  id: string; // `${blockerUid}_${blockedUid}`
+  id: string;
   blockerUid: string;
   blockedUid: string;
   createdAt: string;

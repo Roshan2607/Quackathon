@@ -1,8 +1,8 @@
 /**
- * PES Hackathon Team Finder (Assemble) — v0.3 Three-Pass Matching & Discovery Engine
+ * Quackathon (PES Hackathon Team Finder) — Three-Pass Matching & Discovery Engine
  *
  * Pass 1: Deterministic Hard Constraints (same event, verified/matchable, capacity, no blocks, no active double-team, not swiped)
- * Pass 2: Canonicalized Multi-Hot Tag Vectors + Controlled-Vocabulary TF-IDF Cosine Similarity
+ * Pass 2: Canonicalized Multi-Hot Tag Vectors + Custom Specializations Normalization + Controlled-Vocabulary TF-IDF Cosine Similarity
  * Pass 3: Transparent Re-Ranking (Peer vs. Team-Recruiting objectives, Cold-Start weight redistribution, 1-3 grounded reasons)
  *
  * Strictly zero Gemini/LLM API calls per swipe or card render.
@@ -31,7 +31,92 @@ function tokenizeControlled(text: string): string[] {
     .toLowerCase()
     .replace(/[^a-z0-9+#/-\s]/g, ' ')
     .split(/\s+/)
-    .filter((token) => token.length > 2 && !STOP_WORDS.has(token));
+    .filter((token) => token.length > 1 && !STOP_WORDS.has(token));
+}
+
+const SPECIALIZATION_SYNONYMS: Record<string, string[]> = {
+  'computer vision': ['cv', 'opencv', 'yolo', 'yolov8', 'image processing', 'vision', 'slam'],
+  'nlp / llm engineering': ['nlp', 'llm', 'rag', 'transformers', 'langchain', 'genai', 'applied ai/ml', 'pytorch'],
+  'embedded systems': ['esp32', 'arduino', ' microcontroller', 'firmware', 'rtos', 'uart', 'ros2', 'hardware/embedded', 'c++'],
+  'reinforcement learning': ['rl', 'policy gradient', 'q-learning', 'gym', 'control loops', 'robotics'],
+  'blockchain': ['web3', 'solidity', 'smart contracts', 'zero-knowledge', 'zk', 'ledger', 'fintech'],
+  'scientific computing': ['numpy', 'scipy', 'time-series', 'simulation', 'matlab', 'julia', 'forecasting'],
+  '3d modelling': ['blender', 'three.js', 'webgl', 'cad', 'mesh', '3d', 'spatial'],
+  'geospatial visualization': ['d3.js', 'deck.gl', 'geojson', 'gis', 'maps', 'gtfs', 'canopy', 'data visualization'],
+};
+
+/**
+ * Matches custom free-text specializations against a candidate's profile & participation
+ * using normalization, synonym expansion, and token stem similarity while preserving original labels.
+ * Zero LLM calls per match.
+ */
+export function matchCustomSpecializations(
+  customSpecs: string[] | undefined,
+  candidateProfile: Profile | undefined,
+  candidateParticipation?: Participation
+): { matchedOriginalLabels: string[]; score: number } {
+  if (!customSpecs || customSpecs.length === 0 || !candidateProfile) {
+    return { matchedOriginalLabels: [], score: 0 };
+  }
+
+  const candidateCorpus = [
+    ...candidateProfile.skillTags,
+    ...candidateProfile.interestTags,
+    ...candidateProfile.projectDomains,
+    ...candidateProfile.topicsToExplore,
+    ...candidateProfile.preferredRoles,
+    ...candidateProfile.rolesWantToLearn,
+    ...(candidateParticipation?.skillsOffered ?? []),
+    candidateProfile.headline,
+    ...candidateProfile.featuredProjects.map((p) => `${p.title} ${p.description} ${p.tags.join(' ')}`),
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  const candidateTokens = new Set(tokenizeControlled(candidateCorpus));
+  const matchedOriginalLabels: string[] = [];
+
+  for (const originalLabel of customSpecs) {
+    const normSpec = originalLabel.toLowerCase().trim();
+    if (!normSpec) continue;
+
+    // 1. Direct substring match
+    if (candidateCorpus.includes(normSpec)) {
+      matchedOriginalLabels.push(originalLabel);
+      continue;
+    }
+
+    // 2. Synonym expansion lookup
+    const synonyms = SPECIALIZATION_SYNONYMS[normSpec] ?? [];
+    if (synonyms.some((syn) => candidateCorpus.includes(syn.trim()))) {
+      matchedOriginalLabels.push(originalLabel);
+      continue;
+    }
+
+    // 3. Token overlap / prefix similarity
+    const specTokens = tokenizeControlled(normSpec);
+    if (specTokens.length > 0) {
+      const hits = specTokens.filter((st) => {
+        if (candidateTokens.has(st)) return true;
+        if (st.length >= 4) {
+          for (const ct of candidateTokens) {
+            if (ct.startsWith(st.slice(0, 4)) || st.startsWith(ct.slice(0, 4))) {
+              return true;
+            }
+          }
+        }
+        return false;
+      });
+      if (hits.length / specTokens.length >= 0.5) {
+        matchedOriginalLabels.push(originalLabel);
+      }
+    }
+  }
+
+  return {
+    matchedOriginalLabels,
+    score: matchedOriginalLabels.length / customSpecs.length,
+  };
 }
 
 /**
@@ -109,7 +194,6 @@ function jaccardOverlap(listA: string[], listB: string[]): { score: number; shar
 
 /**
  * Generates safe, editable template-based technical icebreakers from approved projects & interests.
- * Never auto-sent; never infers sensitive attributes.
  */
 export function generateTechnicalIcebreakerDrafts(options: {
   viewerProfile: Profile;
@@ -208,7 +292,6 @@ export function computeInterestCircles(
 
 /**
  * Ranks People cards for a viewer within a selected hackathon.
- * Uses Peer Score when viewer is looking/open, or Team-Candidate Score when viewer is recruiting for their team.
  */
 export function rankPeopleForHackathon(params: {
   viewerUid: string;
@@ -239,7 +322,6 @@ export function rankPeopleForHackathon(params: {
     onlyFirstTimeHackers,
   } = params;
 
-  // Pass 1: Hard constraint — non-matchable events (workshops, talks, solo CTFs) return empty discovery
   if (!hackathon.matchable) {
     return { cards: [], internalScores: new Map() };
   }
@@ -272,14 +354,12 @@ export function rankPeopleForHackathon(params: {
       .map((m) => m.uid)
   );
 
-  // Filter eligible candidate participations
   const eligibleParticipations = participations.filter((part) => {
     if (part.hackathonId !== hackathon.id) return false;
     if (part.uid === viewerUid) return false;
     if (!part.discoverable) return false;
     if (blockedUids.has(part.uid)) return false;
     if (swipedUserIds.has(part.uid)) return false;
-    // Candidate already on a confirmed team in this hackathon is not in solo people discovery
     if (activeMemberUidsInEvent.has(part.uid)) return false;
 
     const candidateUser = users.find((u) => u.uid === part.uid);
@@ -306,12 +386,12 @@ export function rankPeopleForHackathon(params: {
     return true;
   });
 
-  // Build corpus for Pass 2 TF-IDF cosine calculation
   const buildProfileAbstract = (prof: Profile, part?: Participation): string => {
     const projText = prof.featuredProjects.map((p) => `${p.title} ${p.description} ${p.tags.join(' ')}`).join(' ');
     return [
       prof.headline,
       prof.about,
+      prof.skillTags.join(' '),
       prof.interestTags.join(' '),
       prof.projectDomains.join(' '),
       prof.topicsToExplore.join(' '),
@@ -322,7 +402,7 @@ export function rankPeopleForHackathon(params: {
 
   const corpusDocs = eligibleParticipations.map((p) => buildProfileAbstract(profiles[p.uid], p));
   const viewerAbstract = viewerTeam
-    ? `${viewerTeam.name} ${viewerTeam.pitch} ${viewerTeam.projectIdea ?? ''} ${viewerTeam.desiredDomains.join(' ')} ${viewerTeam.rolesNeeded.join(' ')}`
+    ? `${viewerTeam.name} ${viewerTeam.pitch} ${viewerTeam.projectIdea ?? ''} ${viewerTeam.desiredDomains.join(' ')} ${viewerTeam.rolesNeeded.join(' ')} ${(viewerTeam.customSpecializations ?? []).join(' ')}`
     : viewerProfile
     ? buildProfileAbstract(viewerProfile, viewerParticipation)
     : hackathon.themes.join(' ');
@@ -359,7 +439,6 @@ export function rankPeopleForHackathon(params: {
       part.workPreferences.length > 0 ? part.workPreferences : prof.workingStyleTags
     );
 
-    // Check complementary role coverage
     const rolesNeededByViewer = viewerTeam
       ? viewerTeam.rolesNeeded
       : viewerProfile
@@ -374,12 +453,24 @@ export function rankPeopleForHackathon(params: {
     const complementaryRoles = candidateOfferedRoles.filter((r) =>
       rolesNeededByViewer.includes(r)
     );
-    const roleCoverageScore =
+
+    // Match custom specializations when recruiting for a team
+    const customSpecMatch = matchCustomSpecializations(
+      viewerTeam?.customSpecializations,
+      prof,
+      part
+    );
+
+    const baseRoleScore =
       rolesNeededByViewer.length > 0
         ? Math.min(1, complementaryRoles.length / Math.min(2, rolesNeededByViewer.length))
         : 0.5;
 
-    // Cold-start protection: If beginner has no GitHub repos, redistribute project TF-IDF weight to interests & learning goals
+    const combinedRoleAndSpecScore =
+      viewerTeam?.customSpecializations && viewerTeam.customSpecializations.length > 0
+        ? 0.65 * baseRoleScore + 0.35 * customSpecMatch.score
+        : baseRoleScore;
+
     const isColdStart = Boolean(prof.isFirstTimeHacker && !prof.githubUsername);
     const explorationBonus = prof.isFirstTimeHacker ? 0.85 : 0.5;
 
@@ -389,16 +480,14 @@ export function rankPeopleForHackathon(params: {
     );
 
     if (isRecruitingMode) {
-      // Team-candidate score = 0.35 missing_role_coverage + 0.25 shared_problem_interests + 0.20 availability_overlap + 0.15 complementary_skills + 0.05 exploration
-      const skillComplement = isColdStart ? interestSim : tfidfSim;
+      const skillComplement = isColdStart ? interestSim : Math.max(tfidfSim, customSpecMatch.score);
       totalScore =
-        0.35 * roleCoverageScore +
+        0.35 * combinedRoleAndSpecScore +
         0.25 * interestSim +
         0.20 * (viewerAvail.length > 0 ? availSim : 0.6) +
         0.15 * skillComplement +
         0.05 * explorationBonus;
     } else {
-      // Peer score = 0.35 interest_similarity + 0.25 project_theme_similarity + 0.20 availability_overlap + 0.15 collaboration_preference_fit + 0.05 exploration
       const effectiveThemeSim = isColdStart ? Math.max(tfidfSim, interestSim) : tfidfSim;
       totalScore =
         0.35 * interestSim +
@@ -408,8 +497,13 @@ export function rankPeopleForHackathon(params: {
         0.05 * explorationBonus;
     }
 
-    // Build 1-3 grounded human-readable compatibility reasons
     const reasons: string[] = [];
+    if (customSpecMatch.matchedOriginalLabels.length > 0) {
+      reasons.push(
+        `Matches team specialization: ${customSpecMatch.matchedOriginalLabels.join(' & ')}`
+      );
+    }
+
     if (complementaryRoles.length > 0) {
       reasons.push(
         viewerTeam
@@ -426,11 +520,9 @@ export function rankPeopleForHackathon(params: {
       reasons.push(`Shared interest in ${sharedInterests.slice(0, 2).join(' & ')}`);
     }
 
-    if (sharedAvail.length > 0) {
-      reasons.push(
-        `Available during ${sharedAvail.slice(0, 2).join(' and ')}`
-      );
-    } else if (sharedWorkStyle.length > 0) {
+    if (sharedAvail.length > 0 && reasons.length < 3) {
+      reasons.push(`Available during ${sharedAvail.slice(0, 2).join(' and ')}`);
+    } else if (sharedWorkStyle.length > 0 && reasons.length < 3) {
       reasons.push(`Matches your ${sharedWorkStyle[0].toLowerCase()} collaboration style`);
     }
 
@@ -444,7 +536,10 @@ export function rankPeopleForHackathon(params: {
           targetTitle: user.displayName,
           targetProjects: prof.featuredProjects,
           sharedInterests,
-          complementaryRoles,
+          complementaryRoles: [
+            ...complementaryRoles,
+            ...customSpecMatch.matchedOriginalLabels,
+          ],
           customPrompt: prof.icebreakerPrompt,
         })
       : [];
@@ -463,6 +558,7 @@ export function rankPeopleForHackathon(params: {
         isFirstTimeHacker: prof.isFirstTimeHacker,
         skills: Array.from(new Set([...part.skillsOffered, ...prof.skillTags])).slice(0, 7),
         rolesOfferedOrNeeded: candidateOfferedRoles,
+        matchedSpecializations: customSpecMatch.matchedOriginalLabels,
         rolesWantToLearn: prof.rolesWantToLearn,
         featuredEvidence: prof.featuredProjects.map((fp) => ({
           title: fp.title,
@@ -479,8 +575,8 @@ export function rankPeopleForHackathon(params: {
         icebreakerDrafts,
         featureBreakdown: {
           mode: isRecruitingMode ? 'team_candidate' : 'peer',
-          primaryFitLabel: isRecruitingMode ? 'Missing-Role Coverage' : 'Interest & Project Affinity',
-          interestOrRoleSim: Math.round((isRecruitingMode ? roleCoverageScore : interestSim) * 100),
+          primaryFitLabel: isRecruitingMode ? 'Missing-Role & Spec Fit' : 'Interest & Project Affinity',
+          interestOrRoleSim: Math.round((isRecruitingMode ? combinedRoleAndSpecScore : interestSim) * 100),
           tfidfThemeSim: Math.round(tfidfSim * 100),
           availabilitySim: Math.round((viewerAvail.length > 0 ? availSim : 0.6) * 100),
           collabOrSkillSim: Math.round(collabSim * 100),
@@ -498,7 +594,7 @@ export function rankPeopleForHackathon(params: {
 }
 
 /**
- * Ranks open Teams for a viewer within a selected hackathon.
+ * Ranks open Teams for a viewer within a selected hackathon, including customSpecializations matching.
  */
 export function rankTeamsForHackathon(params: {
   viewerUid: string;
@@ -552,7 +648,11 @@ export function rankTeamsForHackathon(params: {
     if (swipedTeamIds.has(team.id)) return false;
 
     if (roleFilter && roleFilter !== 'ALL') {
-      if (!team.rolesNeeded.includes(roleFilter)) return false;
+      const inStandardRole = team.rolesNeeded.includes(roleFilter);
+      const inCustomSpec = (team.customSpecializations ?? []).some(
+        (s) => s.toLowerCase() === roleFilter.toLowerCase()
+      );
+      if (!inStandardRole && !inCustomSpec) return false;
     }
 
     if (activeCircleTags && activeCircleTags.length > 0) {
@@ -564,16 +664,21 @@ export function rankTeamsForHackathon(params: {
   });
 
   const corpusDocs = eligibleTeams.map(
-    (t) => `${t.name} ${t.pitch} ${t.projectIdea ?? ''} ${t.desiredDomains.join(' ')}`
+    (t) =>
+      `${t.name} ${t.pitch} ${t.projectIdea ?? ''} ${t.desiredDomains.join(' ')} ${(
+        t.customSpecializations ?? []
+      ).join(' ')}`
   );
   const viewerDoc = viewerProfile
-    ? `${viewerProfile.headline} ${viewerProfile.about} ${viewerProfile.interestTags.join(' ')} ${viewerProfile.projectDomains.join(' ')}`
+    ? `${viewerProfile.headline} ${viewerProfile.about} ${viewerProfile.skillTags.join(' ')} ${viewerProfile.interestTags.join(' ')} ${viewerProfile.projectDomains.join(' ')}`
     : hackathon.themes.join(' ');
 
   const scored: { card: CandidateCard; score: number }[] = [];
 
   for (const team of eligibleTeams) {
-    const teamDoc = `${team.name} ${team.pitch} ${team.projectIdea ?? ''} ${team.desiredDomains.join(' ')}`;
+    const teamDoc = `${team.name} ${team.pitch} ${team.projectIdea ?? ''} ${team.desiredDomains.join(' ')} ${(
+      team.customSpecializations ?? []
+    ).join(' ')}`;
     const tfidfSim = computeTfIdfCosineSimilarity(viewerDoc, teamDoc, corpusDocs);
 
     const viewerRoles = Array.from(
@@ -585,26 +690,45 @@ export function rankTeamsForHackathon(params: {
     );
 
     const matchingRoles = team.rolesNeeded.filter((r) => viewerRoles.includes(r));
-    const roleScore =
+    const baseRoleScore =
       team.rolesNeeded.length > 0 ? matchingRoles.length / team.rolesNeeded.length : 0.5;
+
+    // Match team's custom specializations against the viewer's profile
+    const specMatch = matchCustomSpecializations(
+      team.customSpecializations,
+      viewerProfile,
+      viewerParticipation
+    );
+
+    const combinedRoleSpecScore =
+      team.customSpecializations && team.customSpecializations.length > 0
+        ? 0.6 * baseRoleScore + 0.4 * specMatch.score
+        : baseRoleScore;
 
     const { score: domainSim, shared: sharedDomains } = jaccardOverlap(
       viewerProfile?.interestTags ?? [],
       team.desiredDomains
     );
 
-    const score = 0.4 * roleScore + 0.35 * domainSim + 0.25 * tfidfSim;
+    const score = 0.45 * combinedRoleSpecScore + 0.3 * domainSim + 0.25 * tfidfSim;
 
     const reasons: string[] = [];
+    if (specMatch.matchedOriginalLabels.length > 0) {
+      reasons.push(
+        `Matches your specialization in ${specMatch.matchedOriginalLabels.join(' & ')}`
+      );
+    }
     if (matchingRoles.length > 0) {
       reasons.push(`Looking for your ${matchingRoles.join(' / ')} role`);
     } else {
       reasons.push(`Open slots for ${team.rolesNeeded.join(' / ')}`);
     }
-    if (sharedDomains.length > 0) {
+    if (sharedDomains.length > 0 && reasons.length < 3) {
       reasons.push(`Aligned on ${sharedDomains.slice(0, 2).join(' & ')}`);
     }
-    reasons.push(`${team.targetSize - team.memberCount} of ${team.targetSize} roster slots open`);
+    if (reasons.length < 3) {
+      reasons.push(`${team.targetSize - team.memberCount} of ${team.targetSize} roster slots open`);
+    }
 
     const icebreakerDrafts = viewerProfile
       ? generateTechnicalIcebreakerDrafts({
@@ -614,7 +738,7 @@ export function rankTeamsForHackathon(params: {
             ? [{ title: team.projectIdea, description: team.pitch }]
             : [],
           sharedInterests: sharedDomains,
-          complementaryRoles: matchingRoles,
+          complementaryRoles: [...matchingRoles, ...specMatch.matchedOriginalLabels],
         })
       : [];
 
@@ -628,10 +752,12 @@ export function rankTeamsForHackathon(params: {
         subtitle: team.pitch,
         skills: team.desiredDomains,
         rolesOfferedOrNeeded: team.rolesNeeded,
+        customSpecializations: team.customSpecializations,
+        matchedSpecializations: specMatch.matchedOriginalLabels,
         featuredEvidence: team.projectIdea
           ? [{ title: 'Planned Build Idea', description: team.projectIdea }]
           : [],
-        compatibilityReasons: reasons,
+        compatibilityReasons: reasons.slice(0, 3),
         remainingSlots: team.targetSize - team.memberCount,
         targetSize: team.targetSize,
         memberCount: team.memberCount,
@@ -643,8 +769,8 @@ export function rankTeamsForHackathon(params: {
         icebreakerDrafts,
         featureBreakdown: {
           mode: 'team_candidate',
-          primaryFitLabel: 'Role Gap Alignment',
-          interestOrRoleSim: Math.round(roleScore * 100),
+          primaryFitLabel: 'Role & Specialization Fit',
+          interestOrRoleSim: Math.round(combinedRoleSpecScore * 100),
           tfidfThemeSim: Math.round(tfidfSim * 100),
           availabilitySim: 80,
           collabOrSkillSim: Math.round(domainSim * 100),

@@ -6,6 +6,7 @@
 import React, { useState } from 'react';
 import {
   CheckCircle2,
+  Code2,
   SlidersHorizontal,
   UserCheck,
 } from 'lucide-react';
@@ -16,6 +17,7 @@ import {
   Conversation,
   DiscoveryMode,
   EventCandidate,
+  ExecutionMode,
   Hackathon,
   Interest,
   JoinRequest,
@@ -51,12 +53,14 @@ import { TeamsAndRequestsView } from './components/TeamsAndRequestsView';
 import { MatchesAndChatView } from './components/MatchesAndChatView';
 import { OnboardingAndProfileModal } from './components/OnboardingAndProfileModal';
 import { AdminReviewQueueView } from './components/AdminReviewQueueView';
+import { IntegrationTestingView } from './components/IntegrationTestingView';
 
-type NavTab = 'hackathons' | 'discover' | 'teams' | 'matches' | 'admin';
+type NavTab = 'hackathons' | 'discover' | 'teams' | 'matches' | 'admin' | 'integrations';
 
 export default function App() {
-  // Navigation & Active Persona State
+  // Navigation, Execution Mode & Active Persona State
   const [activeNav, setActiveNav] = useState<NavTab>('hackathons');
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>('live');
   const [currentUserId, setCurrentUserId] = useState<string>('u_solo_arjun');
   const [selectedHackathonId, setSelectedHackathonId] = useState<string>('hack_terrapthon_26');
   const [discoveryMode, setDiscoveryMode] = useState<DiscoveryMode>('people');
@@ -346,7 +350,6 @@ export default function App() {
       (m) => m.id === deterministicMembershipKey && m.status === 'active'
     );
 
-    // Invariant 1 check: Applicant already belongs to an active team in this hackathon
     if (existingActiveMembership) {
       setLastTransactionBanner({
         type: 'error',
@@ -356,7 +359,6 @@ export default function App() {
       return;
     }
 
-    // Invariant 2 & 4 check: Team capacity vs targetSize and hackathon maxTeamSize
     const maxAllowed = hack.maxTeamSize ?? team.targetSize;
     if (team.memberCount >= team.targetSize || team.memberCount >= maxAllowed) {
       setJoinRequests((prev) =>
@@ -379,7 +381,6 @@ export default function App() {
       return;
     }
 
-    // Commit atomic roster addition
     const nextCount = team.memberCount + 1;
     const isNowFull = nextCount >= team.targetSize;
 
@@ -410,7 +411,6 @@ export default function App() {
       )
     );
 
-    // Update participation status immediately so candidate leaves solo People discovery pool
     setParticipations((prev) =>
       prev.map((p) =>
         p.hackathonId === req.hackathonId && p.uid === req.applicantUid
@@ -419,7 +419,6 @@ export default function App() {
       )
     );
 
-    // Mark request accepted & auto-expire competing pending requests if team reached capacity or for that applicant
     setJoinRequests((prev) =>
       prev.map((r) => {
         if (r.id === requestId) {
@@ -454,7 +453,6 @@ export default function App() {
       })
     );
 
-    // Add applicant to team roster chat
     setConversations((prev) =>
       prev.map((c) =>
         c.teamId === team.id && !c.participantUids.includes(req.applicantUid)
@@ -474,7 +472,6 @@ export default function App() {
     });
   };
 
-  // Acceptance Criterion #4: Two simultaneous approvals for the last slot yield ONE success and ONE clear "team is full" result
   const handleSimulateLastSlotRace = (teamId: string) => {
     const team = teams.find((t) => t.id === teamId);
     if (!team) return;
@@ -496,7 +493,6 @@ export default function App() {
     const firstUser = users.find((u) => u.uid === firstReq.applicantUid);
     const secondUser = users.find((u) => u.uid === secondReq.applicantUid);
 
-    // Execute first approval atomically -> fills slot 4/4, expires secondReq
     handleResolveJoinRequest(firstReq.id, 'accepted');
 
     setLastTransactionBanner({
@@ -506,7 +502,6 @@ export default function App() {
     });
   };
 
-  // Acceptance Criterion #5: Same user cannot join two active teams in the same hackathon
   const handleSimulateDoubleTeamAttempt = (hackathonId: string) => {
     const detKey = `${hackathonId}_${currentUser.uid}`;
     const existing = memberships.find((m) => m.id === detKey && m.status === 'active');
@@ -532,6 +527,7 @@ export default function App() {
     pitch: string;
     projectIdea: string;
     rolesNeeded: string[];
+    customSpecializations: string[];
     desiredDomains: string[];
     targetSize: number;
   }) => {
@@ -555,6 +551,8 @@ export default function App() {
       pitch: params.pitch,
       projectIdea: params.projectIdea || undefined,
       rolesNeeded: params.rolesNeeded,
+      customSpecializations:
+        params.customSpecializations.length > 0 ? params.customSpecializations : undefined,
       desiredDomains: params.desiredDomains,
       availabilitySummary: 'Weekend Hackathon Sprint',
       workStyleTags: currentProfile.workingStyleTags,
@@ -593,8 +591,40 @@ export default function App() {
     setLastTransactionBanner({
       type: 'success',
       title: 'Team Created & Deterministic Leader Membership Claimed',
-      detail: `Created "${params.name}" with target size ${params.targetSize} and claimed key "memberships/${detKey}".`,
+      detail: `Created "${params.name}" with target size ${params.targetSize}${
+        params.customSpecializations.length > 0
+          ? ` and custom specializations (${params.customSpecializations.join(', ')})`
+          : ''
+      }.`,
     });
+  };
+
+  const handleUpdateTeam = (
+    teamId: string,
+    updates: {
+      name: string;
+      pitch: string;
+      rolesNeeded: string[];
+      customSpecializations: string[];
+    }
+  ) => {
+    setTeams((prev) =>
+      prev.map((t) =>
+        t.id === teamId
+          ? {
+              ...t,
+              name: updates.name,
+              pitch: updates.pitch,
+              rolesNeeded: updates.rolesNeeded,
+              customSpecializations:
+                updates.customSpecializations.length > 0
+                  ? updates.customSpecializations
+                  : undefined,
+            }
+          : t
+      )
+    );
+    notifyToast(`Updated roles and custom specializations for ${updates.name}.`);
   };
 
   const handleLeaveTeam = (hackathonId: string, teamId: string) => {
@@ -621,7 +651,7 @@ export default function App() {
     notifyToast('Left team. Your participation status is now back to Looking for Team.');
   };
 
-  // Block & Report Safety Controls (Section 11)
+  // Block & Report Safety Controls
   const handleBlockUser = (targetUid: string) => {
     const blockId = `${currentUser.uid}_${targetUid}`;
     if (!blocks.some((b) => b.id === blockId)) {
@@ -635,7 +665,6 @@ export default function App() {
         },
       ]);
     }
-    // Remove direct conversations with blocked user
     setConversations((prev) =>
       prev.filter(
         (c) =>
@@ -686,9 +715,21 @@ export default function App() {
     notifyToast('Event candidate staged in Admin Review Queue (not public until approved).');
   };
 
-  const handleApproveCandidate = (candidateId: string) => {
-    const cand = eventCandidates.find((c) => c.id === candidateId);
-    if (!cand) return;
+  const handleApproveCandidate = (
+    candidateId: string,
+    overrides?: Partial<EventCandidate>
+  ) => {
+    const rawCand = eventCandidates.find((c) => c.id === candidateId);
+    if (!rawCand) return;
+
+    const cand: EventCandidate = {
+      ...rawCand,
+      ...overrides,
+      venue: overrides?.venue ? { ...rawCand.venue, ...overrides.venue } : rawCand.venue,
+      teamSize: overrides?.teamSize
+        ? { ...rawCand.teamSize, ...overrides.teamSize }
+        : rawCand.teamSize,
+    };
 
     const newHackId = `hack_approved_${Date.now()}`;
     const newHack: Hackathon = {
@@ -709,12 +750,24 @@ export default function App() {
       timezone: cand.timezone,
       registrationDeadline: cand.registrationDeadline,
       registrationUrl: cand.registrationUrl,
+      originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
+      verifiedCanonicalUrl: cand.verifiedCanonicalUrl ?? null,
+      sourceUrlStatus:
+        cand.sourceUrlStatus ??
+        (cand.verifiedCanonicalUrl ? 'verified' : 'unavailable'),
       minTeamSize: cand.teamSize.min,
       maxTeamSize: cand.teamSize.max,
       eligibilityNotes: cand.eligibilityNotes,
       organizer: cand.organizer,
       sourceIds: [cand.id],
-      fieldProvenance: {},
+      fieldProvenance: {
+        name: {
+          sourceType: cand.source,
+          sourceUrl: cand.verifiedCanonicalUrl ?? cand.originalSubmissionUrl ?? 'manual',
+          excerpt: cand.uploadedAttachment?.extractedEvidenceQuote ?? cand.title,
+          verifiedAt: new Date().toISOString(),
+        },
+      },
       suggestedByCount: 1,
       classification: {
         category: cand.eventType,
@@ -733,7 +786,9 @@ export default function App() {
 
     setHackathons((prev) => [newHack, ...prev]);
     setEventCandidates((prev) =>
-      prev.map((c) => (c.id === candidateId ? { ...c, reviewStatus: 'approved' } : c))
+      prev.map((c) =>
+        c.id === candidateId ? { ...cand, reviewStatus: 'approved' } : c
+      )
     );
     setAuditLogs((prev) => [
       {
@@ -741,7 +796,7 @@ export default function App() {
         actorUid: currentUser.uid,
         action: 'APPROVE_EVENT_CANDIDATE',
         targetId: newHackId,
-        summary: `Approved "${cand.title}" into public directory (matchable=${cand.matchable}).`,
+        summary: `Approved "${cand.title}" into public directory (matchable=${cand.matchable}, canonicalUrl=${cand.verifiedCanonicalUrl ?? 'unavailable'}).`,
         createdAt: new Date().toISOString(),
       },
       ...prev,
@@ -791,7 +846,7 @@ export default function App() {
         actorUid: currentUser.uid,
         action: 'MERGE_DUPLICATE_PROVENANCE',
         targetId: targetHackathonId,
-        summary: `Merged duplicate source "${cand.sourceUrl}" into ${targetHackathonId} without overwriting verified constraints.`,
+        summary: `Merged duplicate source "${cand.sourceUrl ?? cand.uploadedAttachment?.fileName ?? 'manual'}" into ${targetHackathonId} without overwriting verified constraints.`,
         createdAt: new Date().toISOString(),
       },
       ...prev,
@@ -841,9 +896,8 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-slate-950 text-slate-900 dark:text-slate-100">
-      {/* Strict 3-Zone Top Bar Contract */}
-      <header className="sticky top-0 z-40 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-b border-slate-200 dark:border-slate-800 px-6 py-3.5 flex items-center justify-between gap-8">
-        {/* Zone 1: Single text element wordmark */}
+      {/* Top Bar */}
+      <header className="sticky top-0 z-40 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-b border-slate-200 dark:border-slate-800 px-6 py-3.5 flex items-center justify-between gap-6">
         <a
           href="#top"
           onClick={(e) => {
@@ -855,7 +909,7 @@ export default function App() {
           Assemble
         </a>
 
-        {/* Zone 2: 5 concise single-line text navigation links */}
+        {/* Navigation Links */}
         <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-400">
           <button
             onClick={() => setActiveNav('hackathons')}
@@ -907,26 +961,37 @@ export default function App() {
           >
             Review Queue ({pendingCandidateCount})
           </button>
+          <button
+            onClick={() => setActiveNav('integrations')}
+            className={`hover:text-slate-900 dark:hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 inline-flex items-center gap-1 ${
+              activeNav === 'integrations'
+                ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 font-semibold'
+                : ''
+            }`}
+          >
+            <Code2 className="w-3.5 h-3.5" />
+            Integration Tests
+          </button>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
+        {/* Primary Action */}
         <div className="flex items-center gap-3 shrink-0">
           <button
             onClick={() => setShowProfileModal(true)}
             className="px-4 py-2 text-xs font-semibold text-white bg-slate-900 dark:bg-slate-100 dark:text-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Edit Profile & GitHub Import
+            Edit Builder Profile
           </button>
         </div>
       </header>
 
-      {/* Sub-Header Workspace Toolbar: PESU OIDC Session & Persona Switcher */}
+      {/* Sub-Header Workspace Toolbar: Mode Selector, PESU Session & Persona Switcher */}
       <div className="bg-slate-100/80 dark:bg-slate-900/60 border-b border-slate-200 dark:border-slate-800 px-6 py-2.5">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
           <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-300">
             <UserCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
             <span className="font-semibold text-slate-900 dark:text-slate-100">
-              PESU OAuth2 (OIDC + PKCE) Verified Session:
+              Active Builder Session:
             </span>
             <select
               aria-label="Switch Active Test Persona"
@@ -941,7 +1006,7 @@ export default function App() {
               ))}
             </select>
             <span className="text-slate-400 hidden lg:inline">
-              · {currentUser.campus} · Claim <code className="font-mono">{currentUser.pesuOidcSub}</code>
+              · {currentUser.campus}
             </span>
           </div>
 
@@ -954,6 +1019,7 @@ export default function App() {
                 { id: 'teams', label: 'My Teams' },
                 { id: 'matches', label: 'Matches' },
                 { id: 'admin', label: `Review (${pendingCandidateCount})` },
+                { id: 'integrations', label: 'API Tests' },
               ] as { id: NavTab; label: string }[]
             ).map((tab) => (
               <button
@@ -970,14 +1036,47 @@ export default function App() {
             ))}
           </div>
 
-          <button
-            onClick={() => setShowProfileModal(true)}
-            className="text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer self-start sm:self-auto"
-          >
-            <SlidersHorizontal className="w-3.5 h-3.5" />
-            Interests: {currentProfile.interestTags.slice(0, 2).join(', ')} · Roles:{' '}
-            {currentProfile.preferredRoles.join('/')}
-          </button>
+          {/* Explicit Demo Mode vs Live Test Mode Selector */}
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-1 p-0.5 bg-slate-200 dark:bg-slate-800 rounded-lg">
+              <button
+                type="button"
+                onClick={() => {
+                  setExecutionMode('demo');
+                  notifyToast('Switched to Demo Mode (Simulated responses labeled explicitly).');
+                }}
+                className={`px-2.5 py-1 rounded-md text-[11px] font-semibold cursor-pointer transition-colors ${
+                  executionMode === 'demo'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Demo Mode
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setExecutionMode('live');
+                  notifyToast('Switched to Live Test Mode (Using real GitHub, Gemini & URL APIs).');
+                }}
+                className={`px-2.5 py-1 rounded-md text-[11px] font-semibold cursor-pointer transition-colors ${
+                  executionMode === 'live'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Live Test Mode
+              </button>
+            </div>
+
+            <button
+              onClick={() => setShowProfileModal(true)}
+              className="text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5" />
+              Roles: {currentProfile.preferredRoles.join('/')}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -997,6 +1096,7 @@ export default function App() {
             hackathons={hackathons}
             selectedHackathonId={selectedHackathonId}
             privateHints={privateHints}
+            executionMode={executionMode}
             onSelectHackathonForDiscovery={(id) => {
               setSelectedHackathonId(id);
               setActiveNav('discover');
@@ -1040,6 +1140,7 @@ export default function App() {
             lastTransactionBanner={lastTransactionBanner}
             onClearTransactionBanner={() => setLastTransactionBanner(null)}
             onCreateTeam={handleCreateTeam}
+            onUpdateTeam={handleUpdateTeam}
             onResolveJoinRequest={handleResolveJoinRequest}
             onSimulateLastSlotRace={handleSimulateLastSlotRace}
             onSimulateDoubleTeamAttempt={handleSimulateDoubleTeamAttempt}
@@ -1092,31 +1193,39 @@ export default function App() {
             }}
           />
         )}
+
+        {activeNav === 'integrations' && (
+          <IntegrationTestingView
+            executionMode={executionMode}
+            onChangeExecutionMode={setExecutionMode}
+          />
+        )}
       </main>
 
-      {/* Quiet Institutional Disclaimer Footer (Section 11.9) */}
+      {/* Quiet Institutional Disclaimer Footer */}
       <footer className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-6 py-4 text-xs text-slate-500 dark:text-slate-400">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-2">
           <span>
-            Assemble (PES Hackathon Team Finder — Architecture v0.3 Phase A) · Independent student project; not an official PES University registration portal.
+            Assemble (Quackathon — PES Hackathon Team Finder) · Independent student project; not an official PES University registration portal.
           </span>
           <span>
-            Synthetic demo profiles & events · Zero Academy password collection · Non-LLM per-swipe matching
+            Mode: {executionMode === 'live' ? 'Live Test Mode (Real APIs)' : 'Demo Mode (Simulated)'} · Zero Academy password collection · Non-LLM per-swipe matching
           </span>
         </div>
       </footer>
 
-      {/* Onboarding & GitHub Evidence Review Modal */}
+      {/* Progressive 3-Step Onboarding & Builder Profile Modal */}
       {showProfileModal && (
         <OnboardingAndProfileModal
           currentUser={currentUser}
           profile={currentProfile}
+          executionMode={executionMode}
           onSaveProfile={(updated) => {
             setProfiles((prev) => ({
               ...prev,
               [currentUser.uid]: updated,
             }));
-            notifyToast('Updated builder profile and recomputed TF-IDF discovery features.');
+            notifyToast('Saved builder profile and updated matching preferences.');
           }}
           onClose={() => setShowProfileModal(false)}
         />

@@ -3,11 +3,11 @@ import {
   AlertTriangle,
   Check,
   CheckCircle2,
+  Edit3,
   LogOut,
   Plus,
   ShieldAlert,
-  ShieldCheck,
-  Users,
+  Sparkles,
   X,
   Zap,
 } from 'lucide-react';
@@ -18,7 +18,11 @@ import {
   Team,
   User,
 } from '../types/domain';
-import { INTEREST_TAXONOMY, ROLE_TAXONOMY } from '../data/seedData';
+import {
+  ROLE_TAXONOMY,
+  SUGGESTED_CUSTOM_SPECIALIZATIONS,
+} from '../data/seedData';
+import { Modal } from './Modal';
 
 interface TeamsAndRequestsViewProps {
   currentUser: User;
@@ -40,9 +44,19 @@ interface TeamsAndRequestsViewProps {
     pitch: string;
     projectIdea: string;
     rolesNeeded: string[];
+    customSpecializations: string[];
     desiredDomains: string[];
     targetSize: number;
   }) => void;
+  onUpdateTeam?: (
+    teamId: string,
+    updates: {
+      name: string;
+      pitch: string;
+      rolesNeeded: string[];
+      customSpecializations: string[];
+    }
+  ) => void;
   onResolveJoinRequest: (requestId: string, decision: 'accepted' | 'rejected') => void;
   onSimulateLastSlotRace: (teamId: string) => void;
   onSimulateDoubleTeamAttempt: (hackathonId: string) => void;
@@ -60,18 +74,23 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
   lastTransactionBanner,
   onClearTransactionBanner,
   onCreateTeam,
+  onUpdateTeam,
   onResolveJoinRequest,
   onSimulateLastSlotRace,
   onSimulateDoubleTeamAttempt,
   onLeaveTeam,
 }) => {
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
+
   const [createHackathonId, setCreateHackathonId] = useState(selectedHackathonId);
   const [teamName, setTeamName] = useState('');
   const [teamPitch, setTeamPitch] = useState('');
   const [projectIdea, setProjectIdea] = useState('');
   const [rolesNeeded, setRolesNeeded] = useState<string[]>(['Frontend', 'Product/UI Design']);
-  const [desiredDomains, setDesiredDomains] = useState<string[]>(['Applied AI/ML', 'Climate/Civic Tech']);
+  const [customSpecializations, setCustomSpecializations] = useState<string[]>([]);
+  const [specInput, setSpecInput] = useState('');
+  const [desiredDomains] = useState<string[]>(['Applied AI/ML', 'Climate/Civic Tech']);
   const [targetSize, setTargetSize] = useState<number>(4);
 
   const myMemberships = memberships.filter(
@@ -94,25 +113,126 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
     selectedHackathonForCreate.minTeamSize === null ||
     selectedHackathonForCreate.maxTeamSize === null;
 
-  const handleSubmitTeam = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!teamName.trim() || !teamPitch.trim()) return;
-    onCreateTeam({
-      hackathonId: createHackathonId,
-      name: teamName.trim(),
-      pitch: teamPitch.trim(),
-      projectIdea: projectIdea.trim(),
-      rolesNeeded,
-      desiredDomains,
-      targetSize,
+  const commitSpecializationTokens = (raw: string) => {
+    const parts = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (parts.length === 0) return;
+
+    setCustomSpecializations((prev) => {
+      const existingLower = new Set(prev.map((item) => item.toLowerCase()));
+      const additions: string[] = [];
+      for (const p of parts) {
+        if (!existingLower.has(p.toLowerCase())) {
+          existingLower.add(p.toLowerCase());
+          additions.push(p);
+        }
+      }
+      return [...prev, ...additions];
     });
-    setShowCreateModal(false);
+  };
+
+  const handleSpecKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      if (specInput.trim()) {
+        commitSpecializationTokens(specInput);
+        setSpecInput('');
+      }
+    } else if (
+      e.key === 'Backspace' &&
+      !specInput &&
+      customSpecializations.length > 0
+    ) {
+      setCustomSpecializations((prev) => prev.slice(0, -1));
+    }
+  };
+
+  const handleRemoveSpecialization = (label: string) => {
+    setCustomSpecializations((prev) => prev.filter((item) => item !== label));
+  };
+
+  const openCreateTeamModal = () => {
+    setEditingTeamId(null);
+    setCreateHackathonId(selectedHackathonId);
+    const h = hackathons.find((ev) => ev.id === selectedHackathonId);
+    if (h?.maxTeamSize) setTargetSize(h.maxTeamSize);
     setTeamName('');
     setTeamPitch('');
     setProjectIdea('');
+    setRolesNeeded(['Frontend', 'Product/UI Design']);
+    setCustomSpecializations([]);
+    setSpecInput('');
+    setShowCreateModal(true);
+  };
+
+  const openEditTeamModal = (team: Team) => {
+    setEditingTeamId(team.id);
+    setCreateHackathonId(team.hackathonId);
+    setTeamName(team.name);
+    setTeamPitch(team.pitch);
+    setProjectIdea(team.projectIdea ?? '');
+    setRolesNeeded([...team.rolesNeeded]);
+    setCustomSpecializations([...(team.customSpecializations ?? [])]);
+    setSpecInput('');
+    setTargetSize(team.targetSize);
+    setShowCreateModal(true);
+  };
+
+  const handleSubmitTeam = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!teamName.trim() || !teamPitch.trim()) return;
+
+    // Commit any pending text inside the specialization input
+    const finalSpecs = [...customSpecializations];
+    if (specInput.trim()) {
+      for (const token of specInput
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)) {
+        if (!finalSpecs.some((ex) => ex.toLowerCase() === token.toLowerCase())) {
+          finalSpecs.push(token);
+        }
+      }
+    }
+
+    if (editingTeamId && onUpdateTeam) {
+      onUpdateTeam(editingTeamId, {
+        name: teamName.trim(),
+        pitch: teamPitch.trim(),
+        rolesNeeded,
+        customSpecializations: finalSpecs,
+      });
+    } else {
+      onCreateTeam({
+        hackathonId: createHackathonId,
+        name: teamName.trim(),
+        pitch: teamPitch.trim(),
+        projectIdea: projectIdea.trim(),
+        rolesNeeded,
+        customSpecializations: finalSpecs,
+        desiredDomains,
+        targetSize,
+      });
+    }
+
+    setShowCreateModal(false);
+    setEditingTeamId(null);
+    setTeamName('');
+    setTeamPitch('');
+    setProjectIdea('');
+    setCustomSpecializations([]);
+    setSpecInput('');
   };
 
   const gridPulseTeam = teams.find((t) => t.id === 'team_gridpulse');
+
+  const hasUnsavedChanges =
+    teamName.trim().length > 0 ||
+    teamPitch.trim().length > 0 ||
+    specInput.trim().length > 0 ||
+    customSpecializations.length > 0;
 
   return (
     <div className="space-y-8">
@@ -131,12 +251,7 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
         </div>
 
         <button
-          onClick={() => {
-            setCreateHackathonId(selectedHackathonId);
-            const h = hackathons.find((ev) => ev.id === selectedHackathonId);
-            if (h?.maxTeamSize) setTargetSize(h.maxTeamSize);
-            setShowCreateModal(true);
-          }}
+          onClick={openCreateTeamModal}
           className="px-4 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg inline-flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer self-start lg:self-auto"
         >
           <Plus className="w-4 h-4" />
@@ -175,7 +290,7 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
         </div>
       )}
 
-      {/* Interactive Invariant & Concurrency Verification Lab (Section 6 & Section 12 Acceptance Tests) */}
+      {/* Interactive Invariant & Concurrency Verification Lab */}
       <div className="p-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-4">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="space-y-1">
@@ -229,13 +344,14 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
               const rosterMembers = memberships.filter(
                 (m) => m.teamId === team.id && m.status === 'active'
               );
+              const isLeader = team.leaderId === currentUser.uid;
 
               return (
                 <div
                   key={mem.id}
                   className="p-5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-4 flex flex-col justify-between"
                 >
-                  <div className="space-y-2.5">
+                  <div className="space-y-3">
                     <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
                       <span>{hack.name.split(' — ')[0]}</span>
                       <span className="font-mono tabular-nums font-bold text-slate-900 dark:text-slate-100">
@@ -243,11 +359,53 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
                       </span>
                     </div>
 
-                    <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
-                      {team.name}
-                    </h3>
+                    <div className="flex items-start justify-between gap-2">
+                      <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
+                        {team.name}
+                      </h3>
+                      {isLeader && onUpdateTeam && (
+                        <button
+                          type="button"
+                          onClick={() => openEditTeamModal(team)}
+                          className="px-2.5 py-1 text-xs font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 rounded-md inline-flex items-center gap-1 cursor-pointer shrink-0"
+                        >
+                          <Edit3 className="w-3 h-3" />
+                          Edit Roles & Specs
+                        </button>
+                      )}
+                    </div>
 
                     <p className="text-xs text-slate-600 dark:text-slate-300">{team.pitch}</p>
+
+                    {/* Complementary Roles & Custom Specializations */}
+                    <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800 text-xs">
+                      <div>
+                        <span className="font-semibold text-slate-700 dark:text-slate-300">
+                          Complementary Roles Needed:{' '}
+                        </span>
+                        <span className="text-slate-600 dark:text-slate-400">
+                          {team.rolesNeeded.join(' · ') || 'None specified'}
+                        </span>
+                      </div>
+
+                      {team.customSpecializations && team.customSpecializations.length > 0 && (
+                        <div className="space-y-1">
+                          <span className="font-semibold text-slate-700 dark:text-slate-300 block">
+                            Specific Specializations Needed:
+                          </span>
+                          <div className="flex flex-wrap gap-1.5">
+                            {team.customSpecializations.map((spec) => (
+                              <span
+                                key={spec}
+                                className="px-2 py-0.5 text-[11px] font-medium bg-indigo-50 dark:bg-indigo-950/50 text-indigo-800 dark:text-indigo-200 border border-indigo-200 dark:border-indigo-800 rounded-md"
+                              >
+                                {spec}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
 
                     <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1 text-xs">
                       <span className="font-semibold text-slate-700 dark:text-slate-300 block">
@@ -388,28 +546,20 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
         )}
       </div>
 
-      {/* Create Team Modal */}
+      {/* Standardized Create / Edit Team Modal (Requirement #5 & #6) */}
       {showCreateModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl max-w-xl w-full p-6 space-y-5">
-            <div className="flex items-start justify-between gap-4 border-b border-slate-200 dark:border-slate-800 pb-4">
-              <div>
-                <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100">
-                  Create a Hackathon Team
-                </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Target size is strictly bounded by the hackathon's verified min/max limits.
-                </p>
-              </div>
-              <button
-                onClick={() => setShowCreateModal(false)}
-                className="text-xs text-slate-500 hover:text-slate-900 cursor-pointer"
-              >
-                Close
-              </button>
-            </div>
-
-            <form onSubmit={handleSubmitTeam} className="space-y-4">
+        <Modal
+          onClose={() => {
+            setShowCreateModal(false);
+            setEditingTeamId(null);
+          }}
+          title={editingTeamId ? 'Edit Team Roles & Specializations' : 'Create a Hackathon Team'}
+          subtitle="Select standard roles and add custom specializations to rank complementary candidates."
+          maxWidthClass="max-w-xl"
+          hasUnsavedChanges={hasUnsavedChanges}
+        >
+          <form onSubmit={handleSubmitTeam} className="space-y-5">
+            {!editingTeamId && (
               <div>
                 <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
                   Select Hackathon
@@ -434,34 +584,36 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
                   ))}
                 </select>
               </div>
+            )}
 
-              {isCreateEventUnconfirmed ? (
-                <div className="p-3.5 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-lg text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2.5">
-                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
-                  <div>
-                    <span className="font-bold block">
-                      Invariant 7 Gate: Team Size Bounds Not Yet Confirmed
-                    </span>
-                    This event has <code className="font-mono">minTeamSize = null</code> and{' '}
-                    <code className="font-mono">maxTeamSize = null</code>. We never guess numeric capacity limits; an organizer or admin must verify the event's team size in the Review Queue before fixed-capacity rosters can be locked.
-                  </div>
+            {!editingTeamId && isCreateEventUnconfirmed ? (
+              <div className="p-3.5 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-lg text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                <div>
+                  <span className="font-bold block">
+                    Team Size Bounds Not Yet Confirmed
+                  </span>
+                  This event has <code className="font-mono">minTeamSize = null</code> and{' '}
+                  <code className="font-mono">maxTeamSize = null</code>. We never guess numeric capacity limits; an organizer or admin must verify the event's team size in the Review Queue before fixed-capacity rosters can be locked.
                 </div>
-              ) : (
-                <>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <div className="sm:col-span-2">
-                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                        Team Name *
-                      </label>
-                      <input
-                        type="text"
-                        required
-                        value={teamName}
-                        onChange={(e) => setTeamName(e.target.value)}
-                        placeholder="e.g., SignalForge PES"
-                        className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                      />
-                    </div>
+              </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className={editingTeamId ? 'sm:col-span-3' : 'sm:col-span-2'}>
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                      Team Name *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={teamName}
+                      onChange={(e) => setTeamName(e.target.value)}
+                      placeholder="e.g., SignalForge PES"
+                      className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
+                    />
+                  </div>
+                  {!editingTeamId && (
                     <div>
                       <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
                         Target Size ({selectedHackathonForCreate.minTeamSize}–{selectedHackathonForCreate.maxTeamSize})
@@ -485,73 +637,147 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
                         className="w-full px-3 py-2 text-xs font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
                       />
                     </div>
+                  )}
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                    Team Pitch & What You Are Building *
+                  </label>
+                  <textarea
+                    rows={2}
+                    required
+                    value={teamPitch}
+                    onChange={(e) => setTeamPitch(e.target.value)}
+                    placeholder="Summarize your problem statement and current progress..."
+                    className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
+                  />
+                </div>
+
+                {/* Complementary Roles Needed */}
+                <div className="space-y-2">
+                  <label className="block text-xs font-semibold text-slate-800 dark:text-slate-200">
+                    Complementary Roles Needed
+                  </label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {ROLE_TAXONOMY.map((role) => {
+                      const selected = rolesNeeded.includes(role);
+                      return (
+                        <button
+                          key={role}
+                          type="button"
+                          onClick={() =>
+                            setRolesNeeded(
+                              selected
+                                ? rolesNeeded.filter((r) => r !== role)
+                                : [...rolesNeeded, role]
+                            )
+                          }
+                          className={`px-2.5 py-1 text-xs rounded-md border cursor-pointer transition-colors ${
+                            selected
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          {role}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Custom Specializations Input (Requirement #5) */}
+                <div className="space-y-2 pt-3 border-t border-slate-100 dark:border-slate-800">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="block text-xs font-semibold text-slate-800 dark:text-slate-200">
+                      Other specializations we're looking for
+                    </label>
+                    <span className="text-[11px] text-slate-400">
+                      Press Enter or comma (,) to add chip
+                    </span>
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                      Team Pitch & What You Are Building *
-                    </label>
-                    <textarea
-                      rows={2}
-                      required
-                      value={teamPitch}
-                      onChange={(e) => setTeamPitch(e.target.value)}
-                      placeholder="Summarize your problem statement and current progress..."
-                      className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
+                  <div className="p-2.5 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg space-y-2">
+                    {customSpecializations.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5">
+                        {customSpecializations.map((spec) => (
+                          <span
+                            key={spec}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-indigo-600 text-white rounded-md"
+                          >
+                            <span>{spec}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveSpecialization(spec)}
+                              aria-label={`Remove ${spec}`}
+                              className="hover:text-indigo-200 cursor-pointer"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    <input
+                      type="text"
+                      value={specInput}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val.includes(',')) {
+                          commitSpecializationTokens(val);
+                          setSpecInput('');
+                        } else {
+                          setSpecInput(val);
+                        }
+                      }}
+                      onKeyDown={handleSpecKeyDown}
+                      placeholder='e.g. "ROS2", "Verilog", "Figma", "Smart Contracts", "RAG", "Pitch Deck"...'
+                      className="w-full px-2 py-1 text-xs bg-transparent text-slate-900 dark:text-slate-100 focus:outline-none"
                     />
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                      Complementary Roles Needed (Drives Team-Candidate Ranking)
-                    </label>
-                    <div className="flex flex-wrap gap-1.5">
-                      {ROLE_TAXONOMY.map((role) => {
-                        const selected = rolesNeeded.includes(role);
-                        return (
-                          <button
-                            key={role}
-                            type="button"
-                            onClick={() =>
-                              setRolesNeeded(
-                                selected
-                                  ? rolesNeeded.filter((r) => r !== role)
-                                  : [...rolesNeeded, role]
-                              )
-                            }
-                            className={`px-2.5 py-1 text-xs rounded-md border cursor-pointer ${
-                              selected
-                                ? 'bg-blue-600 text-white border-blue-600'
-                                : 'bg-white dark:bg-slate-950 text-slate-600 border-slate-200 dark:border-slate-700'
-                            }`}
-                          >
-                            {role}
-                          </button>
-                        );
-                      })}
-                    </div>
+                  {/* Quick-add common custom specialization chips */}
+                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                    <span className="text-[11px] text-slate-400 inline-flex items-center gap-1 mr-1">
+                      <Sparkles className="w-3 h-3 text-indigo-500" />
+                      Quick add:
+                    </span>
+                    {SUGGESTED_CUSTOM_SPECIALIZATIONS.map((suggestion) => {
+                      const alreadyAdded = customSpecializations.some(
+                        (s) => s.toLowerCase() === suggestion.toLowerCase()
+                      );
+                      return (
+                        <button
+                          key={suggestion}
+                          type="button"
+                          disabled={alreadyAdded}
+                          onClick={() => commitSpecializationTokens(suggestion)}
+                          className={`px-2 py-0.5 text-[11px] rounded border transition-colors ${
+                            alreadyAdded
+                              ? 'bg-slate-100 dark:bg-slate-800 text-slate-400 border-slate-200 dark:border-slate-800 cursor-default'
+                              : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-indigo-400 cursor-pointer'
+                          }`}
+                        >
+                          + {suggestion}
+                        </button>
+                      );
+                    })}
                   </div>
+                </div>
 
-                  <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-200 dark:border-slate-800">
-                    <button
-                      type="button"
-                      onClick={() => setShowCreateModal(false)}
-                      className="px-4 py-2 text-xs font-medium text-slate-600 cursor-pointer"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="submit"
-                      className="px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer"
-                    >
-                      Create Compliant Team
-                    </button>
-                  </div>
-                </>
-              )}
-            </form>
-          </div>
-        </div>
+                <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 dark:border-slate-800">
+                  <button
+                    type="submit"
+                    className="px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer"
+                  >
+                    {editingTeamId ? 'Save Team Changes' : 'Create Compliant Team'}
+                  </button>
+                </div>
+              </>
+            )}
+          </form>
+        </Modal>
       )}
     </div>
   );

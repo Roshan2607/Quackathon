@@ -607,6 +607,31 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                         Wants to explore/learn: {topCard.rolesWantToLearn.join(' · ')}
                       </div>
                     )}
+                    {topCard.customSpecializations && topCard.customSpecializations.length > 0 && (
+                      <div className="pt-1 space-y-1">
+                        <span className="text-[11px] text-slate-400 block">
+                          Other Specializations Looking For:
+                        </span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {topCard.customSpecializations.map((spec) => {
+                            const isMatched = topCard.matchedSpecializations?.includes(spec);
+                            return (
+                              <span
+                                key={spec}
+                                className={`px-2 py-0.5 text-[11px] font-medium rounded-md border ${
+                                  isMatched
+                                    ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-200 border-emerald-300 dark:border-emerald-700'
+                                    : 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-800 dark:text-indigo-200 border-indigo-200 dark:border-indigo-800'
+                                }`}
+                              >
+                                {spec}
+                                {isMatched ? ' ✓' : ''}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   <div className="space-y-1.5">
@@ -616,6 +641,20 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                     <div className="text-slate-800 dark:text-slate-200 font-medium">
                       {topCard.skills.join(' · ')}
                     </div>
+                    {topCard.type === 'person' &&
+                      topCard.matchedSpecializations &&
+                      topCard.matchedSpecializations.length > 0 && (
+                        <div className="pt-1 flex flex-wrap gap-1.5">
+                          {topCard.matchedSpecializations.map((spec) => (
+                            <span
+                              key={spec}
+                              className="px-2 py-0.5 text-[11px] font-medium bg-emerald-50 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-200 border border-emerald-300 dark:border-emerald-700 rounded-md"
+                            >
+                              Matches Team Spec: {spec} ✓
+                            </span>
+                          ))}
+                        </div>
+                      )}
                   </div>
 
                   <div className="space-y-1">
@@ -775,6 +814,29 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                       </span>{' '}
                       {card.rolesOfferedOrNeeded.join(' · ')}
                     </div>
+                    {card.customSpecializations && card.customSpecializations.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1 text-xs">
+                        <span className="font-semibold text-slate-800 dark:text-slate-200 mr-1">
+                          Specializations:
+                        </span>
+                        {card.customSpecializations.map((spec) => {
+                          const isMatched = card.matchedSpecializations?.includes(spec);
+                          return (
+                            <span
+                              key={spec}
+                              className={`px-1.5 py-0.5 text-[11px] font-medium rounded border ${
+                                isMatched
+                                  ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-200 border-emerald-300 dark:border-emerald-700'
+                                  : 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-800 dark:text-indigo-200 border-indigo-200 dark:border-indigo-800'
+                              }`}
+                            >
+                              {spec}
+                              {isMatched ? ' ✓' : ''}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
                     <div className="text-xs text-slate-600 dark:text-slate-400">
                       <span className="font-semibold text-slate-800 dark:text-slate-200">
                         Skills:
