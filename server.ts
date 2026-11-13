@@ -814,7 +814,7 @@ async function safeFetchFollowRedirects(
 // ============================================================================
 // 1. Integration Configuration Status Endpoint (Never exposes secret values)
 // ============================================================================
-app.get('/api/integrations/status', (_req, res) => {
+app.get('/api/integrations/status', (req, res) => {
   const hasGeminiKey = hasValidGeminiApiKey();
   const hasGithubToken = Boolean(
     process.env.GITHUB_TOKEN && process.env.GITHUB_TOKEN.trim().length > 0
@@ -826,8 +826,8 @@ app.get('/api/integrations/status', (_req, res) => {
     process.env.PESU_OAUTH_CLIENT_SECRET &&
       process.env.PESU_OAUTH_CLIENT_SECRET.trim().length > 0
   );
-  const pesuIssuer =
-    process.env.PESU_OAUTH_ISSUER_URL || 'https://pesu-oauth2.onrender.com';
+  const issuerResolution = resolveAndValidatePesuIssuerUrl(req);
+  const { expectedRedirectUri } = getAllowedRedirectUris(req);
   const primaryModel = getConfiguredPrimaryModel();
 
   res.json({
@@ -843,6 +843,8 @@ app.get('/api/integrations/status', (_req, res) => {
       geminiApi: {
         configured: hasGeminiKey,
         model: primaryModel,
+        primaryModel,
+        fallbackModel: process.env.GEMINI_FALLBACK_MODEL?.trim() || 'gemini-2.0-flash',
         maxRetries: getConfiguredMaxRetries(),
         note: hasGeminiKey
           ? `GEMINI_API_KEY is present on server (Primary model: ${primaryModel}).`
@@ -856,7 +858,10 @@ app.get('/api/integrations/status', (_req, res) => {
         configured: hasPesuClientId,
         hasClientId: hasPesuClientId,
         hasClientSecret: hasPesuClientSecret,
-        issuerUrl: pesuIssuer,
+        issuerUrl: issuerResolution.issuerBaseUrl,
+        rawConfiguredIssuerUrl: issuerResolution.rawEnvIssuer || null,
+        configWarning: issuerResolution.configWarning,
+        registeredRedirectUri: expectedRedirectUri,
         note: hasPesuClientId
           ? 'PESU OAuth2 Client ID configured.'
           : 'PESU_OAUTH_CLIENT_ID is not set. Live OIDC provider discovery can be tested; full authorization & token exchange requires registered client credentials from PESU-Dev.',
@@ -2111,6 +2116,83 @@ function resolveTrustedAppOrigin(req: express.Request): string {
   return `${proto}://${host}`;
 }
 
+const CANONICAL_PESU_OAUTH_ISSUER = 'https://pesu-oauth2.onrender.com';
+
+/**
+ * Validates and normalizes `PESU_OAUTH_ISSUER_URL` so it never points to the
+ * Quackathon frontend, a Vite SPA fallback, or an `/auth/pesu/callback` URL.
+ */
+export function resolveAndValidatePesuIssuerUrl(req?: express.Request): {
+  issuerBaseUrl: string;
+  rawEnvIssuer: string;
+  configWarning: string | null;
+  misconfiguredCallbackUrl: string | null;
+} {
+  const rawEnvIssuer = (process.env.PESU_OAUTH_ISSUER_URL ?? '').trim();
+  if (!rawEnvIssuer || rawEnvIssuer === 'MY_PESU_OAUTH_ISSUER_URL') {
+    return {
+      issuerBaseUrl: CANONICAL_PESU_OAUTH_ISSUER,
+      rawEnvIssuer: '',
+      configWarning: null,
+      misconfiguredCallbackUrl: null,
+    };
+  }
+
+  // Strip trailing /.well-known/openid-configuration or trailing slashes if supplied
+  const stripped = rawEnvIssuer
+    .replace(/\/\.well-known\/openid-configuration\/?$/i, '')
+    .replace(/\/+$/, '');
+
+  let parsed: URL;
+  try {
+    parsed = new URL(stripped);
+  } catch {
+    return {
+      issuerBaseUrl: CANONICAL_PESU_OAUTH_ISSUER,
+      rawEnvIssuer,
+      configWarning: `PESU_OAUTH_ISSUER_URL ("${rawEnvIssuer}") is not a valid URL. Normalized to "${CANONICAL_PESU_OAUTH_ISSUER}".`,
+      misconfiguredCallbackUrl: null,
+    };
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return {
+      issuerBaseUrl: CANONICAL_PESU_OAUTH_ISSUER,
+      rawEnvIssuer,
+      configWarning: `PESU_OAUTH_ISSUER_URL ("${rawEnvIssuer}") uses unsupported protocol "${parsed.protocol}". Normalized to "${CANONICAL_PESU_OAUTH_ISSUER}".`,
+      misconfiguredCallbackUrl: null,
+    };
+  }
+
+  const appOrigin = req ? resolveTrustedAppOrigin(req) : '';
+  const hostLower = parsed.hostname.toLowerCase();
+  const pathLower = parsed.pathname.toLowerCase();
+
+  const isSelfOrCallbackUrl =
+    pathLower.includes('/auth/pesu/callback') ||
+    hostLower.startsWith('ais-dev-') ||
+    hostLower.startsWith('ais-pre-') ||
+    (appOrigin.length > 0 && stripped.toLowerCase().startsWith(appOrigin.toLowerCase())) ||
+    ((hostLower === 'localhost' || hostLower === '127.0.0.1') &&
+      parsed.port === String(PORT));
+
+  if (isSelfOrCallbackUrl) {
+    return {
+      issuerBaseUrl: CANONICAL_PESU_OAUTH_ISSUER,
+      rawEnvIssuer,
+      configWarning: `PESU_OAUTH_ISSUER_URL ("${rawEnvIssuer}") pointed to the Quackathon application/callback URL instead of the OAuth2 provider. Automatically normalized issuer base URL to "${CANONICAL_PESU_OAUTH_ISSUER}".`,
+      misconfiguredCallbackUrl: pathLower.includes('/auth/pesu/callback') ? stripped : null,
+    };
+  }
+
+  return {
+    issuerBaseUrl: stripped,
+    rawEnvIssuer,
+    configWarning: null,
+    misconfiguredCallbackUrl: null,
+  };
+}
+
 function getAllowedRedirectUris(req: express.Request): {
   expectedRedirectUri: string;
   allowedRedirectUris: string[];
@@ -2118,11 +2200,13 @@ function getAllowedRedirectUris(req: express.Request): {
   const origin = resolveTrustedAppOrigin(req);
   const defaultCallback = `${origin}/auth/pesu/callback`;
   const configuredRedirect = process.env.PESU_OAUTH_REDIRECT_URI?.trim();
+  const issuerResolution = resolveAndValidatePesuIssuerUrl(req);
 
   const allowed = Array.from(
     new Set(
       [
         configuredRedirect,
+        issuerResolution.misconfiguredCallbackUrl ?? undefined,
         defaultCallback,
         'https://ais-dev-br3lg427hqulcvidjuf6bn-148109744684.asia-east1.run.app/auth/pesu/callback',
         'https://ais-pre-br3lg427hqulcvidjuf6bn-148109744684.asia-east1.run.app/auth/pesu/callback',
@@ -2132,102 +2216,396 @@ function getAllowedRedirectUris(req: express.Request): {
   );
 
   return {
-    expectedRedirectUri: configuredRedirect || defaultCallback,
+    expectedRedirectUri:
+      configuredRedirect || issuerResolution.misconfiguredCallbackUrl || defaultCallback,
     allowedRedirectUris: allowed,
   };
 }
 
-async function discoverPesuOidcEndpoints(): Promise<{
+function isValidHttpUrl(val: unknown): val is string {
+  if (typeof val !== 'string' || !val.trim()) return false;
+  try {
+    const u = new URL(val.trim());
+    return u.protocol === 'https:' || u.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+function createSafeDiagnosticSnippet(rawText: string, maxLen = 220): string {
+  const collapsed = rawText
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!collapsed) return '(empty response body)';
+  return collapsed.length > maxLen ? `${collapsed.slice(0, maxLen)}...` : collapsed;
+}
+
+async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
   providerReachable: boolean;
   oidcDiscoveryAvailable: boolean;
+  requestedUrl: string;
+  responseUrl: string | null;
   httpStatus: number;
-  issuer: string;
-  authorizationEndpoint: string;
-  tokenEndpoint: string;
+  contentType: string | null;
+  redirectChain: string[];
+  issuer: string | null;
+  authorizationEndpoint: string | null;
+  tokenEndpoint: string | null;
   userinfoEndpoint: string | null;
+  jwksUri: string | null;
+  revocationEndpoint: string | null;
+  responseTypesSupported: string[];
+  codeChallengeMethodsSupported: string[];
+  tokenEndpointAuthMethodsSupported: string[];
   supportedScopes: string[];
+  configWarning: string | null;
+  diagnosticSnippet: string | null;
+  errorCategory: IntegrationErrorCategory;
   note?: string;
 }> {
-  const configuredIssuer = (
-    process.env.PESU_OAUTH_ISSUER_URL || 'https://pesu-oauth2.onrender.com'
-  )
-    .trim()
-    .replace(/\/$/, '');
+  const { issuerBaseUrl, configWarning } = resolveAndValidatePesuIssuerUrl(req);
+  const requestedUrl = `${issuerBaseUrl}/.well-known/openid-configuration`;
+  const redirectChain: string[] = [requestedUrl];
   const fetchFn = getFetch();
+  const appOrigin = req ? resolveTrustedAppOrigin(req) : '';
+
+  let currentUrl = requestedUrl;
+  const maxHops = 4;
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    const oidcResp = await fetchFn(
-      `${configuredIssuer}/.well-known/openid-configuration`,
-      { signal: controller.signal }
-    );
-    clearTimeout(timer);
+    for (let hop = 0; hop <= maxHops; hop++) {
+      // Ensure no redirect hop ever targets the Quackathon frontend or callback route
+      const hopParsed = new URL(currentUrl);
+      const hopHost = hopParsed.hostname.toLowerCase();
+      if (
+        hopParsed.pathname.toLowerCase().includes('/auth/pesu/callback') ||
+        hopHost.startsWith('ais-dev-') ||
+        hopHost.startsWith('ais-pre-') ||
+        (appOrigin && currentUrl.toLowerCase().startsWith(appOrigin.toLowerCase()))
+      ) {
+        return {
+          providerReachable: false,
+          oidcDiscoveryAvailable: false,
+          requestedUrl,
+          responseUrl: currentUrl,
+          httpStatus: 502,
+          contentType: null,
+          redirectChain,
+          issuer: null,
+          authorizationEndpoint: null,
+          tokenEndpoint: null,
+          userinfoEndpoint: null,
+          jwksUri: null,
+          revocationEndpoint: null,
+          responseTypesSupported: [],
+          codeChallengeMethodsSupported: [],
+          tokenEndpointAuthMethodsSupported: [],
+          supportedScopes: [],
+          configWarning,
+          diagnosticSnippet: `Blocked redirect hop to local application frontend (${currentUrl}).`,
+          errorCategory: 'INVALID_DISCOVERY_METADATA',
+          note: `Discovery request redirected to the application's own frontend (${currentUrl}) instead of an OIDC provider.`,
+        };
+      }
 
-    if (oidcResp.ok) {
-      const cfg = (await oidcResp.json()) as Record<string, unknown>;
-      const discoveredIssuer =
-        typeof cfg.issuer === 'string'
-          ? cfg.issuer.replace(/\/$/, '')
-          : configuredIssuer;
-      const authorizationEndpoint =
-        typeof cfg.authorization_endpoint === 'string'
-          ? cfg.authorization_endpoint
-          : `${discoveredIssuer}/authorize`;
-      const tokenEndpoint =
-        typeof cfg.token_endpoint === 'string'
-          ? cfg.token_endpoint
-          : `${discoveredIssuer}/token`;
-      const userinfoEndpoint =
-        typeof cfg.userinfo_endpoint === 'string' ? cfg.userinfo_endpoint : null;
-      const supportedScopes = Array.isArray(cfg.scopes_supported)
-        ? (cfg.scopes_supported as string[])
-        : DEFAULT_SUPPORTED_SCOPES;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6000);
+      let oidcResp: Response;
+      try {
+        oidcResp = await fetchFn(currentUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: {
+            Accept: 'application/json, application/openid-configuration+json',
+            'User-Agent': 'Quackathon-OIDC-Discovery/1.0',
+          },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if ([301, 302, 303, 307, 308].includes(oidcResp.status)) {
+        const location = oidcResp.headers.get('location');
+        if (!location) {
+          return {
+            providerReachable: false,
+            oidcDiscoveryAvailable: false,
+            requestedUrl,
+            responseUrl: currentUrl,
+            httpStatus: oidcResp.status,
+            contentType: oidcResp.headers.get('content-type'),
+            redirectChain,
+            issuer: null,
+            authorizationEndpoint: null,
+            tokenEndpoint: null,
+            userinfoEndpoint: null,
+            jwksUri: null,
+            revocationEndpoint: null,
+            responseTypesSupported: [],
+            codeChallengeMethodsSupported: [],
+            tokenEndpointAuthMethodsSupported: [],
+            supportedScopes: [],
+            configWarning,
+            diagnosticSnippet: `HTTP ${oidcResp.status} redirect without Location header.`,
+            errorCategory: 'INVALID_DISCOVERY_METADATA',
+            note: `Discovery endpoint returned HTTP ${oidcResp.status} redirect without a Location header.`,
+          };
+        }
+        const nextUrl = new URL(location, currentUrl).toString();
+        redirectChain.push(nextUrl);
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      const responseUrl = oidcResp.url || currentUrl;
+      const httpStatus = oidcResp.status;
+      const contentType = oidcResp.headers.get('content-type') ?? 'unknown';
+      const rawBody = await oidcResp.text();
+      const diagnosticSnippet = createSafeDiagnosticSnippet(rawBody);
+      const trimmedBody = rawBody.trimStart();
+
+      // 1. Detect HTML responses (e.g., <!doctype html> or text/html) before JSON.parse
+      const isHtmlContent =
+        /text\/html|application\/xhtml\+xml/i.test(contentType) ||
+        trimmedBody.startsWith('<!doctype') ||
+        trimmedBody.startsWith('<!DOCTYPE') ||
+        trimmedBody.startsWith('<html') ||
+        trimmedBody.startsWith('<');
+
+      if (isHtmlContent) {
+        return {
+          providerReachable: false,
+          oidcDiscoveryAvailable: false,
+          requestedUrl,
+          responseUrl,
+          httpStatus,
+          contentType,
+          redirectChain,
+          issuer: null,
+          authorizationEndpoint: null,
+          tokenEndpoint: null,
+          userinfoEndpoint: null,
+          jwksUri: null,
+          revocationEndpoint: null,
+          responseTypesSupported: [],
+          codeChallengeMethodsSupported: [],
+          tokenEndpointAuthMethodsSupported: [],
+          supportedScopes: [],
+          configWarning,
+          diagnosticSnippet,
+          errorCategory: 'INVALID_DISCOVERY_HTML',
+          note: `Expected OIDC JSON metadata from ${responseUrl}, but received an HTML document (HTTP ${httpStatus}, Content-Type: ${contentType}).`,
+        };
+      }
+
+      // 2. Handle non-200 HTTP statuses (404, 502, 503, etc.)
+      if (!oidcResp.ok) {
+        const errCat: IntegrationErrorCategory =
+          httpStatus === 404 ? 'NOT_FOUND' : 'UPSTREAM_5XX';
+        return {
+          providerReachable: false,
+          oidcDiscoveryAvailable: false,
+          requestedUrl,
+          responseUrl,
+          httpStatus,
+          contentType,
+          redirectChain,
+          issuer: null,
+          authorizationEndpoint: null,
+          tokenEndpoint: null,
+          userinfoEndpoint: null,
+          jwksUri: null,
+          revocationEndpoint: null,
+          responseTypesSupported: [],
+          codeChallengeMethodsSupported: [],
+          tokenEndpointAuthMethodsSupported: [],
+          supportedScopes: [],
+          configWarning,
+          diagnosticSnippet,
+          errorCategory: errCat,
+          note: `OIDC discovery endpoint (${responseUrl}) returned HTTP ${httpStatus} (Content-Type: ${contentType}).`,
+        };
+      }
+
+      // 3. Parse JSON safely
+      let cfg: Record<string, unknown>;
+      try {
+        const parsedJson = JSON.parse(rawBody);
+        if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
+          throw new Error('Root JSON value is not an object.');
+        }
+        cfg = parsedJson as Record<string, unknown>;
+      } catch (parseErr: unknown) {
+        return {
+          providerReachable: false,
+          oidcDiscoveryAvailable: false,
+          requestedUrl,
+          responseUrl,
+          httpStatus,
+          contentType,
+          redirectChain,
+          issuer: null,
+          authorizationEndpoint: null,
+          tokenEndpoint: null,
+          userinfoEndpoint: null,
+          jwksUri: null,
+          revocationEndpoint: null,
+          responseTypesSupported: [],
+          codeChallengeMethodsSupported: [],
+          tokenEndpointAuthMethodsSupported: [],
+          supportedScopes: [],
+          configWarning,
+          diagnosticSnippet,
+          errorCategory: 'INVALID_DISCOVERY_METADATA',
+          note: `Discovery endpoint (${responseUrl}) did not return valid JSON (${
+            parseErr instanceof Error ? parseErr.message : 'parse error'
+          }).`,
+        };
+      }
+
+      // 4. Validate required OIDC Discovery 1.0 fields (never substitute hardcoded fake URLs)
+      const discoveredIssuer = isValidHttpUrl(cfg.issuer)
+        ? cfg.issuer.trim().replace(/\/$/, '')
+        : null;
+      const authorizationEndpoint = isValidHttpUrl(cfg.authorization_endpoint)
+        ? cfg.authorization_endpoint.trim()
+        : null;
+      const tokenEndpoint = isValidHttpUrl(cfg.token_endpoint)
+        ? cfg.token_endpoint.trim()
+        : null;
+
+      if (!discoveredIssuer || !authorizationEndpoint || !tokenEndpoint) {
+        return {
+          providerReachable: false,
+          oidcDiscoveryAvailable: false,
+          requestedUrl,
+          responseUrl,
+          httpStatus,
+          contentType,
+          redirectChain,
+          issuer: discoveredIssuer,
+          authorizationEndpoint,
+          tokenEndpoint,
+          userinfoEndpoint: null,
+          jwksUri: null,
+          revocationEndpoint: null,
+          responseTypesSupported: [],
+          codeChallengeMethodsSupported: [],
+          tokenEndpointAuthMethodsSupported: [],
+          supportedScopes: [],
+          configWarning,
+          diagnosticSnippet,
+          errorCategory: 'INVALID_DISCOVERY_METADATA',
+          note: `Discovery response from ${responseUrl} is missing required OIDC fields (issuer, authorization_endpoint, or token_endpoint).`,
+        };
+      }
+
+      const userinfoEndpoint = isValidHttpUrl(cfg.userinfo_endpoint)
+        ? cfg.userinfo_endpoint.trim()
+        : null;
+      const jwksUri = isValidHttpUrl(cfg.jwks_uri) ? cfg.jwks_uri.trim() : null;
+      const revocationEndpoint = isValidHttpUrl(cfg.revocation_endpoint)
+        ? cfg.revocation_endpoint.trim()
+        : null;
+
+      const responseTypesSupported = Array.isArray(cfg.response_types_supported)
+        ? cfg.response_types_supported.filter((x): x is string => typeof x === 'string')
+        : [];
+      const codeChallengeMethodsSupported = Array.isArray(
+        cfg.code_challenge_methods_supported
+      )
+        ? cfg.code_challenge_methods_supported.filter(
+            (x): x is string => typeof x === 'string'
+          )
+        : [];
+      const tokenEndpointAuthMethodsSupported = Array.isArray(
+        cfg.token_endpoint_auth_methods_supported
+      )
+        ? cfg.token_endpoint_auth_methods_supported.filter(
+            (x): x is string => typeof x === 'string'
+          )
+        : [];
+      const supportedScopes =
+        Array.isArray(cfg.scopes_supported) && cfg.scopes_supported.length > 0
+          ? cfg.scopes_supported.filter((x): x is string => typeof x === 'string')
+          : DEFAULT_SUPPORTED_SCOPES;
 
       return {
         providerReachable: true,
         oidcDiscoveryAvailable: true,
-        httpStatus: oidcResp.status,
+        requestedUrl,
+        responseUrl,
+        httpStatus,
+        contentType,
+        redirectChain,
         issuer: discoveredIssuer,
         authorizationEndpoint,
         tokenEndpoint,
         userinfoEndpoint,
+        jwksUri,
+        revocationEndpoint,
+        responseTypesSupported,
+        codeChallengeMethodsSupported,
+        tokenEndpointAuthMethodsSupported,
         supportedScopes,
+        configWarning,
+        diagnosticSnippet,
+        errorCategory: 'NONE',
+        note: `Validated OIDC metadata from ${discoveredIssuer} (scopes: ${supportedScopes.join(
+          ', '
+        )}).`,
       };
     }
 
-    // Fallback probe to root endpoint for non-OIDC OAuth2 deployments
-    const controller2 = new AbortController();
-    const timer2 = setTimeout(() => controller2.abort(), 4500);
-    const rootResp = await fetchFn(configuredIssuer, { signal: controller2.signal });
-    clearTimeout(timer2);
-
-    return {
-      providerReachable: rootResp.ok,
-      oidcDiscoveryAvailable: false,
-      httpStatus: rootResp.status,
-      issuer: configuredIssuer,
-      authorizationEndpoint: `${configuredIssuer}/oauth2/authorize`,
-      tokenEndpoint: `${configuredIssuer}/oauth2/token`,
-      userinfoEndpoint: `${configuredIssuer}/api/v1/user`,
-      supportedScopes: DEFAULT_SUPPORTED_SCOPES,
-      note: rootResp.ok
-        ? `Provider root reachable (HTTP ${rootResp.status}); using standard pesu-dev/oauth2 endpoints.`
-        : `Provider responded with HTTP ${rootResp.status}.`,
-    };
-  } catch (err: unknown) {
     return {
       providerReachable: false,
       oidcDiscoveryAvailable: false,
+      requestedUrl,
+      responseUrl: currentUrl,
+      httpStatus: 310,
+      contentType: null,
+      redirectChain,
+      issuer: null,
+      authorizationEndpoint: null,
+      tokenEndpoint: null,
+      userinfoEndpoint: null,
+      jwksUri: null,
+      revocationEndpoint: null,
+      responseTypesSupported: [],
+      codeChallengeMethodsSupported: [],
+      tokenEndpointAuthMethodsSupported: [],
+      supportedScopes: [],
+      configWarning,
+      diagnosticSnippet: `Exceeded maximum redirect hops (${maxHops}).`,
+      errorCategory: 'NETWORK_ERROR',
+      note: `Exceeded maximum redirect hops (${maxHops}) while probing ${requestedUrl}.`,
+    };
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    return {
+      providerReachable: false,
+      oidcDiscoveryAvailable: false,
+      requestedUrl,
+      responseUrl: null,
       httpStatus: 502,
-      issuer: configuredIssuer,
-      authorizationEndpoint: `${configuredIssuer}/oauth2/authorize`,
-      tokenEndpoint: `${configuredIssuer}/oauth2/token`,
-      userinfoEndpoint: `${configuredIssuer}/api/v1/user`,
-      supportedScopes: DEFAULT_SUPPORTED_SCOPES,
-      note: `Could not reach PESU OAuth2 provider at ${configuredIssuer}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      contentType: null,
+      redirectChain,
+      issuer: null,
+      authorizationEndpoint: null,
+      tokenEndpoint: null,
+      userinfoEndpoint: null,
+      jwksUri: null,
+      revocationEndpoint: null,
+      responseTypesSupported: [],
+      codeChallengeMethodsSupported: [],
+      tokenEndpointAuthMethodsSupported: [],
+      supportedScopes: [],
+      configWarning,
+      diagnosticSnippet: createSafeDiagnosticSnippet(errMsg),
+      errorCategory: 'NETWORK_ERROR',
+      note: `Could not reach PESU OAuth2 OIDC discovery endpoint (${requestedUrl}): ${errMsg}`,
     };
   }
 }
@@ -2239,45 +2617,65 @@ app.get('/api/pesu-oauth/discovery', async (req, res) => {
   const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
   const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
 
-  const disc = await discoverPesuOidcEndpoints();
+  const disc = await discoverPesuOidcEndpoints(req);
   session.stages.providerDiscovery = disc.oidcDiscoveryAvailable
     ? 'ok'
-    : disc.providerReachable
-    ? 'degraded_fallback'
+    : disc.errorCategory === 'INVALID_DISCOVERY_HTML' ||
+      disc.errorCategory === 'INVALID_DISCOVERY_METADATA'
+    ? 'invalid_response'
     : 'unreachable';
+
+  const statusToReturn = disc.oidcDiscoveryAvailable
+    ? 200
+    : disc.httpStatus && disc.httpStatus >= 400 && disc.httpStatus < 600
+    ? disc.httpStatus
+    : 502;
 
   const diag: DeveloperDiagnosticTelemetry = {
     serviceName: 'pesu_oauth2',
-    httpStatus: disc.providerReachable ? 200 : 502,
-    errorCategory: disc.providerReachable ? 'NONE' : 'NETWORK_ERROR',
+    httpStatus: statusToReturn,
+    errorCategory: disc.errorCategory,
     retryAttempts: 0,
     durationMs: Date.now() - startTime,
   };
   session.lastDiagnostics = diag;
 
   const response: PesuOAuthDiscoveryResponse = {
-    ok: disc.providerReachable,
+    ok: disc.oidcDiscoveryAvailable,
     live: true,
     providerReachable: disc.providerReachable,
     oidcDiscoveryAvailable: disc.oidcDiscoveryAvailable,
+    requestedUrl: disc.requestedUrl,
+    responseUrl: disc.responseUrl,
+    httpStatus: disc.httpStatus,
+    contentType: disc.contentType,
+    redirectChain: disc.redirectChain,
     issuer: disc.issuer,
     authorizationEndpoint: disc.authorizationEndpoint,
     tokenEndpoint: disc.tokenEndpoint,
     userinfoEndpoint: disc.userinfoEndpoint,
+    jwksUri: disc.jwksUri,
+    revocationEndpoint: disc.revocationEndpoint,
+    responseTypesSupported: disc.responseTypesSupported,
+    codeChallengeMethodsSupported: disc.codeChallengeMethodsSupported,
+    tokenEndpointAuthMethodsSupported: disc.tokenEndpointAuthMethodsSupported,
     supportedScopes: disc.supportedScopes,
     clientConfigured: hasClientId,
     clientSecretConfigured: hasClientSecret,
     expectedRedirectUri,
     allowedRedirectUris,
     stages: session.stages,
-    userMessage: disc.providerReachable
-      ? `Discovered PESU OAuth2 endpoints from ${disc.issuer}.`
-      : `PESU OAuth2 provider (${disc.issuer}) is currently unreachable.`,
+    userMessage: disc.oidcDiscoveryAvailable
+      ? `Discovered valid OIDC metadata from ${disc.issuer} (HTTP ${disc.httpStatus}, Content-Type: ${disc.contentType}).`
+      : disc.note || `PESU OAuth2 OIDC discovery failed (${disc.requestedUrl}).`,
     note: disc.note,
+    configWarning: disc.configWarning,
+    diagnosticSnippet: disc.diagnosticSnippet,
+    errorCategory: disc.errorCategory,
     diagnostics: diag,
   };
 
-  res.status(disc.providerReachable ? 200 : 502).json(response);
+  res.status(statusToReturn).json(response);
 });
 
 app.get('/api/pesu-oauth/session', (req, res) => {
@@ -2362,15 +2760,51 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     requestedScopes.push('openid', 'profile');
   }
 
-  // Discover endpoints & supported scopes
-  const disc = await discoverPesuOidcEndpoints();
+  // Discover endpoints & supported scopes from real OIDC metadata
+  const disc = await discoverPesuOidcEndpoints(req);
   session.stages.providerDiscovery = disc.oidcDiscoveryAvailable
     ? 'ok'
-    : disc.providerReachable
-    ? 'degraded_fallback'
+    : disc.errorCategory === 'INVALID_DISCOVERY_HTML' ||
+      disc.errorCategory === 'INVALID_DISCOVERY_METADATA'
+    ? 'invalid_response'
     : 'unreachable';
 
-  // Validate requested scopes against provider's supportedScopes
+  if (
+    !disc.oidcDiscoveryAvailable ||
+    !disc.issuer ||
+    !disc.authorizationEndpoint ||
+    !disc.tokenEndpoint
+  ) {
+    const statusToReturn =
+      disc.httpStatus && disc.httpStatus >= 400 && disc.httpStatus < 600
+        ? disc.httpStatus
+        : 502;
+    const diag: DeveloperDiagnosticTelemetry = {
+      serviceName: 'pesu_oauth2',
+      httpStatus: statusToReturn,
+      errorCategory: disc.errorCategory,
+      retryAttempts: 0,
+      durationMs: Date.now() - startTime,
+    };
+    session.lastDiagnostics = diag;
+    const resp: PesuOAuthUrlResponse = {
+      ok: false,
+      live: true,
+      redirectUri: requestedRedirectUri,
+      scopes: requestedScopes,
+      scope: requestedScopes.join(' '),
+      stages: session.stages,
+      userMessage:
+        disc.note ||
+        `Cannot construct authorization URL because OIDC discovery failed (${disc.requestedUrl}).`,
+      errorCategory: disc.errorCategory,
+      diagnostics: diag,
+    };
+    res.status(statusToReturn).json(resp);
+    return;
+  }
+
+  // Validate requested scopes against provider's discovered supportedScopes
   const unsupported = requestedScopes.filter(
     (s) => !disc.supportedScopes.includes(s)
   );
@@ -2392,7 +2826,7 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       stages: session.stages,
       userMessage: `Unsupported OAuth2 scope(s) requested: ${unsupported.join(
         ', '
-      )}. Allowed scopes: ${disc.supportedScopes.join(', ')}.`,
+      )}. Allowed scopes advertised by provider: ${disc.supportedScopes.join(', ')}.`,
       errorCategory: 'OAUTH_SCOPE_REJECTED',
       diagnostics: diag,
     };
@@ -2875,6 +3309,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
 };
 
 app.get(['/auth/pesu/callback', '/auth/pesu/callback/'], pesuCallbackHandler);
+
+// Explicit JSON 404 guard for all /api/* routes so unrouted API requests
+// can never fall through to Vite's SPA HTML fallback.
+app.use('/api', (req, res) => {
+  res.status(404).json({
+    ok: false,
+    errorCategory: 'NOT_FOUND',
+    userMessage: `API route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
 
 // ============================================================================
 // Mount Vite Dev Server or Production Static Bundle

@@ -27,6 +27,8 @@ export type IntegrationErrorCategory =
   | 'SSRF_BLOCKED'
   | 'NETWORK_ERROR'
   | 'NOT_FOUND'
+  | 'INVALID_DISCOVERY_HTML'
+  | 'INVALID_DISCOVERY_METADATA'
   | 'OAUTH_SCOPE_REJECTED'
   | 'OAUTH_REDIRECT_URI_MISMATCH'
   | 'OAUTH_STATE_INVALID'
@@ -165,7 +167,7 @@ export interface ExtractEventUrlResponse {
  * PESU OAuth2 End-to-End Contracts (Requirement #1)
  */
 export interface PesuOAuthStageStatuses {
-  providerDiscovery: 'idle' | 'ok' | 'degraded_fallback' | 'unreachable';
+  providerDiscovery: 'idle' | 'ok' | 'invalid_response' | 'degraded_fallback' | 'unreachable';
   configuration: 'configured' | 'public_client_only' | 'missing_client_id';
   redirectUriValidation: 'valid' | 'mismatch';
   authorizationRedirect:
@@ -195,10 +197,20 @@ export interface PesuOAuthDiscoveryResponse {
   live: true;
   providerReachable: boolean;
   oidcDiscoveryAvailable: boolean;
-  issuer: string;
-  authorizationEndpoint: string;
-  tokenEndpoint: string;
+  requestedUrl: string;
+  responseUrl: string | null;
+  httpStatus: number;
+  contentType: string | null;
+  redirectChain: string[];
+  issuer: string | null;
+  authorizationEndpoint: string | null;
+  tokenEndpoint: string | null;
   userinfoEndpoint: string | null;
+  jwksUri?: string | null;
+  revocationEndpoint?: string | null;
+  responseTypesSupported?: string[];
+  codeChallengeMethodsSupported?: string[];
+  tokenEndpointAuthMethodsSupported?: string[];
   supportedScopes: string[];
   clientConfigured: boolean;
   clientSecretConfigured: boolean;
@@ -207,6 +219,9 @@ export interface PesuOAuthDiscoveryResponse {
   stages: PesuOAuthStageStatuses;
   userMessage: string;
   note?: string;
+  configWarning?: string | null;
+  diagnosticSnippet?: string | null;
+  errorCategory?: IntegrationErrorCategory;
   diagnostics: DeveloperDiagnosticTelemetry;
 }
 

@@ -550,3 +550,134 @@ test('13. Simulated Demo Mode helpers never report isLiveApiResult = true', () =
   const eventPreview = extractPublicEventPreview('https://events.pes.edu/11515/');
   assert.equal(eventPreview.isLiveApiResult, false);
 });
+
+test('14. PESU OIDC discovery parses valid JSON metadata and returns requestedUrl, httpStatus, contentType, and endpoints', async () => {
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://pesu-oauth2.onrender.com';
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      assert.equal(url, 'https://pesu-oauth2.onrender.com/.well-known/openid-configuration');
+      return new Response(
+        JSON.stringify({
+          issuer: 'https://pesu-oauth2.onrender.com',
+          authorization_endpoint: 'https://pesu-oauth2.onrender.com/oauth2/authorize',
+          token_endpoint: 'https://pesu-oauth2.onrender.com/oauth2/token',
+          userinfo_endpoint: 'https://pesu-oauth2.onrender.com/api/v1/userinfo',
+          jwks_uri: 'https://pesu-oauth2.onrender.com/jwks.json',
+          revocation_endpoint: 'https://pesu-oauth2.onrender.com/oauth2/revoke',
+          response_types_supported: ['code'],
+          code_challenge_methods_supported: ['S256'],
+          scopes_supported: ['openid', 'profile', 'email', 'phone', 'offline_access'],
+          token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+      );
+    },
+  });
+
+  const res = await fetch(`${baseUrl}/api/pesu-oauth/discovery`);
+  const data = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(data.ok, true);
+  assert.equal(data.oidcDiscoveryAvailable, true);
+  assert.equal(data.requestedUrl, 'https://pesu-oauth2.onrender.com/.well-known/openid-configuration');
+  assert.equal(data.httpStatus, 200);
+  assert.equal(data.contentType, 'application/json; charset=utf-8');
+  assert.equal(data.issuer, 'https://pesu-oauth2.onrender.com');
+  assert.equal(data.authorizationEndpoint, 'https://pesu-oauth2.onrender.com/oauth2/authorize');
+  assert.equal(data.tokenEndpoint, 'https://pesu-oauth2.onrender.com/oauth2/token');
+  assert.equal(data.userinfoEndpoint, 'https://pesu-oauth2.onrender.com/api/v1/userinfo');
+  assert.equal(data.jwksUri, 'https://pesu-oauth2.onrender.com/jwks.json');
+  assert.equal(data.stages.providerDiscovery, 'ok');
+  assert.deepEqual(data.supportedScopes, ['openid', 'profile', 'email', 'phone', 'offline_access']);
+});
+
+test('15. PESU OIDC discovery gracefully handles unexpected HTML response without throwing JSON parse error', async () => {
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://pesu-oauth2.onrender.com';
+  setServerTestOverrides({
+    fetchFn: async () => {
+      return new Response(
+        '<!doctype html><html lang="en"><head><title>Quackathon SPA Fallback</title></head><body><div id="root"></div></body></html>',
+        { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+      );
+    },
+  });
+
+  const res = await fetch(`${baseUrl}/api/pesu-oauth/discovery`);
+  const data = await res.json();
+  assert.equal(res.status, 502);
+  assert.equal(data.ok, false);
+  assert.equal(data.oidcDiscoveryAvailable, false);
+  assert.equal(data.errorCategory, 'INVALID_DISCOVERY_HTML');
+  assert.equal(data.stages.providerDiscovery, 'invalid_response');
+  assert.equal(data.httpStatus, 200);
+  assert.equal(data.contentType, 'text/html; charset=utf-8');
+  assert.equal(data.authorizationEndpoint, null);
+  assert.equal(data.tokenEndpoint, null);
+  assert.ok(data.diagnosticSnippet.includes('<!doctype html>'));
+  assert.ok(!data.note.includes('Unexpected token'));
+});
+
+test('16. PESU OIDC discovery detects and normalizes PESU_OAUTH_ISSUER_URL misconfigured as callback URL', async () => {
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://ais-dev-br3lg427hqulcvidjuf6bn-148109744684.asia-east1.run.app/auth/pesu/callback';
+  let capturedDiscoveryUrl = '';
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      capturedDiscoveryUrl = String(input);
+      return new Response(
+        JSON.stringify({
+          issuer: 'https://pesu-oauth2.onrender.com',
+          authorization_endpoint: 'https://pesu-oauth2.onrender.com/oauth2/authorize',
+          token_endpoint: 'https://pesu-oauth2.onrender.com/oauth2/token',
+          userinfo_endpoint: 'https://pesu-oauth2.onrender.com/api/v1/userinfo',
+          scopes_supported: ['openid', 'profile', 'email'],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    },
+  });
+
+  const res = await fetch(`${baseUrl}/api/pesu-oauth/discovery`);
+  const data = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(capturedDiscoveryUrl, 'https://pesu-oauth2.onrender.com/.well-known/openid-configuration');
+  assert.equal(data.ok, true);
+  assert.equal(data.oidcDiscoveryAvailable, true);
+  assert.equal(data.issuer, 'https://pesu-oauth2.onrender.com');
+  assert.ok(data.configWarning.includes('PESU_OAUTH_ISSUER_URL'));
+  assert.ok(
+    data.allowedRedirectUris.includes('https://ais-dev-br3lg427hqulcvidjuf6bn-148109744684.asia-east1.run.app/auth/pesu/callback')
+  );
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://pesu-oauth2.onrender.com';
+});
+
+test('17. PESU OIDC discovery rejects incomplete OIDC JSON metadata and /api catch-all returns JSON 404', async () => {
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://pesu-oauth2.onrender.com';
+  setServerTestOverrides({
+    fetchFn: async () => {
+      return new Response(
+        JSON.stringify({
+          issuer: 'https://pesu-oauth2.onrender.com',
+          // missing authorization_endpoint and token_endpoint
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    },
+  });
+
+  const res = await fetch(`${baseUrl}/api/pesu-oauth/discovery`);
+  const data = await res.json();
+  assert.equal(res.status, 502);
+  assert.equal(data.ok, false);
+  assert.equal(data.oidcDiscoveryAvailable, false);
+  assert.equal(data.errorCategory, 'INVALID_DISCOVERY_METADATA');
+  assert.equal(data.stages.providerDiscovery, 'invalid_response');
+
+  // Verify unknown /api/* route returns JSON 404, never HTML
+  const unknownApiRes = await fetch(`${baseUrl}/api/non-existent-endpoint`);
+  const unknownApiData = await unknownApiRes.json();
+  assert.equal(unknownApiRes.status, 404);
+  assert.equal(unknownApiData.ok, false);
+});
+

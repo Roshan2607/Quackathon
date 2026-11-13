@@ -575,27 +575,68 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
     }
   };
 
-  // Test 4: PESU OAuth2 Discovery & Authorized Consent Flow (Fixes Problems A, B, C, D)
+  // Test 4: PESU OAuth2 Discovery & Authorized Consent Flow (Fixes Problems A, B, C, D + OIDC Discovery)
   const handleProbePesuDiscovery = async () => {
     const start = performance.now();
     setOauthDiscoveryState({ status: 'running' });
 
     try {
-      const res = await fetch('/api/pesu-oauth/discovery');
-      const data = (await res.json()) as PesuOAuthDiscoveryResponse;
+      const res = await fetch('/api/pesu-oauth/discovery', {
+        headers: { Accept: 'application/json' },
+      });
+      const contentType = res.headers.get('content-type') || 'unknown';
+      const rawText = await res.text();
+      const latencyMs = Math.round(performance.now() - start);
+
+      // Guard against unexpected HTML or non-JSON responses from proxy/fallback
+      if (rawText.trimStart().startsWith('<') || !contentType.toLowerCase().includes('json')) {
+        const snippet = rawText
+          .replace(/[\r\n\t]+/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 200);
+        setOauthStages((prev) => ({ ...prev, providerDiscovery: 'invalid_response' }));
+        setOauthDiscoveryState({
+          status: 'error',
+          httpStatus: res.status,
+          latencyMs,
+          summary: `OIDC discovery endpoint returned unexpected non-JSON content (HTTP ${res.status}, Content-Type: ${contentType}).`,
+          payload: {
+            ok: false,
+            requestedUrl: `${serverConfig?.pesuOAuthIssuerUrl || 'https://pesu-oauth2.onrender.com'}/.well-known/openid-configuration`,
+            responseUrl: res.url || '/api/pesu-oauth/discovery',
+            httpStatus: res.status,
+            contentType,
+            redirectChain: [],
+            diagnosticSnippet: snippet,
+          } satisfies Partial<PesuOAuthDiscoveryResponse>,
+        });
+        return;
+      }
+
+      const data = JSON.parse(rawText) as PesuOAuthDiscoveryResponse;
       if (data.stages) {
         setOauthStages(data.stages);
       }
       if (data.supportedScopes && data.supportedScopes.length > 0) {
         setSupportedScopes(data.supportedScopes);
       }
+
+      const isValidOidc = Boolean(
+        data.ok &&
+          data.oidcDiscoveryAvailable &&
+          data.issuer &&
+          data.authorizationEndpoint &&
+          data.tokenEndpoint
+      );
+
       setOauthDiscoveryState({
-        status: data.ok ? 'success' : 'error',
-        httpStatus: res.status,
-        latencyMs: Math.round(performance.now() - start),
-        summary: data.ok
-          ? `Discovered OIDC metadata from ${data.issuer} (token_endpoint: ${data.tokenEndpoint})`
-          : `OIDC discovery probe status: ${data.note || data.userMessage || 'Provider unreachable'} (Client ID Configured: ${data.clientConfigured ? 'Yes' : 'No'})`,
+        status: isValidOidc ? 'success' : 'error',
+        httpStatus: data.httpStatus ?? res.status,
+        latencyMs,
+        summary: isValidOidc
+          ? `Discovered valid OIDC metadata from ${data.issuer} (token_endpoint: ${data.tokenEndpoint}, scopes: ${data.supportedScopes.join(', ')})`
+          : `OIDC discovery failed: ${data.note || data.userMessage || 'Invalid or unreachable provider'}`,
         payload: data,
         diagnostics: data.diagnostics,
       });
@@ -812,16 +853,23 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
 
   const renderStageBadge = (label: string, value: string) => {
     const isGood =
+      value === 'ok' ||
       value === 'ready' ||
       value === 'configured' ||
       value === 'valid' ||
       value === 'succeeded' ||
       value === 'verified';
-    const isWarn = value === 'Redirected / Waiting for user consent' || value === 'redirected';
+    const isWarn =
+      value === 'awaiting_user_consent' ||
+      value === 'Redirected / Waiting for user consent' ||
+      value === 'redirected';
     const isBad =
+      value === 'unreachable' ||
+      value === 'invalid_response' ||
       value === 'unavailable' ||
       value === 'missing_client_id' ||
       value === 'mismatch' ||
+      value === 'consent_denied_or_error' ||
       value === 'failed';
 
     return (
@@ -1268,15 +1316,127 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
             </button>
           </div>
 
-          {oauthDiscoveryState.status !== 'idle' && oauthDiscoveryState.status !== 'running' && (
-            <div className="p-3 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-xs space-y-1">
-              <div className="font-semibold text-slate-800 dark:text-slate-200">
-                Discovery Probe ({oauthDiscoveryState.latencyMs} ms):
-              </div>
-              <p className="text-slate-600 dark:text-slate-400">{oauthDiscoveryState.summary}</p>
-              <DiagnosticTelemetryCard diagnostics={oauthDiscoveryState.diagnostics} />
-            </div>
-          )}
+          {oauthDiscoveryState.status !== 'idle' &&
+            oauthDiscoveryState.status !== 'running' &&
+            (() => {
+              const discPayload = oauthDiscoveryState.payload as
+                | Partial<PesuOAuthDiscoveryResponse>
+                | undefined;
+              return (
+                <div
+                  className={`p-3.5 rounded-lg border text-xs space-y-2.5 ${
+                    oauthDiscoveryState.status === 'success'
+                      ? 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-950 dark:text-emerald-200'
+                      : 'bg-red-50/80 dark:bg-red-950/30 border-red-200 dark:border-red-800 text-red-950 dark:text-red-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-semibold">
+                    <span className="inline-flex items-center gap-1.5">
+                      {oauthDiscoveryState.status === 'success' ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                      ) : (
+                        <XCircle className="w-4 h-4 text-red-600" />
+                      )}
+                      OIDC Discovery {oauthDiscoveryState.status.toUpperCase()} (HTTP{' '}
+                      {discPayload?.httpStatus ?? oauthDiscoveryState.httpStatus ?? 'ERR'})
+                    </span>
+                    <span className="font-mono text-[11px]">{oauthDiscoveryState.latencyMs} ms</span>
+                  </div>
+
+                  <p>{oauthDiscoveryState.summary}</p>
+
+                  {discPayload?.configWarning && (
+                    <div className="p-2 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded text-[11px] text-amber-900 dark:text-amber-200">
+                      <strong>Issuer URL Normalization Notice:</strong> {discPayload.configWarning}
+                    </div>
+                  )}
+
+                  {discPayload && (
+                    <div className="p-2.5 bg-white/90 dark:bg-slate-900/90 border border-slate-200 dark:border-slate-800 rounded-lg font-mono text-[11px] text-slate-700 dark:text-slate-300 space-y-1.5">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div>
+                          <span className="text-slate-400 block font-sans text-[10px] uppercase">
+                            Requested Discovery URL
+                          </span>
+                          <span className="break-all font-semibold">
+                            {discPayload.requestedUrl ?? 'n/a'}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400 block font-sans text-[10px] uppercase">
+                            HTTP Status & Content-Type
+                          </span>
+                          <span className="font-semibold">
+                            HTTP {discPayload.httpStatus ?? 'ERR'} ·{' '}
+                            {discPayload.contentType ?? 'unknown'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {discPayload.responseUrl &&
+                        discPayload.responseUrl !== discPayload.requestedUrl && (
+                          <div>
+                            <span className="text-slate-400 block font-sans text-[10px] uppercase">
+                              Final Response URL
+                            </span>
+                            <span className="break-all">{discPayload.responseUrl}</span>
+                          </div>
+                        )}
+
+                      {discPayload.oidcDiscoveryAvailable && discPayload.issuer && (
+                        <div className="pt-1.5 border-t border-slate-100 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                          <div>
+                            <span className="text-slate-400 font-sans text-[10px] uppercase block">
+                              Authorization Endpoint
+                            </span>
+                            <span className="break-all">{discPayload.authorizationEndpoint}</span>
+                          </div>
+                          <div>
+                            <span className="text-slate-400 font-sans text-[10px] uppercase block">
+                              Token Endpoint
+                            </span>
+                            <span className="break-all">{discPayload.tokenEndpoint}</span>
+                          </div>
+                          <div>
+                            <span className="text-slate-400 font-sans text-[10px] uppercase block">
+                              UserInfo / JWKS URI
+                            </span>
+                            <span className="break-all">
+                              {discPayload.userinfoEndpoint ?? 'n/a'} ·{' '}
+                              {discPayload.jwksUri ?? 'n/a'}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-slate-400 font-sans text-[10px] uppercase block">
+                              PKCE & Auth Methods
+                            </span>
+                            <span>
+                              PKCE:{' '}
+                              {discPayload.codeChallengeMethodsSupported?.join(', ') || 'S256'} ·
+                              Auth:{' '}
+                              {discPayload.tokenEndpointAuthMethodsSupported?.join(', ') || 'n/a'}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+
+                      {!discPayload.oidcDiscoveryAvailable && discPayload.diagnosticSnippet && (
+                        <div className="pt-1.5 border-t border-slate-100 dark:border-slate-800">
+                          <span className="text-slate-400 block font-sans text-[10px] uppercase">
+                            Safe Truncated Response Diagnostic
+                          </span>
+                          <span className="break-all text-red-700 dark:text-red-300">
+                            {discPayload.diagnosticSnippet}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <DiagnosticTelemetryCard diagnostics={oauthDiscoveryState.diagnostics} />
+                </div>
+              );
+            })()}
 
           {oauthFlowNotice && (
             <div
