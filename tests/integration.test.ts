@@ -1208,10 +1208,18 @@ test('22. Profile detail fields (domains, topics to explore, goals, portfolio li
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({
-      profile: {
-        ...createdProfile,
-        headline: 'Updated headline only',
-      },
+      profile: (() => {
+        // Omit the detail fields entirely (not just send defaults) so this
+        // really exercises "client that does not know the new fields".
+        const {
+          projectDomains: _pd,
+          topicsToExplore: _te,
+          hackathonGoals: _hg,
+          portfolioLinks: _pl,
+          ...withoutDetailFields
+        } = createdProfile;
+        return { ...withoutDetailFields, headline: 'Updated headline only' };
+      })(),
     }),
   });
   assert.equal(partialRes.status, 200);
