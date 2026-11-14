@@ -1,19 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import {
-  AlertCircle,
-  Check,
-  CheckCircle2,
-  ChevronDown,
-  ChevronRight,
-  GitBranch,
-  Loader2,
-  Plus,
-  Save,
-  Sparkles,
-  Trash2,
-  X,
-} from 'lucide-react';
-import {
   ExecutionMode,
   FeaturedProject,
   Profile,
@@ -26,6 +12,17 @@ import {
   WORK_STYLE_TAXONOMY,
 } from '../data/seedData';
 import {
+  Github,
+  Check,
+  Sparkles,
+  Plus,
+  Trash2,
+  ChevronDown,
+  ChevronUp,
+  Bookmark,
+} from 'lucide-react';
+import {
+  fetchLiveGitHubRepositoriesDeterministically,
   runBoundedGitHubEnrichmentDraft,
   runLiveGitHubAndGeminiEnrichment,
 } from '../services/adapters';
@@ -35,872 +32,942 @@ interface OnboardingAndProfileModalProps {
   currentUser: User;
   profile: Profile;
   executionMode: ExecutionMode;
-  onSaveProfile: (updated: Profile) => void;
+  isInline?: boolean;
+  onSaveProfile: (
+    updatedProfile: Profile,
+    updatedPrivacy: User['privacyPreferences']
+  ) => void;
   onClose: () => void;
+  onNotify?: (msg: string) => void;
 }
-
-type OnboardingStep = 1 | 2 | 3;
 
 export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps> = ({
   currentUser,
   profile,
   executionMode,
+  isInline = false,
   onSaveProfile,
   onClose,
+  onNotify,
 }) => {
   const draftStorageKey = `quackathon_profile_draft_${currentUser.uid}`;
 
-  const [step, setStep] = useState<OnboardingStep>(1);
-  const [hasSavedDraftInStorage, setHasSavedDraftInStorage] = useState(false);
-  const [draftNotice, setDraftNotice] = useState<string | null>(null);
+  const loadInitialProfile = (): Profile => {
+    try {
+      const saved = localStorage.getItem(draftStorageKey);
+      if (saved) {
+        return { ...profile, ...JSON.parse(saved) };
+      }
+    } catch {
+      // Ignore corrupt draft
+    }
+    return profile;
+  };
 
-  // Step 1 — About You
-  const [headline, setHeadline] = useState(profile.headline);
-  const [interestTags, setInterestTags] = useState<string[]>(profile.interestTags);
-  const [skillTags, setSkillTags] = useState<string[]>(profile.skillTags);
-  const [newSkillInput, setNewSkillInput] = useState('');
-  const [preferredRoles, setPreferredRoles] = useState<string[]>(profile.preferredRoles);
+  const initial = loadInitialProfile();
 
-  // Step 2 — Your Work (Optional projects & GitHub import)
-  const [featuredProjects, setFeaturedProjects] = useState<FeaturedProject[]>(
-    profile.featuredProjects
+  // Essential fields shown initially
+  const [headline, setHeadline] = useState(initial.headline);
+  const [interestTags, setInterestTags] = useState<string[]>(initial.interestTags);
+  const [customInterestInput, setCustomInterestInput] = useState('');
+  const [skillTags, setSkillTags] = useState<string[]>(initial.skillTags);
+  const [customSkillInput, setCustomSkillInput] = useState('');
+  const [preferredRoles, setPreferredRoles] = useState<string[]>(
+    initial.preferredRoles
   );
+  const [featuredProjects, setFeaturedProjects] = useState<FeaturedProject[]>(
+    initial.featuredProjects
+  );
+
+  // Add Project inline state
+  const [showAddProjectForm, setShowAddProjectForm] = useState(false);
   const [newProjTitle, setNewProjTitle] = useState('');
   const [newProjDesc, setNewProjDesc] = useState('');
-  const [githubUsername, setGithubUsername] = useState(profile.githubUsername ?? '');
-  const [isImportingGithub, setIsImportingGithub] = useState(false);
-  const [githubError, setGithubError] = useState<string | null>(null);
-  const [evidenceDraft, setEvidenceDraft] = useState<ProfileEvidenceDraft | null>(null);
-  const [editableDraftProjTitle, setEditableDraftProjTitle] = useState('');
-  const [editableDraftProjDesc, setEditableDraftProjDesc] = useState('');
-  const [draftApprovedMsg, setDraftApprovedMsg] = useState<string | null>(null);
+  const [newProjTags, setNewProjTags] = useState('');
 
-  // Step 3 — Preferences & Collapsible Advanced Settings
-  const [workingStyleTags, setWorkingStyleTags] = useState<string[]>(profile.workingStyleTags);
-  const [rolesWantToLearn, setRolesWantToLearn] = useState<string[]>(profile.rolesWantToLearn);
-  const [icebreakerPrompt, setIcebreakerPrompt] = useState(profile.icebreakerPrompt ?? '');
-  const [visibility, setVisibility] = useState<'public_verified_students' | 'hidden'>(
-    profile.visibility
+  // Progressive disclosure expandable sections
+  const [showGitHubSection, setShowGitHubSection] = useState(false);
+  const [showPreferencesSection, setShowPreferencesSection] = useState(false);
+  const [showAdvancedSection, setShowAdvancedSection] = useState(false);
+
+  // GitHub & AI Suggestions state
+  const [githubUsername, setGithubUsername] = useState(
+    initial.githubUsername ?? ''
   );
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [about, setAbout] = useState(profile.about);
-  const [isFirstTimeHacker, setIsFirstTimeHacker] = useState(Boolean(profile.isFirstTimeHacker));
-  const [simulateMaliciousReadme, setSimulateMaliciousReadme] = useState(false);
+  const [enrichmentDraft, setEnrichmentDraft] =
+    useState<ProfileEvidenceDraft | null>(null);
+  const [isFetchingGitHub, setIsFetchingGitHub] = useState(false);
+  const [isEnhancingWithAI, setIsEnhancingWithAI] = useState(false);
+  const [githubStatusError, setGithubStatusError] = useState<string | null>(null);
 
-  // Load saved draft if available
+  // Collaboration Preferences & Advanced Options
+  const [about, setAbout] = useState(initial.about);
+  const [rolesWantToLearn, setRolesWantToLearn] = useState<string[]>(
+    initial.rolesWantToLearn
+  );
+  const [workingStyleTags, setWorkingStyleTags] = useState<string[]>(
+    initial.workingStyleTags
+  );
+  const [icebreakerPrompt, setIcebreakerPrompt] = useState(
+    initial.icebreakerPrompt ?? ''
+  );
+  const [isFirstTimeHacker, setIsFirstTimeHacker] = useState(
+    Boolean(initial.isFirstTimeHacker)
+  );
+  const [visibility, setVisibility] = useState<Profile['visibility']>(
+    initial.visibility
+  );
+  const [privacyPreferences, setPrivacyPreferences] = useState<
+    User['privacyPreferences']
+  >(currentUser.privacyPreferences);
+
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(draftStorageKey);
-      if (raw) {
-        setHasSavedDraftInStorage(true);
-      }
-    } catch {
-      // Ignore storage errors
-    }
-  }, [draftStorageKey]);
+    setHeadline(profile.headline);
+    setInterestTags(profile.interestTags);
+    setSkillTags(profile.skillTags);
+    setPreferredRoles(profile.preferredRoles);
+    setFeaturedProjects(profile.featuredProjects);
+    setGithubUsername(profile.githubUsername ?? '');
+    setAbout(profile.about);
+    setRolesWantToLearn(profile.rolesWantToLearn);
+    setWorkingStyleTags(profile.workingStyleTags);
+    setIcebreakerPrompt(profile.icebreakerPrompt ?? '');
+    setIsFirstTimeHacker(Boolean(profile.isFirstTimeHacker));
+    setVisibility(profile.visibility);
+    setPrivacyPreferences(currentUser.privacyPreferences);
+  }, [currentUser.uid, profile, currentUser.privacyPreferences]);
 
-  const handleRestoreDraft = () => {
-    try {
-      const raw = localStorage.getItem(draftStorageKey);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (parsed.headline !== undefined) setHeadline(parsed.headline);
-      if (Array.isArray(parsed.interestTags)) setInterestTags(parsed.interestTags);
-      if (Array.isArray(parsed.skillTags)) setSkillTags(parsed.skillTags);
-      if (Array.isArray(parsed.preferredRoles)) setPreferredRoles(parsed.preferredRoles);
-      if (Array.isArray(parsed.featuredProjects)) setFeaturedProjects(parsed.featuredProjects);
-      if (parsed.githubUsername !== undefined) setGithubUsername(parsed.githubUsername);
-      if (Array.isArray(parsed.workingStyleTags)) setWorkingStyleTags(parsed.workingStyleTags);
-      if (Array.isArray(parsed.rolesWantToLearn)) setRolesWantToLearn(parsed.rolesWantToLearn);
-      if (parsed.icebreakerPrompt !== undefined) setIcebreakerPrompt(parsed.icebreakerPrompt);
-      if (parsed.visibility) setVisibility(parsed.visibility);
-      if (parsed.about !== undefined) setAbout(parsed.about);
-      if (typeof parsed.isFirstTimeHacker === 'boolean') {
-        setIsFirstTimeHacker(parsed.isFirstTimeHacker);
-      }
-      setDraftNotice('Restored your saved draft.');
-      setHasSavedDraftInStorage(false);
-    } catch {
-      setDraftNotice('Could not restore saved draft.');
-    }
-  };
-
-  const handleSaveDraft = () => {
-    try {
-      const payload = {
-        headline,
-        interestTags,
-        skillTags,
-        preferredRoles,
-        featuredProjects,
-        githubUsername,
-        workingStyleTags,
-        rolesWantToLearn,
-        icebreakerPrompt,
-        visibility,
-        about,
-        isFirstTimeHacker,
-        savedAt: new Date().toISOString(),
-      };
-      localStorage.setItem(draftStorageKey, JSON.stringify(payload));
-      setDraftNotice('Draft saved! You can safely close this window and resume later.');
-    } catch {
-      setDraftNotice('Could not save draft to browser storage.');
-    }
-  };
-
-  const isDirty =
-    headline !== profile.headline ||
-    about !== profile.about ||
-    icebreakerPrompt !== (profile.icebreakerPrompt ?? '') ||
-    visibility !== profile.visibility ||
-    isFirstTimeHacker !== Boolean(profile.isFirstTimeHacker) ||
-    interestTags.join(',') !== profile.interestTags.join(',') ||
-    skillTags.join(',') !== profile.skillTags.join(',') ||
-    preferredRoles.join(',') !== profile.preferredRoles.join(',') ||
-    rolesWantToLearn.join(',') !== profile.rolesWantToLearn.join(',') ||
-    workingStyleTags.join(',') !== profile.workingStyleTags.join(',') ||
-    featuredProjects.length !== profile.featuredProjects.length;
-
-  const toggleItem = (list: string[], item: string, max?: number): string[] => {
+  const toggleItem = (
+    item: string,
+    list: string[],
+    setter: React.Dispatch<React.SetStateAction<string[]>>
+  ) => {
     if (list.includes(item)) {
-      return list.filter((x) => x !== item);
+      setter(list.filter((i) => i !== item));
+    } else {
+      setter([...list, item]);
     }
-    if (max && list.length >= max) return list;
-    return [...list, item];
   };
 
-  const handleAddSkill = () => {
-    const raw = newSkillInput.trim();
-    if (!raw) return;
-    const parts = raw
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const merged = Array.from(new Set([...skillTags, ...parts]));
-    setSkillTags(merged);
-    setNewSkillInput('');
+  const handleAddCustomInterest = () => {
+    const trimmed = customInterestInput.trim();
+    if (trimmed && !interestTags.includes(trimmed)) {
+      setInterestTags([...interestTags, trimmed]);
+      setCustomInterestInput('');
+    }
   };
 
-  const handleAddManualProject = () => {
+  const handleAddCustomSkill = () => {
+    const trimmed = customSkillInput.trim();
+    if (trimmed && !skillTags.includes(trimmed)) {
+      setSkillTags([...skillTags, trimmed]);
+      setCustomSkillInput('');
+    }
+  };
+
+  const handleAddProject = () => {
     if (!newProjTitle.trim() || !newProjDesc.trim()) return;
-    setFeaturedProjects([
-      ...featuredProjects,
-      {
-        id: `proj_manual_${Date.now()}`,
-        title: newProjTitle.trim(),
-        description: newProjDesc.trim(),
-        tags: interestTags.slice(0, 2),
-        isCourseworkOrIdea: true,
-      },
-    ]);
+    const proj: FeaturedProject = {
+      id: `proj_${Date.now()}`,
+      title: newProjTitle.trim(),
+      description: newProjDesc.trim(),
+      tags: newProjTags
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean),
+    };
+    setFeaturedProjects([...featuredProjects, proj]);
     setNewProjTitle('');
     setNewProjDesc('');
+    setNewProjTags('');
+    setShowAddProjectForm(false);
+    onNotify?.('Project added to profile.');
   };
 
-  const handleRunGitHubImport = async (modeOverride?: ExecutionMode) => {
-    const modeToUse = modeOverride ?? executionMode;
-    const targetUsername = githubUsername.trim() || 'Roshan2607';
-    setGithubUsername(targetUsername);
-    setGithubError(null);
-    setDraftApprovedMsg(null);
-    setIsImportingGithub(true);
-
+  // Requirement #7: Fast deterministic GitHub import WITHOUT Gemini initially
+  const handleRunDeterministicGitHubImport = async () => {
+    const username = githubUsername.trim();
+    if (!username) {
+      setGithubStatusError('Enter your GitHub username first.');
+      return;
+    }
+    setIsFetchingGitHub(true);
+    setGithubStatusError(null);
     try {
-      if (modeToUse === 'live' && !simulateMaliciousReadme) {
-        const res = await runLiveGitHubAndGeminiEnrichment({
+      if (executionMode === 'live') {
+        const res = await fetchLiveGitHubRepositoriesDeterministically({
           uid: currentUser.uid,
-          githubUsername: targetUsername,
+          githubUsername: username,
         });
-        if (!res.ok || !res.draft) {
-          setGithubError(res.errorMessage ?? 'Live GitHub/Gemini import failed.');
-          setIsImportingGithub(false);
+        if (res.ok && res.draft) {
+          setEnrichmentDraft(res.draft);
+          onNotify?.(
+            `Fetched ${res.repositories?.length ?? 0} public repositories from GitHub. Select items to include.`
+          );
           return;
         }
-        setEvidenceDraft(res.draft);
-        setEditableDraftProjTitle(res.draft.suggestedProject.title);
-        setEditableDraftProjDesc(res.draft.suggestedProject.description);
-      } else {
-        const demoDraft = runBoundedGitHubEnrichmentDraft({
-          uid: currentUser.uid,
-          githubUsername: targetUsername,
-          simulateMaliciousReadme,
-        });
-        setEvidenceDraft(demoDraft);
-        setEditableDraftProjTitle(demoDraft.suggestedProject.title);
-        setEditableDraftProjDesc(demoDraft.suggestedProject.description);
+        setGithubStatusError(
+          res.errorMessage || 'Could not fetch GitHub repositories for this username.'
+        );
+        return;
       }
-    } catch (err: unknown) {
-      setGithubError(err instanceof Error ? err.message : String(err));
+
+      const demoDraft = runBoundedGitHubEnrichmentDraft({
+        uid: currentUser.uid,
+        githubUsername: username,
+      });
+      setEnrichmentDraft(demoDraft);
+      onNotify?.('Loaded sample repository suggestions. Check items to include.');
     } finally {
-      setIsImportingGithub(false);
+      setIsFetchingGitHub(false);
     }
   };
 
-  const handleToggleDraftSkill = (skillName: string) => {
-    if (!evidenceDraft) return;
-    setEvidenceDraft({
-      ...evidenceDraft,
-      suggestedSkills: evidenceDraft.suggestedSkills.map((s) =>
-        s.name === skillName ? { ...s, approved: !s.approved } : s
-      ),
+  // Requirement #7: Optional Gemini enhancement with strict timeout & fallback
+  const handleEnhanceWithAI = async () => {
+    const username = githubUsername.trim();
+    if (!username) {
+      setGithubStatusError('Enter your GitHub username first.');
+      return;
+    }
+    setIsEnhancingWithAI(true);
+    setGithubStatusError(null);
+    try {
+      const res = await runLiveGitHubAndGeminiEnrichment({
+        uid: currentUser.uid,
+        githubUsername: username,
+        useGemini: true,
+      });
+      if (res.ok && res.draft) {
+        setEnrichmentDraft(res.draft);
+        onNotify?.(
+          res.errorMessage
+            ? res.errorMessage
+            : 'Enhanced repository descriptions with AI. Review and approve items before adding.'
+        );
+        return;
+      }
+      setGithubStatusError(
+        res.errorMessage || 'AI enhancement is unavailable right now.'
+      );
+    } finally {
+      setIsEnhancingWithAI(false);
+    }
+  };
+
+  const toggleSuggestedSkill = (idx: number) => {
+    if (!enrichmentDraft) return;
+    const next = [...enrichmentDraft.suggestedSkills];
+    next[idx] = { ...next[idx], approved: !next[idx].approved };
+    setEnrichmentDraft({ ...enrichmentDraft, suggestedSkills: next });
+  };
+
+  const toggleSuggestedProject = (idx: number) => {
+    if (!enrichmentDraft || !enrichmentDraft.suggestedProjects) return;
+    const next = [...enrichmentDraft.suggestedProjects];
+    next[idx] = { ...next[idx], approved: !next[idx].approved };
+    setEnrichmentDraft({
+      ...enrichmentDraft,
+      suggestedProjects: next,
+      suggestedProject: next[0] ?? enrichmentDraft.suggestedProject,
     });
   };
 
-  const handleApplyApprovedDraft = () => {
-    if (!evidenceDraft) return;
-    const approvedSkillNames = evidenceDraft.suggestedSkills
+  const handleApplyApprovedSuggestions = () => {
+    if (!enrichmentDraft) return;
+    const approvedSkills = enrichmentDraft.suggestedSkills
       .filter((s) => s.approved)
       .map((s) => s.name);
+    setSkillTags(Array.from(new Set([...skillTags, ...approvedSkills])));
 
-    const mergedSkills = Array.from(new Set([...skillTags, ...approvedSkillNames]));
-    setSkillTags(mergedSkills);
-
-    if (evidenceDraft.suggestedProject.approved && editableDraftProjTitle.trim()) {
-      const exists = featuredProjects.some(
-        (p) => p.title.toLowerCase() === editableDraftProjTitle.trim().toLowerCase()
-      );
-      if (!exists) {
-        setFeaturedProjects([
-          ...featuredProjects,
-          {
-            id: `proj_gh_${Date.now()}`,
-            title: editableDraftProjTitle.trim(),
-            description: editableDraftProjDesc.trim(),
-            sourceUrl: evidenceDraft.suggestedProject.sourceUrl,
-            tags: evidenceDraft.suggestedProject.tags,
-          },
-        ]);
+    const newProjects: FeaturedProject[] = [];
+    if (
+      enrichmentDraft.suggestedProjects &&
+      enrichmentDraft.suggestedProjects.length > 0
+    ) {
+      for (const sp of enrichmentDraft.suggestedProjects) {
+        if (sp.approved) {
+          newProjects.push({
+            id: `gh_proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            title: sp.title,
+            description: sp.description,
+            sourceUrl: sp.sourceUrl,
+            tags: sp.tags,
+          });
+        }
       }
+    } else if (enrichmentDraft.suggestedProject?.approved) {
+      newProjects.push({
+        id: `gh_proj_${Date.now()}`,
+        title: enrichmentDraft.suggestedProject.title,
+        description: enrichmentDraft.suggestedProject.description,
+        sourceUrl: enrichmentDraft.suggestedProject.sourceUrl,
+        tags: enrichmentDraft.suggestedProject.tags,
+      });
     }
 
-    setDraftApprovedMsg(
-      `Added ${approvedSkillNames.length} approved skill(s) and project summary to your profile.`
+    if (newProjects.length > 0) {
+      const existingTitles = new Set(
+        featuredProjects.map((p) => p.title.toLowerCase())
+      );
+      const unique = newProjects.filter(
+        (p) => !existingTitles.has(p.title.toLowerCase())
+      );
+      setFeaturedProjects([...featuredProjects, ...unique]);
+    }
+
+    setEnrichmentDraft(null);
+    onNotify?.(
+      `Applied ${approvedSkills.length} approved skill(s) and ${newProjects.length} project(s) to your profile.`
     );
   };
 
-  const handleSave = (e: React.FormEvent) => {
-    e.preventDefault();
+  const buildUpdatedProfile = (): Profile => ({
+    ...profile,
+    headline: headline.trim() || 'PES University Builder',
+    about: about.trim(),
+    interestTags,
+    skillTags,
+    preferredRoles:
+      preferredRoles.length > 0 ? preferredRoles : ['Generalist'],
+    rolesWantToLearn,
+    workingStyleTags,
+    featuredProjects,
+    githubUsername: githubUsername.trim() || undefined,
+    icebreakerPrompt: icebreakerPrompt.trim() || undefined,
+    isFirstTimeHacker,
+    visibility,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const handleSaveDraft = () => {
+    try {
+      localStorage.setItem(
+        draftStorageKey,
+        JSON.stringify(buildUpdatedProfile())
+      );
+      onNotify?.('Draft saved locally.');
+    } catch {
+      onNotify?.('Could not save draft.');
+    }
+  };
+
+  const handleSaveFinal = () => {
+    const updated = buildUpdatedProfile();
     try {
       localStorage.removeItem(draftStorageKey);
     } catch {
-      // Ignore storage errors
+      // ignore
     }
-    onSaveProfile({
-      ...profile,
-      headline: headline.trim() || profile.headline,
-      about: about.trim() || profile.about,
-      interestTags,
-      preferredRoles,
-      rolesWantToLearn,
-      skillTags,
-      workingStyleTags,
-      icebreakerPrompt: icebreakerPrompt.trim() || undefined,
-      githubUsername: githubUsername.trim() || undefined,
-      isFirstTimeHacker,
-      visibility,
-      featuredProjects,
-      updatedAt: new Date().toISOString(),
-    });
-    onClose();
+    onSaveProfile(updated, privacyPreferences);
+    if (!isInline) {
+      onClose();
+    }
   };
+
+  const formContent = (
+    <div className="space-y-5">
+      {/* 1. Headline */}
+      <div>
+        <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+          Headline
+        </label>
+        <input
+          type="text"
+          value={headline}
+          onChange={(e) => setHeadline(e.target.value)}
+          placeholder="e.g., First-year CSE exploring Frontend & Applied AI"
+          className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs sm:text-sm text-slate-900 dark:text-slate-100"
+        />
+      </div>
+
+      {/* 2. Interests */}
+      <div>
+        <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+          Interests
+        </label>
+        <div className="flex flex-wrap gap-1.5 mb-2">
+          {INTEREST_TAXONOMY.map((interest) => {
+            const active = interestTags.includes(interest);
+            return (
+              <button
+                key={interest}
+                type="button"
+                onClick={() =>
+                  toggleItem(interest, interestTags, setInterestTags)
+                }
+                className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  active
+                    ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
+                    : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                {interest}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={customInterestInput}
+            onChange={(e) => setCustomInterestInput(e.target.value)}
+            onKeyDown={(e) =>
+              e.key === 'Enter' &&
+              (e.preventDefault(), handleAddCustomInterest())
+            }
+            placeholder="Add custom interest..."
+            className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+          />
+          <button
+            type="button"
+            onClick={handleAddCustomInterest}
+            className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Add
+          </button>
+        </div>
+      </div>
+
+      {/* 3. Skills & Preferred Roles */}
+      <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+        <div>
+          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+            Preferred Roles
+          </label>
+          <div className="flex flex-wrap gap-1.5">
+            {ROLE_TAXONOMY.map((role) => {
+              const active = preferredRoles.includes(role);
+              return (
+                <button
+                  key={role}
+                  type="button"
+                  onClick={() =>
+                    toggleItem(role, preferredRoles, setPreferredRoles)
+                  }
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    active
+                      ? 'bg-blue-600 text-white border-blue-600 font-semibold'
+                      : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  {role}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div>
+          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+            Skills & Tools
+          </label>
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {skillTags.map((skill) => (
+              <span
+                key={skill}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 text-xs font-medium"
+              >
+                {skill}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSkillTags(skillTags.filter((s) => s !== skill))
+                  }
+                  className="text-slate-400 hover:text-red-600 cursor-pointer"
+                  aria-label={`Remove ${skill}`}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={customSkillInput}
+              onChange={(e) => setCustomSkillInput(e.target.value)}
+              onKeyDown={(e) =>
+                e.key === 'Enter' &&
+                (e.preventDefault(), handleAddCustomSkill())
+              }
+              placeholder="Add a language, framework, or tool..."
+              className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+            />
+            <button
+              type="button"
+              onClick={handleAddCustomSkill}
+              className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              Add Skill
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* 4. Projects (Optional) */}
+      <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+        <div className="flex items-center justify-between mb-2">
+          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
+            Projects{' '}
+            <span className="text-slate-400 font-normal">(Optional)</span>
+          </label>
+          {!showAddProjectForm && (
+            <button
+              type="button"
+              onClick={() => setShowAddProjectForm(true)}
+              className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Add Project
+            </button>
+          )}
+        </div>
+
+        {featuredProjects.length > 0 ? (
+          <div className="space-y-2 mb-2">
+            {featuredProjects.map((proj) => (
+              <div
+                key={proj.id}
+                className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 flex items-start justify-between gap-2"
+              >
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                    {proj.title}
+                  </div>
+                  <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5 line-clamp-2">
+                    {proj.description}
+                  </p>
+                  {proj.tags.length > 0 && (
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      {proj.tags.join(' · ')}
+                    </p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setFeaturedProjects(
+                      featuredProjects.filter((p) => p.id !== proj.id)
+                    )
+                  }
+                  className="text-slate-400 hover:text-red-600 p-1 shrink-0 cursor-pointer"
+                  title="Remove project"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          !showAddProjectForm && (
+            <p className="text-xs text-slate-500">
+              No projects listed yet. Class projects or side builds are optional.
+            </p>
+          )
+        )}
+
+        {showAddProjectForm && (
+          <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2 mt-2">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <input
+                type="text"
+                value={newProjTitle}
+                onChange={(e) => setNewProjTitle(e.target.value)}
+                placeholder="Project title"
+                className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
+              />
+              <input
+                type="text"
+                value={newProjTags}
+                onChange={(e) => setNewProjTags(e.target.value)}
+                placeholder="Tags (comma separated)"
+                className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
+              />
+            </div>
+            <input
+              type="text"
+              value={newProjDesc}
+              onChange={(e) => setNewProjDesc(e.target.value)}
+              placeholder="One-line description of what you built"
+              className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowAddProjectForm(false)}
+                className="px-2.5 py-1 rounded text-xs text-slate-600 dark:text-slate-400 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleAddProject}
+                className="px-3 py-1 rounded bg-blue-600 text-white text-xs font-medium cursor-pointer"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Expandable Section 1: GitHub Enrichment & Optional AI Suggestions */}
+      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setShowGitHubSection(!showGitHubSection)}
+          className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
+        >
+          <span className="flex items-center gap-2">
+            <Github className="w-3.5 h-3.5" />
+            Import from GitHub & AI Suggestions (Optional)
+          </span>
+          {showGitHubSection ? (
+            <ChevronUp className="w-4 h-4 text-slate-400" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-slate-400" />
+          )}
+        </button>
+
+        {showGitHubSection && (
+          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800">
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                value={githubUsername}
+                onChange={(e) => setGithubUsername(e.target.value)}
+                placeholder="GitHub username (e.g., Roshan2607)"
+                className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
+              />
+              <button
+                type="button"
+                disabled={isFetchingGitHub || isEnhancingWithAI}
+                onClick={handleRunDeterministicGitHubImport}
+                className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Github className="w-3.5 h-3.5" />
+                {isFetchingGitHub ? 'Fetching Repos...' : 'Import from GitHub (Fast)'}
+              </button>
+              <button
+                type="button"
+                disabled={isFetchingGitHub || isEnhancingWithAI}
+                onClick={handleEnhanceWithAI}
+                className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+                title="Optional: Use Gemini to summarize repositories and suggest skills"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+                {isEnhancingWithAI ? 'Enhancing...' : 'Enhance with AI'}
+              </button>
+            </div>
+
+            {githubStatusError && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                {githubStatusError}
+              </p>
+            )}
+
+            {enrichmentDraft && (
+              <div className="p-3 rounded-lg bg-blue-50/60 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 block">
+                      Review & Approve Suggestions
+                    </span>
+                    <span className="text-[11px] text-slate-500">
+                      Nothing is added until you select items and click Add Selected.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleApplyApprovedSuggestions}
+                    className="px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Add Selected
+                  </button>
+                </div>
+
+                {enrichmentDraft.suggestedSkills.length > 0 && (
+                  <div>
+                    <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1">
+                      Suggested Languages & Topics
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {enrichmentDraft.suggestedSkills.map((s, idx) => (
+                        <button
+                          key={s.name}
+                          type="button"
+                          onClick={() => toggleSuggestedSkill(idx)}
+                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium border cursor-pointer ${
+                            s.approved
+                              ? 'bg-emerald-600 text-white border-emerald-600'
+                              : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300'
+                          }`}
+                        >
+                          <Check className="w-3 h-3" />
+                          {s.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {enrichmentDraft.suggestedProjects &&
+                  enrichmentDraft.suggestedProjects.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">
+                        Public Repositories ({enrichmentDraft.suggestedProjects.length})
+                      </div>
+                      {enrichmentDraft.suggestedProjects.map((proj, idx) => (
+                        <div
+                          key={`${proj.title}_${idx}`}
+                          className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs space-y-1"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-slate-900 dark:text-slate-100">
+                              {proj.title}
+                            </span>
+                            <label className="inline-flex items-center gap-1 text-[11px] font-medium cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={proj.approved}
+                                onChange={() => toggleSuggestedProject(idx)}
+                              />
+                              Include
+                            </label>
+                          </div>
+                          <p className="text-slate-600 dark:text-slate-400">
+                            {proj.description}
+                          </p>
+                          {proj.tags.length > 0 && (
+                            <p className="text-[11px] text-slate-400">
+                              {proj.tags.join(' · ')}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Expandable Section 2: Collaboration Preferences */}
+      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setShowPreferencesSection(!showPreferencesSection)}
+          className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
+        >
+          <span>Collaboration Style & Roles to Explore</span>
+          {showPreferencesSection ? (
+            <ChevronUp className="w-4 h-4 text-slate-400" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-slate-400" />
+          )}
+        </button>
+
+        {showPreferencesSection && (
+          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                Working Style
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {WORK_STYLE_TAXONOMY.map((style) => {
+                  const active = workingStyleTags.includes(style);
+                  return (
+                    <button
+                      key={style}
+                      type="button"
+                      onClick={() =>
+                        toggleItem(
+                          style,
+                          workingStyleTags,
+                          setWorkingStyleTags
+                        )
+                      }
+                      className={`px-2.5 py-1 rounded-lg text-xs font-medium border cursor-pointer ${
+                        active
+                          ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
+                          : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200'
+                      }`}
+                    >
+                      {style}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                Roles You Want to Learn
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {ROLE_TAXONOMY.map((role) => {
+                  const active = rolesWantToLearn.includes(role);
+                  return (
+                    <button
+                      key={role}
+                      type="button"
+                      onClick={() =>
+                        toggleItem(
+                          role,
+                          rolesWantToLearn,
+                          setRolesWantToLearn
+                        )
+                      }
+                      className={`px-2.5 py-1 rounded-lg text-xs font-medium border cursor-pointer ${
+                        active
+                          ? 'bg-slate-800 text-white border-slate-800'
+                          : 'bg-white dark:bg-slate-900 text-slate-600 border-slate-200'
+                      }`}
+                    >
+                      {role}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <label className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300 cursor-pointer pt-1">
+              <input
+                type="checkbox"
+                checked={isFirstTimeHacker}
+                onChange={(e) => setIsFirstTimeHacker(e.target.checked)}
+              />
+              I am a first-time hacker (show beginner-friendly badge)
+            </label>
+          </div>
+        )}
+      </div>
+
+      {/* Expandable Section 3: Advanced & Privacy Settings */}
+      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setShowAdvancedSection(!showAdvancedSection)}
+          className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
+        >
+          <span>Bio, Icebreaker & Privacy Options</span>
+          {showAdvancedSection ? (
+            <ChevronUp className="w-4 h-4 text-slate-400" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-slate-400" />
+          )}
+        </button>
+
+        {showAdvancedSection && (
+          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800 text-xs">
+            <div>
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                Short Bio
+              </label>
+              <textarea
+                rows={2}
+                value={about}
+                onChange={(e) => setAbout(e.target.value)}
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+              />
+            </div>
+
+            <div>
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                Conversation Icebreaker
+              </label>
+              <input
+                type="text"
+                value={icebreakerPrompt}
+                onChange={(e) => setIcebreakerPrompt(e.target.value)}
+                placeholder="What part of the stack do you want to own?"
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+              />
+            </div>
+
+            <div className="flex items-center justify-between pt-1">
+              <span className="font-semibold text-slate-700 dark:text-slate-300">
+                Profile Visibility
+              </span>
+              <select
+                value={visibility}
+                onChange={(e) =>
+                  setVisibility(e.target.value as Profile['visibility'])
+                }
+                className="px-2.5 py-1 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+              >
+                <option value="public_verified_students">
+                  Visible to Verified PES Students
+                </option>
+                <option value="hidden">Hidden from Discover</option>
+              </select>
+            </div>
+
+            <label className="flex items-center gap-2 text-slate-700 dark:text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={privacyPreferences.academyAnnouncementsOptIn}
+                onChange={(e) =>
+                  setPrivacyPreferences({
+                    ...privacyPreferences,
+                    academyAnnouncementsOptIn: e.target.checked,
+                  })
+                }
+              />
+              Consent to fetch PESU Academy announcements when signed in with PESU OAuth
+            </label>
+          </div>
+        )}
+      </div>
+
+      {/* Footer Actions */}
+      <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={handleSaveDraft}
+          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+        >
+          <Bookmark className="w-3.5 h-3.5" />
+          Save Draft
+        </button>
+
+        <button
+          type="button"
+          onClick={handleSaveFinal}
+          className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+        >
+          Save Profile
+        </button>
+      </div>
+    </div>
+  );
+
+  if (isInline) {
+    return (
+      <div className="max-w-2xl mx-auto bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-5">
+        <div className="border-b border-slate-100 dark:border-slate-800 pb-3">
+          <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
+            Builder Profile
+          </h2>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {currentUser.displayName} · {currentUser.campus} · {currentUser.program}
+          </p>
+        </div>
+        {formContent}
+      </div>
+    );
+  }
 
   return (
     <Modal
       title="Edit Builder Profile"
-      subtitle={`${currentUser.displayName} · Complete at your own pace or save a draft for later`}
+      subtitle={`${currentUser.displayName} · ${currentUser.campus}`}
       onClose={onClose}
-      hasUnsavedChanges={isDirty && !draftNotice}
-      maxWidthClass="max-w-2xl"
+      maxWidthClass="max-w-xl"
     >
-      {/* Saved Draft Banner */}
-      {hasSavedDraftInStorage && (
-        <div className="p-3 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-lg flex items-center justify-between gap-3 text-xs">
-          <span className="text-blue-900 dark:text-blue-200 font-medium">
-            You have an unsaved profile draft from an earlier session.
-          </span>
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={handleRestoreDraft}
-              className="px-2.5 py-1 bg-blue-600 text-white font-semibold rounded-md cursor-pointer"
-            >
-              Restore Draft
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                localStorage.removeItem(draftStorageKey);
-                setHasSavedDraftInStorage(false);
-              }}
-              className="px-2 py-1 text-slate-500 hover:text-slate-800 cursor-pointer"
-            >
-              Dismiss
-            </button>
-          </div>
-        </div>
-      )}
-
-      {draftNotice && (
-        <div className="p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg flex items-center gap-2 text-xs text-emerald-800 dark:text-emerald-200">
-          <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
-          <span>{draftNotice}</span>
-        </div>
-      )}
-
-      {/* Progressive 3-Step Stepper */}
-      <div className="grid grid-cols-3 gap-2 p-1 bg-slate-100 dark:bg-slate-800 rounded-xl">
-        {(
-          [
-            { num: 1, title: 'Step 1 · About You', sub: 'Headline, roles & skills' },
-            { num: 2, title: 'Step 2 · Your Work', sub: 'Projects & optional GitHub' },
-            { num: 3, title: 'Step 3 · Preferences', sub: 'Work style & icebreaker' },
-          ] as { num: OnboardingStep; title: string; sub: string }[]
-        ).map((item) => {
-          const active = step === item.num;
-          return (
-            <button
-              key={item.num}
-              type="button"
-              onClick={() => setStep(item.num)}
-              className={`p-2.5 rounded-lg text-left transition-colors cursor-pointer ${
-                active
-                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
-              }`}
-            >
-              <div className="text-xs font-bold">{item.title}</div>
-              <div className="text-[11px] text-slate-500 dark:text-slate-400 hidden sm:block">
-                {item.sub}
-              </div>
-            </button>
-          );
-        })}
-      </div>
-
-      <form onSubmit={handleSave} className="space-y-5 text-xs">
-        {/* ================================================================
-            STEP 1 — ABOUT YOU
-           ================================================================ */}
-        {step === 1 && (
-          <div className="space-y-5">
-            <div>
-              <label className="block font-semibold text-slate-800 dark:text-slate-200 mb-1">
-                Builder Headline
-              </label>
-              <input
-                type="text"
-                value={headline}
-                onChange={(e) => setHeadline(e.target.value)}
-                placeholder="e.g., Backend & ML builder looking for a Frontend teammate"
-                className="w-full px-3 py-2 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-              />
-              <span className="text-[11px] text-slate-500 mt-1 block">
-                A short one-liner shown at the top of your card.
-              </span>
-            </div>
-
-            <div className="space-y-2">
-              <label className="block font-semibold text-slate-800 dark:text-slate-200">
-                What are you excited to build? (Choose up to 5 interests)
-              </label>
-              <div className="flex flex-wrap gap-1.5">
-                {INTEREST_TAXONOMY.map((tag) => {
-                  const selected = interestTags.includes(tag);
-                  return (
-                    <button
-                      key={tag}
-                      type="button"
-                      onClick={() => setInterestTags(toggleItem(interestTags, tag, 5))}
-                      className={`px-2.5 py-1.5 rounded-md border transition-colors cursor-pointer ${
-                        selected
-                          ? 'bg-blue-600 text-white border-blue-600 font-medium'
-                          : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                      }`}
-                    >
-                      {tag}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <label className="block font-semibold text-slate-800 dark:text-slate-200">
-                Preferred Roles (Choose up to 3 roles you can contribute)
-              </label>
-              <div className="flex flex-wrap gap-1.5">
-                {ROLE_TAXONOMY.map((role) => {
-                  const selected = preferredRoles.includes(role);
-                  return (
-                    <button
-                      key={role}
-                      type="button"
-                      onClick={() => setPreferredRoles(toggleItem(preferredRoles, role, 3))}
-                      className={`px-2.5 py-1.5 rounded-md border cursor-pointer ${
-                        selected
-                          ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900 font-medium'
-                          : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                      }`}
-                    >
-                      {role}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <label className="block font-semibold text-slate-800 dark:text-slate-200">
-                Your Skills & Tools
-              </label>
-              <div className="flex flex-wrap items-center gap-1.5">
-                {skillTags.map((sk) => (
-                  <button
-                    key={sk}
-                    type="button"
-                    onClick={() => setSkillTags(skillTags.filter((s) => s !== sk))}
-                    className="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 hover:bg-red-50 dark:hover:bg-red-950/40 text-slate-800 dark:text-slate-200 rounded-md inline-flex items-center gap-1 cursor-pointer"
-                  >
-                    <span>{sk}</span>
-                    <X className="w-3 h-3 text-slate-400" />
-                  </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-2 pt-1">
-                <input
-                  type="text"
-                  value={newSkillInput}
-                  onChange={(e) => setNewSkillInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ',') {
-                      e.preventDefault();
-                      handleAddSkill();
-                    }
-                  }}
-                  placeholder="Type a skill (e.g., React, Python, ESP32) and press Enter..."
-                  className="flex-1 px-3 py-1.5 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                />
-                <button
-                  type="button"
-                  onClick={handleAddSkill}
-                  className="px-3 py-1.5 bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 font-medium rounded-lg cursor-pointer"
-                >
-                  Add Skill
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ================================================================
-            STEP 2 — YOUR WORK (Optional Projects & GitHub Import)
-           ================================================================ */}
-        {step === 2 && (
-          <div className="space-y-5">
-            {/* Manual Projects Section */}
-            <div className="space-y-2.5">
-              <div>
-                <label className="block font-semibold text-slate-800 dark:text-slate-200">
-                  Projects, Coursework, or Ideas (Optional)
-                </label>
-                <p className="text-slate-500 text-[11px]">
-                  Class assignments, lab experiments, and hackathon ideas all count—no polished portfolio required.
-                </p>
-              </div>
-
-              {featuredProjects.length > 0 && (
-                <div className="space-y-2">
-                  {featuredProjects.map((fp) => (
-                    <div
-                      key={fp.id}
-                      className="p-3 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-lg flex items-start justify-between gap-3"
-                    >
-                      <div>
-                        <div className="font-bold text-slate-900 dark:text-slate-100">
-                          {fp.title}
-                        </div>
-                        <p className="text-slate-600 dark:text-slate-300 mt-0.5">
-                          {fp.description}
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setFeaturedProjects(featuredProjects.filter((p) => p.id !== fp.id))
-                        }
-                        aria-label={`Remove ${fp.title}`}
-                        className="text-slate-400 hover:text-red-600 cursor-pointer p-1"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className="p-3.5 bg-slate-50/70 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-lg space-y-2.5">
-                <input
-                  type="text"
-                  value={newProjTitle}
-                  onChange={(e) => setNewProjTitle(e.target.value)}
-                  placeholder="Project or lab title (e.g., Ultrasonic Room Counter)"
-                  className="w-full px-3 py-1.5 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                />
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={newProjDesc}
-                    onChange={(e) => setNewProjDesc(e.target.value)}
-                    placeholder="One sentence describing what you built or learned..."
-                    className="flex-1 px-3 py-1.5 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleAddManualProject}
-                    className="px-3 py-1.5 font-semibold text-slate-800 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 rounded-lg inline-flex items-center gap-1 cursor-pointer shrink-0"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    Add
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Optional GitHub Import & AI Suggestions */}
-            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <label className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-                    <GitBranch className="w-3.5 h-3.5 text-blue-600" />
-                    Import from GitHub (Optional)
-                  </label>
-                  <p className="text-[11px] text-slate-500">
-                    Suggests skills and project summaries from your public repositories. Nothing is added until you approve it.
-                  </p>
-                </div>
-                <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
-                  {executionMode === 'live' ? 'Live API Mode' : 'Demo Mode'}
-                </span>
-              </div>
-
-              <div className="flex flex-col sm:flex-row gap-2">
-                <input
-                  type="text"
-                  value={githubUsername}
-                  onChange={(e) => setGithubUsername(e.target.value)}
-                  placeholder="Enter GitHub username (e.g., Roshan2607)"
-                  className="flex-1 px-3 py-2 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg font-mono text-slate-900 dark:text-slate-100"
-                />
-                <button
-                  type="button"
-                  disabled={isImportingGithub}
-                  onClick={() => handleRunGitHubImport()}
-                  className="px-4 py-2 font-semibold text-white bg-slate-900 dark:bg-slate-100 dark:text-slate-900 rounded-lg cursor-pointer whitespace-nowrap inline-flex items-center justify-center gap-1.5 disabled:opacity-50"
-                >
-                  {isImportingGithub ? (
-                    <>
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      Fetching...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="w-3.5 h-3.5" />
-                      {executionMode === 'live'
-                        ? 'Import Live GitHub + Gemini'
-                        : 'Preview Suggestions (Demo)'}
-                    </>
-                  )}
-                </button>
-              </div>
-
-              {githubError && (
-                <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg flex items-start gap-2 text-red-800 dark:text-red-200">
-                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
-                  <div>
-                    <span className="font-semibold block">GitHub / Gemini Import Error</span>
-                    <span>{githubError}</span>
-                  </div>
-                </div>
-              )}
-
-              {evidenceDraft && (
-                <div className="p-4 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-slate-900 dark:text-slate-100">
-                      Review Suggested Additions ({evidenceDraft.isLiveApiResult ? 'Live API Result' : 'Demo Preview'})
-                    </span>
-                    <span className="text-[11px] text-slate-500">
-                      Uncheck anything you don't want on your profile
-                    </span>
-                  </div>
-
-                  {/* Suggested Skills Checkboxes */}
-                  <div className="space-y-1.5">
-                    <span className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 block">
-                      Suggested Skills:
-                    </span>
-                    <div className="flex flex-wrap gap-2">
-                      {evidenceDraft.suggestedSkills.map((sk) => (
-                        <label
-                          key={sk.name}
-                          className={`px-2.5 py-1.5 rounded-lg border inline-flex items-center gap-2 cursor-pointer ${
-                            sk.approved
-                              ? 'bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 text-blue-900 dark:text-blue-200'
-                              : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-500'
-                          }`}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={sk.approved}
-                            onChange={() => handleToggleDraftSkill(sk.name)}
-                          />
-                          <span className="font-medium">{sk.name}</span>
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Editable Suggested Project */}
-                  <div className="space-y-2 pt-2 border-t border-slate-200 dark:border-slate-800">
-                    <label className="inline-flex items-center gap-2 font-semibold text-slate-700 dark:text-slate-300 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={evidenceDraft.suggestedProject.approved}
-                        onChange={() =>
-                          setEvidenceDraft({
-                            ...evidenceDraft,
-                            suggestedProject: {
-                              ...evidenceDraft.suggestedProject,
-                              approved: !evidenceDraft.suggestedProject.approved,
-                            },
-                          })
-                        }
-                      />
-                      Include Suggested Project Summary (Editable):
-                    </label>
-                    {evidenceDraft.suggestedProject.approved && (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        <input
-                          type="text"
-                          value={editableDraftProjTitle}
-                          onChange={(e) => setEditableDraftProjTitle(e.target.value)}
-                          className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-md"
-                        />
-                        <input
-                          type="text"
-                          value={editableDraftProjDesc}
-                          onChange={(e) => setEditableDraftProjDesc(e.target.value)}
-                          className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-md"
-                        />
-                      </div>
-                    )}
-                  </div>
-
-                  {draftApprovedMsg && (
-                    <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4 shrink-0" />
-                      <span>{draftApprovedMsg}</span>
-                    </div>
-                  )}
-
-                  <div className="flex justify-end">
-                    <button
-                      type="button"
-                      onClick={handleApplyApprovedDraft}
-                      className="px-3.5 py-1.5 font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer inline-flex items-center gap-1.5"
-                    >
-                      <Check className="w-3.5 h-3.5" />
-                      Add Approved Items to Profile
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ================================================================
-            STEP 3 — PREFERENCES & COLLAPSIBLE ADVANCED SETTINGS
-           ================================================================ */}
-        {step === 3 && (
-          <div className="space-y-5">
-            <div className="space-y-2">
-              <label className="block font-semibold text-slate-800 dark:text-slate-200">
-                How do you like collaborating?
-              </label>
-              <div className="flex flex-wrap gap-1.5">
-                {WORK_STYLE_TAXONOMY.map((ws) => {
-                  const active = workingStyleTags.includes(ws);
-                  return (
-                    <button
-                      key={ws}
-                      type="button"
-                      onClick={() => setWorkingStyleTags(toggleItem(workingStyleTags, ws, 3))}
-                      className={`px-2.5 py-1.5 rounded-md border cursor-pointer ${
-                        active
-                          ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900 font-medium'
-                          : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                      }`}
-                    >
-                      {ws}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <label className="block font-semibold text-slate-800 dark:text-slate-200">
-                Roles you want to explore or learn (Optional)
-              </label>
-              <div className="flex flex-wrap gap-1.5">
-                {ROLE_TAXONOMY.map((role) => {
-                  const selected = rolesWantToLearn.includes(role);
-                  return (
-                    <button
-                      key={role}
-                      type="button"
-                      onClick={() => setRolesWantToLearn(toggleItem(rolesWantToLearn, role, 3))}
-                      className={`px-2.5 py-1.5 rounded-md border cursor-pointer ${
-                        selected
-                          ? 'bg-emerald-600 text-white border-emerald-600 font-medium'
-                          : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                      }`}
-                    >
-                      {role}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label className="block font-semibold text-slate-800 dark:text-slate-200 mb-1">
-                  Profile Visibility
-                </label>
-                <select
-                  value={visibility}
-                  onChange={(e) =>
-                    setVisibility(e.target.value as 'public_verified_students' | 'hidden')
-                  }
-                  className="w-full px-3 py-2 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                >
-                  <option value="public_verified_students">Visible to Verified PES Students</option>
-                  <option value="hidden">Hidden / Pause Discovery</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block font-semibold text-slate-800 dark:text-slate-200 mb-1">
-                  Optional Technical Icebreaker
-                </label>
-                <input
-                  type="text"
-                  value={icebreakerPrompt}
-                  onChange={(e) => setIcebreakerPrompt(e.target.value)}
-                  placeholder="e.g., I build the API; you make it look great?"
-                  className="w-full px-3 py-2 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                />
-              </div>
-            </div>
-
-            {/* Collapsible Advanced Settings */}
-            <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
-              <button
-                type="button"
-                onClick={() => setShowAdvanced(!showAdvanced)}
-                className="flex items-center gap-1.5 text-slate-600 dark:text-slate-400 hover:text-slate-900 font-medium cursor-pointer"
-              >
-                {showAdvanced ? (
-                  <ChevronDown className="w-4 h-4" />
-                ) : (
-                  <ChevronRight className="w-4 h-4" />
-                )}
-                Advanced & Experience Settings (Optional)
-              </button>
-
-              {showAdvanced && (
-                <div className="mt-3 p-4 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-lg space-y-3">
-                  <div>
-                    <label className="block font-semibold text-slate-800 dark:text-slate-200 mb-1">
-                      Extended Bio / About Notes
-                    </label>
-                    <textarea
-                      rows={2}
-                      value={about}
-                      onChange={(e) => setAbout(e.target.value)}
-                      className="w-full px-3 py-2 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                    />
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <label className="inline-flex items-center gap-2 cursor-pointer text-slate-700 dark:text-slate-300">
-                      <input
-                        type="checkbox"
-                        checked={isFirstTimeHacker}
-                        onChange={(e) => setIsFirstTimeHacker(e.target.checked)}
-                      />
-                      <span>I am a first-time hacker (prioritize interest & schedule match)</span>
-                    </label>
-
-                    <label className="inline-flex items-center gap-2 cursor-pointer text-slate-500">
-                      <input
-                        type="checkbox"
-                        checked={simulateMaliciousReadme}
-                        onChange={(e) => setSimulateMaliciousReadme(e.target.checked)}
-                      />
-                      <span>Test README sanitization in Demo Mode</span>
-                    </label>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Footer Navigation & Save Controls */}
-        <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-200 dark:border-slate-800">
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={handleSaveDraft}
-              className="px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-            >
-              <Save className="w-3.5 h-3.5" />
-              Save Draft for Later
-            </button>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {step > 1 && (
-              <button
-                type="button"
-                onClick={() => setStep((step - 1) as OnboardingStep)}
-                className="px-3.5 py-2 text-xs font-medium text-slate-600 dark:text-slate-400 hover:text-slate-900 cursor-pointer"
-              >
-                ← Back
-              </button>
-            )}
-            {step < 3 ? (
-              <button
-                type="button"
-                onClick={() => setStep((step + 1) as OnboardingStep)}
-                className="px-4 py-2 text-xs font-semibold text-slate-900 dark:text-slate-100 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 rounded-lg cursor-pointer"
-              >
-                Next Step →
-              </button>
-            ) : null}
-            <button
-              type="submit"
-              className="px-5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer"
-            >
-              Save Profile
-            </button>
-          </div>
-        </div>
-      </form>
+      {formContent}
     </Modal>
   );
 };

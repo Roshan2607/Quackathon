@@ -1,22 +1,41 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import React, { useState } from 'react';
+import React, {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
-  CheckCircle2,
-  Code2,
-  SlidersHorizontal,
-  UserCheck,
+  Bell,
+  Calendar,
+  ChevronDown,
+  Compass,
+  Lock,
+  LogIn,
+  LogOut,
+  MessageSquare,
+  ShieldCheck,
+  Terminal,
+  UserCircle,
 } from 'lucide-react';
+import { signInWithPopup, signOut } from 'firebase/auth';
+import { auth, googleAuthProvider } from './lib/firebase';
+import {
+  apiFetch,
+  getApiClientAuthToken,
+  setApiClientAuthToken,
+} from './lib/apiClient';
+import { startPesuOAuthSignIn } from './services/adapters';
 import {
   AuditLog,
   BlockRecord,
+  CampusType,
   CandidateCard,
   Conversation,
   DiscoveryMode,
   EventCandidate,
+  EventType,
   ExecutionMode,
   Hackathon,
   Interest,
@@ -24,1212 +43,1236 @@ import {
   Membership,
   Message,
   Participation,
-  PrivateAcademyHint,
   Profile,
   ReportRecord,
   Team,
   User,
 } from './types/domain';
-import {
-  SEED_AUDIT_LOGS,
-  SEED_BLOCKS,
-  SEED_CONVERSATIONS,
-  SEED_EVENT_CANDIDATES,
-  SEED_HACKATHONS,
-  SEED_INTERESTS,
-  SEED_JOIN_REQUESTS,
-  SEED_MEMBERSHIPS,
-  SEED_MESSAGES,
-  SEED_PARTICIPATIONS,
-  SEED_PRIVATE_ACADEMY_HINTS,
-  SEED_PROFILES,
-  SEED_REPORTS,
-  SEED_TEAMS,
-  SEED_USERS,
-} from './data/seedData';
-import { HackathonsView } from './components/HackathonsView';
-import { DiscoverView } from './components/DiscoverView';
-import { TeamsAndRequestsView } from './components/TeamsAndRequestsView';
-import { MatchesAndChatView } from './components/MatchesAndChatView';
-import { OnboardingAndProfileModal } from './components/OnboardingAndProfileModal';
-import { AdminReviewQueueView } from './components/AdminReviewQueueView';
-import { IntegrationTestingView } from './components/IntegrationTestingView';
 
-type NavTab = 'hackathons' | 'discover' | 'teams' | 'matches' | 'admin' | 'integrations';
+// Lazy-loaded route views to reduce initial bundle parse & execution latency
+const DiscoverView = React.lazy(() =>
+  import('./components/DiscoverView').then((m) => ({ default: m.DiscoverView }))
+);
+const HackathonsView = React.lazy(() =>
+  import('./components/HackathonsView').then((m) => ({
+    default: m.HackathonsView,
+  }))
+);
+const MatchesAndChatView = React.lazy(() =>
+  import('./components/MatchesAndChatView').then((m) => ({
+    default: m.MatchesAndChatView,
+  }))
+);
+const OnboardingAndProfileModal = React.lazy(() =>
+  import('./components/OnboardingAndProfileModal').then((m) => ({
+    default: m.OnboardingAndProfileModal,
+  }))
+);
+const AdminReviewQueueView = React.lazy(() =>
+  import('./components/AdminReviewQueueView').then((m) => ({
+    default: m.AdminReviewQueueView,
+  }))
+);
+const IntegrationTestingView = React.lazy(() =>
+  import('./components/IntegrationTestingView').then((m) => ({
+    default: m.IntegrationTestingView,
+  }))
+);
 
-export default function App() {
-  // Navigation, Execution Mode & Active Persona State
-  const [activeNav, setActiveNav] = useState<NavTab>('hackathons');
+type NavTab =
+  | 'discover'
+  | 'hackathons'
+  | 'matches'
+  | 'profile'
+  | 'admin'
+  | 'integrations';
+
+const GUEST_USER: User = {
+  uid: 'guest_unauthenticated',
+  pesPrnOrSrn: 'UNVERIFIED',
+  displayName: 'Guest Student',
+  personaLabel: 'Sign in with PESU or Google',
+  campus: 'RR Campus',
+  program: 'PES University',
+  graduationYear: 2028,
+  verified: false,
+  isAdmin: false,
+  createdAt: new Date().toISOString(),
+  lastActiveAt: new Date().toISOString(),
+  privacyPreferences: {
+    showGraduationYear: true,
+    allowTeamInvites: true,
+    academyAnnouncementsOptIn: false,
+    consentUpdatedAt: new Date().toISOString(),
+  },
+};
+
+const GUEST_PROFILE: Profile = {
+  uid: 'guest_unauthenticated',
+  headline: 'PES University Builder',
+  about: '',
+  interestTags: [],
+  skillTags: [],
+  preferredRoles: ['Generalist'],
+  rolesWantToLearn: [],
+  workingStyleTags: [],
+  featuredProjects: [],
+  visibility: 'public_verified_students',
+  updatedAt: new Date().toISOString(),
+};
+
+const ViewSkeleton: React.FC = () => (
+  <div className="space-y-3 animate-pulse">
+    <div className="h-14 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800" />
+    <div className="h-64 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800" />
+  </div>
+);
+
+interface BootstrapPayload {
+  ok: boolean;
+  users: User[];
+  profiles: Record<string, Profile>;
+  hackathons: Hackathon[];
+  eventCandidates: EventCandidate[];
+  participations: Participation[];
+  teams: Team[];
+  memberships: Membership[];
+  joinRequests: JoinRequest[];
+  interests: Interest[];
+  conversations: Conversation[];
+  messages: Message[];
+}
+
+export function App() {
+  const getInitialTab = (): NavTab => {
+    const hash = window.location.hash;
+    if (hash === '#/admin') return 'admin';
+    if (hash === '#/dev/integrations') return 'integrations';
+    if (hash === '#/profile') return 'profile';
+    if (hash === '#/hackathons') return 'hackathons';
+    if (hash === '#/matches') return 'matches';
+    return 'discover';
+  };
+
+  const [activeTab, setActiveTab] = useState<NavTab>(getInitialTab);
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('live');
-  const [currentUserId, setCurrentUserId] = useState<string>('u_solo_arjun');
-  const [selectedHackathonId, setSelectedHackathonId] = useState<string>('hack_terrapthon_26');
+  const [authenticatedUser, setAuthenticatedUser] = useState<User | null>(null);
+  const [selectedHackathonId, setSelectedHackathonId] = useState<string>('');
   const [discoveryMode, setDiscoveryMode] = useState<DiscoveryMode>('people');
   const [showProfileModal, setShowProfileModal] = useState(false);
+  const [showAccountMenu, setShowAccountMenu] = useState(false);
+  const [isSigningIn, setIsSigningIn] = useState(false);
 
-  // Domain State Stores (Seeded with Synthetic Data)
-  const [users, setUsers] = useState<User[]>(SEED_USERS);
-  const [profiles, setProfiles] = useState<Record<string, Profile>>(SEED_PROFILES);
-  const [hackathons, setHackathons] = useState<Hackathon[]>(SEED_HACKATHONS);
-  const [eventCandidates, setEventCandidates] = useState<EventCandidate[]>(SEED_EVENT_CANDIDATES);
-  const [privateHints] = useState<PrivateAcademyHint[]>(SEED_PRIVATE_ACADEMY_HINTS);
-  const [participations, setParticipations] = useState<Participation[]>(SEED_PARTICIPATIONS);
-  const [teams, setTeams] = useState<Team[]>(SEED_TEAMS);
-  const [memberships, setMemberships] = useState<Membership[]>(SEED_MEMBERSHIPS);
-  const [interests, setInterests] = useState<Interest[]>(SEED_INTERESTS);
-  const [joinRequests, setJoinRequests] = useState<JoinRequest[]>(SEED_JOIN_REQUESTS);
-  const [conversations, setConversations] = useState<Conversation[]>(SEED_CONVERSATIONS);
-  const [messages, setMessages] = useState<Message[]>(SEED_MESSAGES);
-  const [blocks, setBlocks] = useState<BlockRecord[]>(SEED_BLOCKS);
-  const [reports, setReports] = useState<ReportRecord[]>(SEED_REPORTS);
-  const [auditLogs, setAuditLogs] = useState<AuditLog[]>(SEED_AUDIT_LOGS);
+  // Real Domain State (Zero Synthetic Seed Data)
+  const [users, setUsers] = useState<User[]>([]);
+  const [profiles, setProfiles] = useState<Record<string, Profile>>({});
+  const [hackathons, setHackathons] = useState<Hackathon[]>([]);
+  const [eventCandidates, setEventCandidates] = useState<EventCandidate[]>([]);
+  const [participations, setParticipations] = useState<Participation[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [memberships, setMemberships] = useState<Membership[]>([]);
+  const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([]);
+  const [interests, setInterests] = useState<Interest[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [blocks, setBlocks] = useState<BlockRecord[]>([]);
+  const [reports, setReports] = useState<ReportRecord[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
 
-  // Feedback Toast & Transaction Banner
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [lastTransactionBanner, setLastTransactionBanner] = useState<{
-    type: 'success' | 'error' | 'warning';
-    title: string;
-    detail: string;
-  } | null>(null);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
 
-  const currentUser = users.find((u) => u.uid === currentUserId) ?? users[0];
-  const currentProfile = profiles[currentUser.uid];
-
-  const notifyToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
-    }, 4500);
-  };
+    }, 4200);
+  }, []);
 
-  // Switch active test persona
-  const handleSelectPersona = (uid: string) => {
-    setCurrentUserId(uid);
-    notifyToast(`Switched active session to ${users.find((u) => u.uid === uid)?.displayName}`);
-  };
-
-  // Toggle optional PESU OAuth2 Academy scope consent (private by default)
-  const handleToggleAcademyScope = (scope: 'announcements' | 'timetable') => {
-    setUsers((prev) =>
-      prev.map((u) => {
-        if (u.uid !== currentUser.uid) return u;
-        const nextVal =
-          scope === 'announcements'
-            ? !u.privacyPreferences.academyAnnouncementsOptIn
-            : !u.privacyPreferences.academyTimetableOptIn;
-        notifyToast(
-          nextVal
-            ? `Granted optional ${scope}:read scope for your private session only.`
-            : `Revoked ${scope}:read scope. Private Academy hints disabled.`
-        );
-        return {
-          ...u,
-          privacyPreferences: {
-            ...u.privacyPreferences,
-            academyAnnouncementsOptIn:
-              scope === 'announcements' ? nextVal : u.privacyPreferences.academyAnnouncementsOptIn,
-            academyTimetableOptIn:
-              scope === 'timetable' ? nextVal : u.privacyPreferences.academyTimetableOptIn,
-          },
-        };
-      })
-    );
-  };
-
-  // Update per-hackathon participation intent, roles, or availability
-  const handleUpdateParticipation = (
-    hackathonId: string,
-    updates: Partial<Pick<Participation, 'intent' | 'desiredRoles' | 'availabilityWindows' | 'discoverable'>>
-  ) => {
-    const detKey = `${hackathonId}_${currentUser.uid}`;
-    setParticipations((prev) => {
-      const existing = prev.find((p) => p.id === detKey);
-      if (existing) {
-        return prev.map((p) =>
-          p.id === detKey ? { ...p, ...updates, updatedAt: new Date().toISOString() } : p
-        );
-      }
-      const created: Participation = {
-        id: detKey,
-        hackathonId,
-        uid: currentUser.uid,
-        intent: updates.intent ?? 'looking',
-        desiredRoles: updates.desiredRoles ?? currentProfile.preferredRoles,
-        skillsOffered: currentProfile.skillTags.slice(0, 4),
-        availabilityWindows: updates.availabilityWindows ?? ['Sat Morning (8am–1pm)'],
-        commitmentLevel: 'standard',
-        workPreferences: currentProfile.workingStyleTags,
-        discoverable: updates.discoverable ?? true,
-        updatedAt: new Date().toISOString(),
-      };
-      return [...prev, created];
-    });
-  };
-
-  // Idempotent Swipe Decision (Right-swipe = interest / apply / invite; Left-swipe = pass)
-  const handleSwipeDecision = (
-    card: CandidateCard,
-    decision: 'interested' | 'passed',
-    customNote?: string
-  ) => {
-    const targetType = card.type === 'person' ? 'user' : 'team';
-    const interestKey = `${card.hackathonId}_${currentUser.uid}_${targetType}_${card.id}`;
-
-    // Idempotency guard: if already recorded, do not duplicate
-    if (interests.some((i) => i.id === interestKey)) {
-      notifyToast('Action already recorded (idempotent swipe guard).');
-      return;
-    }
-
-    const newInterest: Interest = {
-      id: interestKey,
-      hackathonId: card.hackathonId,
-      fromUid: currentUser.uid,
-      targetType,
-      targetId: card.id,
-      decision,
-      createdAt: new Date().toISOString(),
-    };
-
-    setInterests((prev) => [...prev, newInterest]);
-
-    if (decision === 'passed') {
-      notifyToast(`Passed on ${card.title}. Card hidden from pool.`);
-      return;
-    }
-
-    // If swiping right on a PERSON:
-    if (card.type === 'person') {
-      const myLedTeam = teams.find(
-        (t) =>
-          t.hackathonId === card.hackathonId &&
-          t.leaderId === currentUser.uid &&
-          t.status === 'open'
+  const currentUser = useMemo(() => {
+    if (authenticatedUser) {
+      return (
+        users.find((u) => u.uid === authenticatedUser.uid) ?? authenticatedUser
       );
+    }
+    return GUEST_USER;
+  }, [authenticatedUser, users]);
 
-      // If viewer leads an open team in this event, send an official team invitation
-      if (myLedTeam) {
-        const existingPending = joinRequests.find(
-          (jr) =>
-            jr.teamId === myLedTeam.id &&
-            jr.applicantUid === card.id &&
-            jr.status === 'pending'
-        );
-        if (!existingPending) {
-          const inviteReq: JoinRequest = {
-            id: `req_inv_${Date.now()}`,
-            hackathonId: card.hackathonId,
-            teamId: myLedTeam.id,
-            applicantUid: card.id,
-            initiatorUid: currentUser.uid,
-            proposedRole: card.rolesOfferedOrNeeded[0] ?? 'Builder',
-            message:
-              customNote ??
-              `Invited to join ${myLedTeam.name.split(' (')[0]} based on complementary role fit.`,
-            direction: 'invitation',
-            status: 'pending',
-            createdAt: new Date().toISOString(),
-          };
-          setJoinRequests((prev) => [inviteReq, ...prev]);
+  const currentProfile = useMemo(() => {
+    if (authenticatedUser && profiles[authenticatedUser.uid]) {
+      return profiles[authenticatedUser.uid];
+    }
+    return GUEST_PROFILE;
+  }, [authenticatedUser, profiles]);
+
+  const isAuthorizedStaff = Boolean(currentUser.isAdmin);
+
+  const refreshBootstrap = useCallback(async () => {
+    const res = await apiFetch<BootstrapPayload>('/api/bootstrap');
+    if (res.ok && res.data?.ok) {
+      setUsers(res.data.users ?? []);
+      setProfiles(res.data.profiles ?? {});
+      setHackathons(res.data.hackathons ?? []);
+      setEventCandidates(res.data.eventCandidates ?? []);
+      setParticipations(res.data.participations ?? []);
+      setTeams(res.data.teams ?? []);
+      setMemberships(res.data.memberships ?? []);
+      setJoinRequests(res.data.joinRequests ?? []);
+      setInterests(res.data.interests ?? []);
+      setConversations(res.data.conversations ?? []);
+      setMessages(res.data.messages ?? []);
+      setSelectedHackathonId((prev) => {
+        if (prev && res.data!.hackathons.some((h) => h.id === prev)) {
+          return prev;
         }
-        notifyToast(`Sent team invitation to ${card.title}!`);
+        return res.data!.hackathons[0]?.id ?? '';
+      });
+    }
+  }, []);
+
+  const restoreAuthSession = useCallback(async () => {
+    const res = await apiFetch<{
+      ok: boolean;
+      authenticated: boolean;
+      user: User | null;
+      profile: Profile | null;
+    }>('/api/auth/session');
+
+    if (res.ok && res.data?.authenticated && res.data.user) {
+      setAuthenticatedUser(res.data.user);
+      if (res.data.profile) {
+        setProfiles((prev) => ({
+          ...prev,
+          [res.data!.user!.uid]: res.data!.profile!,
+        }));
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void restoreAuthSession().then(() => refreshBootstrap());
+  }, [restoreAuthSession, refreshBootstrap]);
+
+  // Listen for PESU OAuth2 Popup Callback
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      const data = event.data;
+      if (!data || data.type !== 'PESU_OAUTH_RESULT') return;
+
+      if (data.status === 'success') {
+        if (data.sessionToken) {
+          setApiClientAuthToken(String(data.sessionToken));
+        }
+        if (data.user) {
+          setAuthenticatedUser(data.user as User);
+        }
+        void restoreAuthSession().then(() => refreshBootstrap());
+        showToast(
+          `Signed in with PESU as ${data.profile?.name || data.user?.displayName || 'Verified Student'}.`
+        );
+      } else {
+        showToast(data.error || 'PESU OAuth sign-in did not complete.');
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [restoreAuthSession, refreshBootstrap, showToast]);
+
+  // Sync URL hash for routes
+  useEffect(() => {
+    const onHashChange = () => {
+      const hash = window.location.hash;
+      if (hash === '#/admin') setActiveTab('admin');
+      else if (hash === '#/dev/integrations') setActiveTab('integrations');
+      else if (hash === '#/profile') setActiveTab('profile');
+      else if (hash === '#/hackathons') setActiveTab('hackathons');
+      else if (hash === '#/matches') setActiveTab('matches');
+      else setActiveTab('discover');
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  // Close Account Menu on outside click
+  useEffect(() => {
+    if (!showAccountMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        accountMenuRef.current &&
+        !accountMenuRef.current.contains(e.target as Node)
+      ) {
+        setShowAccountMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showAccountMenu]);
+
+  const navigateToTab = useCallback((tab: NavTab) => {
+    setActiveTab(tab);
+    setShowAccountMenu(false);
+    if (tab === 'admin') {
+      window.history.replaceState(null, '', '#/admin');
+    } else if (tab === 'integrations') {
+      window.history.replaceState(null, '', '#/dev/integrations');
+    } else if (window.location.hash) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+  }, []);
+
+  // Authentication Handlers
+  const handleSignInWithPesu = useCallback(async () => {
+    setIsSigningIn(true);
+    try {
+      const res = await startPesuOAuthSignIn(['openid', 'profile', 'email']);
+      if (!res.ok || !res.authUrl) {
+        showToast(res.errorMessage || 'Could not start PESU OAuth2 sign-in.');
+        return;
+      }
+      window.open(
+        res.authUrl,
+        'pesu_oauth_popup',
+        'width=520,height=660,menubar=no,toolbar=no'
+      );
+    } finally {
+      setIsSigningIn(false);
+    }
+  }, [showToast]);
+
+  const handleSignInWithGoogle = useCallback(async () => {
+    setIsSigningIn(true);
+    try {
+      const cred = await signInWithPopup(auth, googleAuthProvider);
+      const idToken = await cred.user.getIdToken();
+      setApiClientAuthToken(idToken);
+      const res = await apiFetch<{
+        ok: boolean;
+        user?: User;
+        profile?: Profile;
+        error?: string;
+      }>('/api/auth/firebase-sync', {
+        method: 'POST',
+        body: {
+          displayName: cred.user.displayName,
+        },
+      });
+      if (res.ok && res.data?.user) {
+        setAuthenticatedUser(res.data.user);
+        await refreshBootstrap();
+        showToast(`Signed in as ${res.data.user.displayName}.`);
+      } else {
+        showToast(res.errorMessage || 'Could not sync Google account.');
+      }
+    } catch (err) {
+      showToast(
+        err instanceof Error
+          ? err.message
+          : 'Google sign-in popup was closed or blocked.'
+      );
+    } finally {
+      setIsSigningIn(false);
+    }
+  }, [refreshBootstrap, showToast]);
+
+  const handleSignOut = useCallback(async () => {
+    await apiFetch('/api/auth/logout', { method: 'POST' });
+    try {
+      await signOut(auth);
+    } catch {
+      // ignore if not signed in via Firebase
+    }
+    setApiClientAuthToken(null);
+    setAuthenticatedUser(null);
+    setShowAccountMenu(false);
+    await refreshBootstrap();
+    showToast('Signed out.');
+  }, [refreshBootstrap, showToast]);
+
+  // Real Backend Handlers
+  const handleUpdateParticipation = useCallback(
+    async (
+      hackathonId: string,
+      updates: Partial<
+        Pick<
+          Participation,
+          'intent' | 'desiredRoles' | 'availabilityWindows' | 'discoverable'
+        >
+      >
+    ) => {
+      if (!authenticatedUser) {
+        showToast('Sign in with PESU or Google to save your event participation.');
+        return;
+      }
+      const res = await apiFetch<{
+        ok: boolean;
+        participation?: Participation;
+      }>(`/api/participations/${encodeURIComponent(hackathonId)}`, {
+        method: 'PUT',
+        body: updates,
+      });
+
+      if (res.ok && res.data?.participation) {
+        const updated = res.data.participation;
+        setParticipations((prev) => {
+          const exists = prev.some((p) => p.id === updated.id);
+          return exists
+            ? prev.map((p) => (p.id === updated.id ? updated : p))
+            : [...prev, updated];
+        });
+      } else {
+        showToast(res.errorMessage || 'Could not update participation.');
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleSwipeDecision = useCallback(
+    async (
+      card: CandidateCard,
+      decision: 'interested' | 'passed',
+      customNote?: string
+    ) => {
+      if (!authenticatedUser) {
+        showToast('Sign in with PESU or Google to connect with students or teams.');
         return;
       }
 
-      // Check if counterpart already expressed interest in currentUser -> Mutual Match!
-      const reciprocalKey = `${card.hackathonId}_${card.id}_user_${currentUser.uid}`;
-      const hasReciprocal = interests.some(
-        (i) => i.id === reciprocalKey && i.decision === 'interested'
-      );
+      const res = await apiFetch<{
+        ok: boolean;
+        interest?: Interest;
+        matchedConversation?: Conversation;
+        createdJoinRequest?: JoinRequest;
+        initialMessage?: Message;
+      }>('/api/swipes', {
+        method: 'POST',
+        body: {
+          hackathonId: card.hackathonId,
+          targetType: card.type === 'person' ? 'user' : 'team',
+          targetId: card.id,
+          decision,
+          proposedRole: card.rolesOfferedOrNeeded[0] ?? 'Builder',
+          customNote,
+        },
+      });
 
-      if (hasReciprocal) {
-        const convId = `conv_match_${card.hackathonId}_${[currentUser.uid, card.id].sort().join('_')}`;
-        if (!conversations.some((c) => c.id === convId)) {
-          const newConv: Conversation = {
-            id: convId,
-            hackathonId: card.hackathonId,
-            type: 'direct_match',
-            title: `${currentUser.displayName.split(' (')[0]} ↔ ${card.title.split(' (')[0]} (Mutual Match)`,
-            participantUids: [currentUser.uid, card.id],
-            createdAt: new Date().toISOString(),
-            lastMessageAt: new Date().toISOString(),
-          };
-          setConversations((prev) => [newConv, ...prev]);
-          if (customNote) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: `msg_${Date.now()}`,
-                conversationId: convId,
-                senderUid: currentUser.uid,
-                body: customNote,
-                createdAt: new Date().toISOString(),
-                moderationStatus: 'clean',
-              },
-            ]);
-          }
-        }
-        notifyToast(`Mutual Match with ${card.title}! 1-to-1 chat unlocked in Matches & Chat.`);
-      } else {
-        notifyToast(`Interest sent to ${card.title}. Chat unlocks if they reciprocate.`);
+      if (!res.ok || !res.data?.interest) {
+        showToast(res.errorMessage || 'Could not record decision.');
+        return;
       }
-      return;
-    }
 
-    // If swiping right on a TEAM -> Submit join application
-    const existingApp = joinRequests.find(
-      (jr) =>
-        jr.teamId === card.id &&
-        jr.applicantUid === currentUser.uid &&
-        jr.status === 'pending'
-    );
-    if (!existingApp) {
-      const appReq: JoinRequest = {
-        id: `req_app_${Date.now()}`,
-        hackathonId: card.hackathonId,
-        teamId: card.id,
-        applicantUid: currentUser.uid,
-        initiatorUid: currentUser.uid,
-        proposedRole: currentProfile.preferredRoles[0] ?? 'Generalist',
-        message:
-          customNote ??
-          `Applying for ${card.rolesOfferedOrNeeded[0] ?? 'open'} role on ${card.title.split(' (')[0]}.`,
-        direction: 'application',
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-      };
-      setJoinRequests((prev) => [appReq, ...prev]);
-    }
-    notifyToast(`Application submitted to ${card.title}! Track status in My Teams.`);
-  };
+      const recordedInterest = res.data.interest;
+      setInterests((prev) => [
+        ...prev.filter((i) => i.id !== recordedInterest.id),
+        recordedInterest,
+      ]);
 
-  const handleResetPassedCards = (hackathonId: string) => {
-    setInterests((prev) =>
-      prev.filter(
-        (i) =>
-          !(
-            i.hackathonId === hackathonId &&
-            i.fromUid === currentUser.uid &&
-            i.decision === 'passed'
+      if (decision === 'passed') return;
+
+      if (res.data.createdJoinRequest) {
+        const jr = res.data.createdJoinRequest;
+        setJoinRequests((prev) => [
+          jr,
+          ...prev.filter((r) => r.id !== jr.id),
+        ]);
+        showToast(
+          jr.direction === 'application'
+            ? `Application sent to "${card.title}".`
+            : `Team invitation sent to ${card.title}.`
+        );
+        return;
+      }
+
+      if (res.data.matchedConversation) {
+        const conv = res.data.matchedConversation;
+        setConversations((prev) => [
+          conv,
+          ...prev.filter((c) => c.id !== conv.id),
+        ]);
+        if (res.data.initialMessage) {
+          setMessages((prev) => [...prev, res.data!.initialMessage!]);
+        }
+        showToast(`Mutual match with ${card.title}! Open Matches to chat.`);
+      } else {
+        showToast(`Connection sent to ${card.title}.`);
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleResetPassedCards = useCallback(
+    async (hackathonId: string) => {
+      if (!authenticatedUser) {
+        showToast('Sign in first to manage your passed profiles.');
+        return;
+      }
+      const res = await apiFetch<{ ok: boolean }>(
+        `/api/swipes/passed/${encodeURIComponent(hackathonId)}`,
+        { method: 'DELETE' }
+      );
+      if (res.ok) {
+        setInterests((prev) =>
+          prev.filter(
+            (i) =>
+              !(
+                i.hackathonId === hackathonId &&
+                i.fromUid === currentUser.uid &&
+                i.decision === 'passed'
+              )
           )
-      )
-    );
-    notifyToast('Reset passed cards for this hackathon.');
-  };
+        );
+        showToast('Restored passed profiles for this event.');
+      } else {
+        showToast(res.errorMessage || 'Could not reset passed profiles.');
+      }
+    },
+    [authenticatedUser, currentUser.uid, showToast]
+  );
 
-  // Atomic Join Request Resolution (Section 6 Invariants 1-6)
-  const handleResolveJoinRequest = (
-    requestId: string,
-    decision: 'accepted' | 'rejected'
-  ) => {
-    const req = joinRequests.find((r) => r.id === requestId);
-    if (!req || req.status !== 'pending') return;
-
-    if (decision === 'rejected') {
-      setJoinRequests((prev) =>
-        prev.map((r) =>
-          r.id === requestId
-            ? {
-                ...r,
-                status: 'rejected',
-                resolvedAt: new Date().toISOString(),
-                resolutionNote: `Declined by ${currentUser.displayName}`,
-              }
-            : r
-        )
-      );
-      notifyToast('Request declined.');
-      return;
-    }
-
-    const team = teams.find((t) => t.id === req.teamId);
-    const hack = hackathons.find((h) => h.id === req.hackathonId);
-    if (!team || !hack) return;
-
-    const deterministicMembershipKey = `${req.hackathonId}_${req.applicantUid}`;
-    const existingActiveMembership = memberships.find(
-      (m) => m.id === deterministicMembershipKey && m.status === 'active'
-    );
-
-    if (existingActiveMembership) {
-      setLastTransactionBanner({
-        type: 'error',
-        title: 'Atomic Transaction Aborted — Single-Team Invariant Violation',
-        detail: `Deterministic key "${deterministicMembershipKey}" is already claimed by active team "${existingActiveMembership.teamId}". A student cannot belong to two active teams in the same hackathon.`,
-      });
-      return;
-    }
-
-    const maxAllowed = hack.maxTeamSize ?? team.targetSize;
-    if (team.memberCount >= team.targetSize || team.memberCount >= maxAllowed) {
-      setJoinRequests((prev) =>
-        prev.map((r) =>
-          r.id === requestId
-            ? {
-                ...r,
-                status: 'expired',
-                resolvedAt: new Date().toISOString(),
-                resolutionNote: 'Rejected atomically: Team reached full capacity.',
-              }
-            : r
-        )
-      );
-      setLastTransactionBanner({
-        type: 'error',
-        title: 'Atomic Transaction Rejected — Team is Full',
-        detail: `${team.name.split(' (')[0]} already has ${team.memberCount}/${team.targetSize} confirmed members.`,
-      });
-      return;
-    }
-
-    const nextCount = team.memberCount + 1;
-    const isNowFull = nextCount >= team.targetSize;
-
-    const newMembership: Membership = {
-      id: deterministicMembershipKey,
-      hackathonId: req.hackathonId,
-      teamId: team.id,
-      uid: req.applicantUid,
-      role: req.proposedRole,
-      joinedAt: new Date().toISOString(),
-      status: 'active',
-    };
-
-    setMemberships((prev) => [
-      ...prev.filter((m) => m.id !== deterministicMembershipKey),
-      newMembership,
-    ]);
-
-    setTeams((prev) =>
-      prev.map((t) =>
-        t.id === team.id
-          ? {
-              ...t,
-              memberCount: nextCount,
-              status: isNowFull ? 'full' : 'open',
-            }
-          : t
-      )
-    );
-
-    setParticipations((prev) =>
-      prev.map((p) =>
-        p.hackathonId === req.hackathonId && p.uid === req.applicantUid
-          ? { ...p, teamId: team.id, updatedAt: new Date().toISOString() }
-          : p
-      )
-    );
-
-    setJoinRequests((prev) =>
-      prev.map((r) => {
-        if (r.id === requestId) {
-          return {
-            ...r,
-            status: 'accepted',
-            resolvedAt: new Date().toISOString(),
-            resolutionNote: `Atomically committed (${nextCount}/${team.targetSize} slots filled).`,
-          };
-        }
-        if (
-          r.status === 'pending' &&
-          r.hackathonId === req.hackathonId &&
-          r.applicantUid === req.applicantUid
-        ) {
-          return {
-            ...r,
-            status: 'expired',
-            resolvedAt: new Date().toISOString(),
-            resolutionNote: 'Auto-invalidated: Applicant joined an active team in this hackathon.',
-          };
-        }
-        if (isNowFull && r.status === 'pending' && r.teamId === team.id) {
-          return {
-            ...r,
-            status: 'expired',
-            resolvedAt: new Date().toISOString(),
-            resolutionNote: `Auto-expired atomically: Team reached full capacity (${nextCount}/${team.targetSize}).`,
-          };
-        }
-        return r;
-      })
-    );
-
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.teamId === team.id && !c.participantUids.includes(req.applicantUid)
-          ? { ...c, participantUids: [...c.participantUids, req.applicantUid] }
-          : c
-      )
-    );
-
-    setLastTransactionBanner({
-      type: 'success',
-      title: 'Atomic Roster Transaction Committed',
-      detail: `Created deterministic membership "${deterministicMembershipKey}" (${nextCount}/${team.targetSize} members). ${
-        isNowFull
-          ? 'Team reached full capacity; all competing pending applications/invitations for this team were atomically expired.'
-          : 'Applicant discovery status updated immediately.'
-      }`,
-    });
-  };
-
-  const handleSimulateLastSlotRace = (teamId: string) => {
-    const team = teams.find((t) => t.id === teamId);
-    if (!team) return;
-
-    const pendingForTeam = joinRequests.filter(
-      (r) => r.teamId === teamId && r.status === 'pending'
-    );
-
-    if (pendingForTeam.length < 2) {
-      setLastTransactionBanner({
-        type: 'warning',
-        title: 'Race Simulation Notice',
-        detail: 'Need at least 2 pending requests on Team GridPulse to run the concurrent race simulation.',
-      });
-      return;
-    }
-
-    const [firstReq, secondReq] = pendingForTeam;
-    const firstUser = users.find((u) => u.uid === firstReq.applicantUid);
-    const secondUser = users.find((u) => u.uid === secondReq.applicantUid);
-
-    handleResolveJoinRequest(firstReq.id, 'accepted');
-
-    setLastTransactionBanner({
-      type: 'success',
-      title: 'Simultaneous Last-Slot Race Verified (1 Success · 1 Rejected)',
-      detail: `Concurrent Tx #1 (${firstUser?.displayName ?? firstReq.applicantUid}) claimed slot 4/4 via deterministic key "${team.hackathonId}_${firstReq.applicantUid}". Concurrent Tx #2 (${secondUser?.displayName ?? secondReq.applicantUid}) received "Team is full (4/4)" and was atomically marked expired.`,
-    });
-  };
-
-  const handleSimulateDoubleTeamAttempt = (hackathonId: string) => {
-    const detKey = `${hackathonId}_${currentUser.uid}`;
-    const existing = memberships.find((m) => m.id === detKey && m.status === 'active');
-
-    if (existing) {
-      setLastTransactionBanner({
-        type: 'error',
-        title: 'Invariant 1 Verified — Double-Team Membership Blocked',
-        detail: `Attempted to join a second team in "${hackathonId}", but deterministic key "memberships/${detKey}" is already active on "${existing.teamId}". You CAN still join teams in other hackathons (e.g., EC Campus Buildathon).`,
-      });
-    } else {
-      setLastTransactionBanner({
-        type: 'warning',
-        title: 'Deterministic Key Check Passed (Currently Not on a Team)',
-        detail: `Key "memberships/${detKey}" is currently free for ${currentUser.displayName}. Switch to Persona B (Ananya Sharma) or approve an application first to see the active duplicate-team block.`,
-      });
-    }
-  };
-
-  const handleCreateTeam = (params: {
-    hackathonId: string;
-    name: string;
-    pitch: string;
-    projectIdea: string;
-    rolesNeeded: string[];
-    customSpecializations: string[];
-    desiredDomains: string[];
-    targetSize: number;
-  }) => {
-    const detKey = `${params.hackathonId}_${currentUser.uid}`;
-    const existingMem = memberships.find((m) => m.id === detKey && m.status === 'active');
-    if (existingMem) {
-      setLastTransactionBanner({
-        type: 'error',
-        title: 'Cannot Create Second Active Team in Same Hackathon',
-        detail: `You already hold active membership "${detKey}" in this hackathon. Leave your current team first or select a different hackathon.`,
-      });
-      return;
-    }
-
-    const newTeamId = `team_${Date.now()}`;
-    const newTeam: Team = {
-      id: newTeamId,
-      hackathonId: params.hackathonId,
-      leaderId: currentUser.uid,
-      name: params.name,
-      pitch: params.pitch,
-      projectIdea: params.projectIdea || undefined,
-      rolesNeeded: params.rolesNeeded,
-      customSpecializations:
-        params.customSpecializations.length > 0 ? params.customSpecializations : undefined,
-      desiredDomains: params.desiredDomains,
-      availabilitySummary: 'Weekend Hackathon Sprint',
-      workStyleTags: currentProfile.workingStyleTags,
-      targetSize: params.targetSize,
-      memberCount: 1,
-      status: 'open',
-      visibility: 'public',
-      createdAt: new Date().toISOString(),
-    };
-
-    const newMem: Membership = {
-      id: detKey,
-      hackathonId: params.hackathonId,
-      teamId: newTeamId,
-      uid: currentUser.uid,
-      role: 'Team Leader',
-      joinedAt: new Date().toISOString(),
-      status: 'active',
-    };
-
-    const newConv: Conversation = {
-      id: `conv_${newTeamId}`,
-      hackathonId: params.hackathonId,
-      type: 'team_roster',
-      title: `Team ${params.name} — Roster Channel`,
-      participantUids: [currentUser.uid],
-      teamId: newTeamId,
-      createdAt: new Date().toISOString(),
-      lastMessageAt: new Date().toISOString(),
-    };
-
-    setTeams((prev) => [newTeam, ...prev]);
-    setMemberships((prev) => [...prev, newMem]);
-    setConversations((prev) => [newConv, ...prev]);
-    handleUpdateParticipation(params.hackathonId, { intent: 'recruiting' });
-    setLastTransactionBanner({
-      type: 'success',
-      title: 'Team Created & Deterministic Leader Membership Claimed',
-      detail: `Created "${params.name}" with target size ${params.targetSize}${
-        params.customSpecializations.length > 0
-          ? ` and custom specializations (${params.customSpecializations.join(', ')})`
-          : ''
-      }.`,
-    });
-  };
-
-  const handleUpdateTeam = (
-    teamId: string,
-    updates: {
-      name: string;
-      pitch: string;
-      rolesNeeded: string[];
-      customSpecializations: string[];
-    }
-  ) => {
-    setTeams((prev) =>
-      prev.map((t) =>
-        t.id === teamId
-          ? {
-              ...t,
-              name: updates.name,
-              pitch: updates.pitch,
-              rolesNeeded: updates.rolesNeeded,
-              customSpecializations:
-                updates.customSpecializations.length > 0
-                  ? updates.customSpecializations
-                  : undefined,
-            }
-          : t
-      )
-    );
-    notifyToast(`Updated roles and custom specializations for ${updates.name}.`);
-  };
-
-  const handleLeaveTeam = (hackathonId: string, teamId: string) => {
-    const detKey = `${hackathonId}_${currentUser.uid}`;
-    setMemberships((prev) =>
-      prev.map((m) => (m.id === detKey ? { ...m, status: 'left' } : m))
-    );
-    setTeams((prev) =>
-      prev.map((t) =>
-        t.id === teamId
-          ? {
-              ...t,
-              memberCount: Math.max(0, t.memberCount - 1),
-              status: 'open',
-            }
-          : t
-      )
-    );
-    setParticipations((prev) =>
-      prev.map((p) =>
-        p.id === detKey ? { ...p, teamId: undefined, intent: 'looking' } : p
-      )
-    );
-    notifyToast('Left team. Your participation status is now back to Looking for Team.');
-  };
-
-  // Block & Report Safety Controls
-  const handleBlockUser = (targetUid: string) => {
-    const blockId = `${currentUser.uid}_${targetUid}`;
-    if (!blocks.some((b) => b.id === blockId)) {
+  const handleBlockUser = useCallback(
+    (targetUid: string) => {
       setBlocks((prev) => [
         ...prev,
         {
-          id: blockId,
+          id: `${currentUser.uid}_${targetUid}`,
           blockerUid: currentUser.uid,
           blockedUid: targetUid,
           createdAt: new Date().toISOString(),
         },
       ]);
-    }
-    setConversations((prev) =>
-      prev.filter(
-        (c) =>
-          !(
-            c.type === 'direct_match' &&
-            c.participantUids.includes(currentUser.uid) &&
-            c.participantUids.includes(targetUid)
-          )
-      )
-    );
-    notifyToast('User blocked. Removed from discovery pool and direct messaging.');
-  };
+      showToast('User hidden from your Discover feed.');
+    },
+    [currentUser.uid, showToast]
+  );
 
-  const handleReportTarget = (
-    targetType: 'user' | 'team' | 'message',
-    targetId: string,
-    targetLabel: string,
-    reason: string
-  ) => {
-    const newRep: ReportRecord = {
-      id: `rep_${Date.now()}`,
-      reporterUid: currentUser.uid,
-      targetType,
-      targetId,
-      targetLabel,
-      reason,
-      status: 'open',
-      createdAt: new Date().toISOString(),
-    };
-    setReports((prev) => [newRep, ...prev]);
-    notifyToast('Safety report submitted to Moderator Queue.');
-  };
-
-  // Admin Event Ingestion Review Actions
-  const handleSubmitEventCandidate = (candidate: EventCandidate) => {
-    setEventCandidates((prev) => [candidate, ...prev]);
-    setAuditLogs((prev) => [
-      {
-        id: `audit_${Date.now()}`,
-        actorUid: currentUser.uid,
-        action: 'STAGE_EVENT_CANDIDATE',
-        targetId: candidate.id,
-        summary: `Staged "${candidate.title}" (${candidate.source}) into review queue.`,
-        createdAt: new Date().toISOString(),
-      },
-      ...prev,
-    ]);
-    notifyToast('Event candidate staged in Admin Review Queue (not public until approved).');
-  };
-
-  const handleApproveCandidate = (
-    candidateId: string,
-    overrides?: Partial<EventCandidate>
-  ) => {
-    const rawCand = eventCandidates.find((c) => c.id === candidateId);
-    if (!rawCand) return;
-
-    const cand: EventCandidate = {
-      ...rawCand,
-      ...overrides,
-      venue: overrides?.venue ? { ...rawCand.venue, ...overrides.venue } : rawCand.venue,
-      teamSize: overrides?.teamSize
-        ? { ...rawCand.teamSize, ...overrides.teamSize }
-        : rawCand.teamSize,
-    };
-
-    const newHackId = `hack_approved_${Date.now()}`;
-    const newHack: Hackathon = {
-      id: newHackId,
-      name: cand.title,
-      description: cand.description,
-      eventType: cand.eventType,
-      matchable: cand.matchable,
-      themes: cand.themes.length > 0 ? cand.themes : ['Applied AI/ML', 'Developer Tools'],
-      venue: {
-        name: cand.venue.name ?? null,
-        campus: cand.venue.campus ?? 'RR Campus',
-      },
-      format: cand.format,
-      startAt: cand.startAt,
-      datePrecision: cand.startAt && cand.startAt.length > 10 ? 'exact_instant' : 'date_only',
-      endAt: cand.endAt,
-      timezone: cand.timezone,
-      registrationDeadline: cand.registrationDeadline,
-      registrationUrl: cand.registrationUrl,
-      originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
-      verifiedCanonicalUrl: cand.verifiedCanonicalUrl ?? null,
-      sourceUrlStatus:
-        cand.sourceUrlStatus ??
-        (cand.verifiedCanonicalUrl ? 'verified' : 'unavailable'),
-      minTeamSize: cand.teamSize.min,
-      maxTeamSize: cand.teamSize.max,
-      eligibilityNotes: cand.eligibilityNotes,
-      organizer: cand.organizer,
-      sourceIds: [cand.id],
-      fieldProvenance: {
-        name: {
-          sourceType: cand.source,
-          sourceUrl: cand.verifiedCanonicalUrl ?? cand.originalSubmissionUrl ?? 'manual',
-          excerpt: cand.uploadedAttachment?.extractedEvidenceQuote ?? cand.title,
-          verifiedAt: new Date().toISOString(),
+  const handleSaveProfile = useCallback(
+    async (
+      updatedProfile: Profile,
+      updatedPrivacy: User['privacyPreferences']
+    ) => {
+      if (!authenticatedUser) {
+        showToast('Sign in with PESU or Google to save your profile.');
+        return;
+      }
+      const res = await apiFetch<{
+        ok: boolean;
+        user?: User;
+        profile?: Profile;
+      }>('/api/profile', {
+        method: 'PUT',
+        body: {
+          profile: updatedProfile,
+          privacyPreferences: updatedPrivacy,
         },
-      },
-      suggestedByCount: 1,
-      classification: {
-        category: cand.eventType,
-        ruleGatePassed: cand.classification.ruleGatePassed,
-        mlConfidenceScore: cand.classification.mlScore,
-        reason: cand.classification.reason,
-      },
-      lastVerifiedAt: new Date().toISOString(),
-      verificationStatus:
-        cand.teamSize.min !== null && cand.teamSize.max !== null
-          ? 'verified'
-          : 'unconfirmed_constraints',
-      status: 'published',
-      createdBy: currentUser.uid,
-    };
+      });
 
-    setHackathons((prev) => [newHack, ...prev]);
-    setEventCandidates((prev) =>
-      prev.map((c) =>
-        c.id === candidateId ? { ...cand, reviewStatus: 'approved' } : c
-      )
-    );
-    setAuditLogs((prev) => [
-      {
-        id: `audit_${Date.now()}`,
-        actorUid: currentUser.uid,
-        action: 'APPROVE_EVENT_CANDIDATE',
-        targetId: newHackId,
-        summary: `Approved "${cand.title}" into public directory (matchable=${cand.matchable}, canonicalUrl=${cand.verifiedCanonicalUrl ?? 'unavailable'}).`,
+      if (res.ok && res.data?.profile && res.data?.user) {
+        const savedUser = res.data.user;
+        const savedProfile = res.data.profile;
+        setAuthenticatedUser(savedUser);
+        setProfiles((prev) => ({
+          ...prev,
+          [savedUser.uid]: savedProfile,
+        }));
+        setUsers((prev) => {
+          const exists = prev.some((u) => u.uid === savedUser.uid);
+          return exists
+            ? prev.map((u) => (u.uid === savedUser.uid ? savedUser : u))
+            : [...prev, savedUser];
+        });
+        showToast('Builder profile saved.');
+      } else {
+        showToast(res.errorMessage || 'Could not save builder profile.');
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleCreateTeam = useCallback(
+    async (params: {
+      hackathonId: string;
+      name: string;
+      pitch: string;
+      projectIdea: string;
+      rolesNeeded: string[];
+      customSpecializations: string[];
+      targetSize: number;
+    }) => {
+      if (!authenticatedUser) {
+        showToast('Sign in with PESU or Google to create a team.');
+        return;
+      }
+
+      const res = await apiFetch<{
+        ok: boolean;
+        team?: Team;
+        membership?: Membership;
+        conversation?: Conversation;
+      }>('/api/teams', {
+        method: 'POST',
+        body: params,
+      });
+
+      if (res.ok && res.data?.team && res.data?.membership && res.data?.conversation) {
+        setTeams((prev) => [res.data!.team!, ...prev]);
+        setMemberships((prev) => [...prev, res.data!.membership!]);
+        setConversations((prev) => [res.data!.conversation!, ...prev]);
+        showToast(`Created team "${res.data.team.name}".`);
+      } else {
+        showToast(res.errorMessage || 'Could not create team.');
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleResolveJoinRequest = useCallback(
+    async (requestId: string, decision: 'accept' | 'reject') => {
+      if (!authenticatedUser) return;
+      const res = await apiFetch<{
+        ok: boolean;
+        status?: string;
+        newMemberCount?: number;
+        cap?: number;
+        becomesFull?: boolean;
+      }>(`/api/join-requests/${encodeURIComponent(requestId)}/resolve`, {
+        method: 'POST',
+        body: { decision },
+      });
+
+      if (!res.ok) {
+        showToast(res.errorMessage || 'Could not resolve request.');
+        await refreshBootstrap();
+        return;
+      }
+
+      await refreshBootstrap();
+      if (decision === 'reject') {
+        showToast('Request declined.');
+      } else {
+        showToast(
+          res.data?.becomesFull
+            ? `Accepted member! Team is now full (${res.data.newMemberCount}/${res.data.cap}).`
+            : `Accepted member (${res.data?.newMemberCount}/${res.data?.cap} slots filled).`
+        );
+      }
+    },
+    [authenticatedUser, refreshBootstrap, showToast]
+  );
+
+  const handleSubmitEventCandidate = useCallback(
+    async (candidate: EventCandidate) => {
+      if (!authenticatedUser) {
+        showToast('Sign in with PESU or Google to submit a campus event.');
+        return;
+      }
+      const res = await apiFetch<{
+        ok: boolean;
+        candidate?: EventCandidate;
+      }>('/api/hackathons/candidates', {
+        method: 'POST',
+        body: candidate,
+      });
+
+      if (res.ok && res.data?.candidate) {
+        setEventCandidates((prev) => [res.data!.candidate!, ...prev]);
+        showToast('Submitted event to Moderator Review Queue.');
+      } else {
+        showToast(res.errorMessage || 'Could not submit event candidate.');
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleApproveCandidate = useCallback(
+    async (
+      candidateId: string,
+      overrides?: {
+        minTeamSize: number | null;
+        maxTeamSize: number | null;
+        eventType: EventType;
+        matchable: boolean;
+        campus: CampusType | null;
+      }
+    ) => {
+      const res = await apiFetch<{
+        ok: boolean;
+        hackathon?: Hackathon;
+      }>(`/api/admin/candidates/${encodeURIComponent(candidateId)}/approve`, {
+        method: 'POST',
+        body: overrides ?? {},
+      });
+
+      if (res.ok && res.data?.hackathon) {
+        const pub = res.data.hackathon;
+        setHackathons((prev) => [pub, ...prev]);
+        setEventCandidates((prev) =>
+          prev.map((c) =>
+            c.id === candidateId ? { ...c, reviewStatus: 'approved' } : c
+          )
+        );
+        setSelectedHackathonId((prev) => prev || pub.id);
+        setAuditLogs((prev) => [
+          {
+            id: `audit_${Date.now()}`,
+            actorUid: currentUser.uid,
+            action: 'APPROVE_EVENT_CANDIDATE',
+            targetId: pub.id,
+            summary: `Published "${pub.name}".`,
+            createdAt: new Date().toISOString(),
+          },
+          ...prev,
+        ]);
+        showToast(`Approved and published "${pub.name}".`);
+      } else {
+        showToast(res.errorMessage || 'Could not approve candidate.');
+      }
+    },
+    [currentUser.uid, showToast]
+  );
+
+  const handleRejectCandidate = useCallback(
+    async (candidateId: string) => {
+      const res = await apiFetch<{ ok: boolean }>(
+        `/api/admin/candidates/${encodeURIComponent(candidateId)}/reject`,
+        { method: 'POST' }
+      );
+      if (res.ok) {
+        setEventCandidates((prev) =>
+          prev.map((c) =>
+            c.id === candidateId ? { ...c, reviewStatus: 'rejected' } : c
+          )
+        );
+        showToast('Rejected event candidate.');
+      } else {
+        showToast(res.errorMessage || 'Could not reject candidate.');
+      }
+    },
+    [showToast]
+  );
+
+  const handleMergeDuplicateCandidate = useCallback(
+    async (candidateId: string) => {
+      await handleRejectCandidate(candidateId);
+    },
+    [handleRejectCandidate]
+  );
+
+  const handleApplySourceDiffCandidate = useCallback(
+    async (candidateId: string) => {
+      await handleApproveCandidate(candidateId);
+    },
+    [handleApproveCandidate]
+  );
+
+  const handleResolveReport = useCallback(
+    (
+      reportId: string,
+      resolution: 'resolved_dismissed' | 'resolved_actioned'
+    ) => {
+      setReports((prev) =>
+        prev.map((r) => (r.id === reportId ? { ...r, status: resolution } : r))
+      );
+      showToast(`Report marked as ${resolution.replace('resolved_', '')}.`);
+    },
+    [showToast]
+  );
+
+  const handleSendMessage = useCallback(
+    async (conversationId: string, body: string) => {
+      if (!authenticatedUser) {
+        showToast('Sign in to send messages.');
+        return;
+      }
+      const res = await apiFetch<{
+        ok: boolean;
+        message?: Message;
+      }>(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, {
+        method: 'POST',
+        body: { body },
+      });
+
+      if (res.ok && res.data?.message) {
+        const msg = res.data.message;
+        setMessages((prev) => [...prev, msg]);
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === conversationId
+              ? { ...c, lastMessageAt: msg.createdAt }
+              : c
+          )
+        );
+      } else {
+        showToast(res.errorMessage || 'Could not send message.');
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleReportTarget = useCallback(
+    (params: {
+      targetType: 'user' | 'team' | 'message';
+      targetId: string;
+      targetLabel: string;
+      reason: string;
+    }) => {
+      const rep: ReportRecord = {
+        id: `rep_${Date.now()}`,
+        reporterUid: currentUser.uid,
+        ...params,
+        status: 'open',
         createdAt: new Date().toISOString(),
-      },
-      ...prev,
-    ]);
-    notifyToast(`Approved "${cand.title}" into the live Hackathon Directory.`);
-  };
+      };
+      setReports((prev) => [rep, ...prev]);
+      showToast('Report submitted to moderators.');
+    },
+    [currentUser.uid, showToast]
+  );
 
-  const handleRejectCandidate = (candidateId: string) => {
-    setEventCandidates((prev) =>
-      prev.map((c) => (c.id === candidateId ? { ...c, reviewStatus: 'rejected' } : c))
+  // Badges
+  const pendingAdminCount =
+    eventCandidates.filter(
+      (c) => c.reviewStatus === 'new' || c.reviewStatus === 'needs_confirmation'
+    ).length + reports.filter((r) => r.status === 'open').length;
+
+  const pendingTeamRequestsCount = joinRequests.filter((r) => {
+    if (r.status !== 'pending') return false;
+    const team = teams.find((t) => t.id === r.teamId);
+    return (
+      team?.leaderId === currentUser.uid || r.applicantUid === currentUser.uid
     );
-    setAuditLogs((prev) => [
-      {
-        id: `audit_${Date.now()}`,
-        actorUid: currentUser.uid,
-        action: 'REJECT_EVENT_CANDIDATE',
-        targetId: candidateId,
-        summary: `Rejected candidate ${candidateId}.`,
-        createdAt: new Date().toISOString(),
-      },
-      ...prev,
-    ]);
-    notifyToast('Rejected staged event candidate.');
-  };
+  }).length;
 
-  const handleMergeDuplicateCandidate = (candidateId: string, targetHackathonId: string) => {
-    const cand = eventCandidates.find((c) => c.id === candidateId);
-    if (!cand) return;
-
-    setHackathons((prev) =>
-      prev.map((h) =>
-        h.id === targetHackathonId
-          ? {
-              ...h,
-              sourceIds: Array.from(new Set([...h.sourceIds, cand.id])),
-              suggestedByCount: h.suggestedByCount + 1,
-            }
-          : h
-      )
-    );
-    setEventCandidates((prev) =>
-      prev.map((c) => (c.id === candidateId ? { ...c, reviewStatus: 'superseded' } : c))
-    );
-    setAuditLogs((prev) => [
-      {
-        id: `audit_${Date.now()}`,
-        actorUid: currentUser.uid,
-        action: 'MERGE_DUPLICATE_PROVENANCE',
-        targetId: targetHackathonId,
-        summary: `Merged duplicate source "${cand.sourceUrl ?? cand.uploadedAttachment?.fileName ?? 'manual'}" into ${targetHackathonId} without overwriting verified constraints.`,
-        createdAt: new Date().toISOString(),
-      },
-      ...prev,
-    ]);
-    notifyToast('Merged duplicate candidate provenance into existing verified hackathon.');
-  };
-
-  const handleApplyDiffCandidate = (candidateId: string, targetHackathonId: string) => {
-    const cand = eventCandidates.find((c) => c.id === candidateId);
-    if (!cand) return;
-
-    setHackathons((prev) =>
-      prev.map((h) =>
-        h.id === targetHackathonId
-          ? {
-              ...h,
-              registrationDeadline: cand.registrationDeadline ?? h.registrationDeadline,
-              venue: {
-                ...h.venue,
-                name: cand.venue.name ?? h.venue.name,
-              },
-              lastVerifiedAt: new Date().toISOString(),
-            }
-          : h
-      )
-    );
-    setEventCandidates((prev) =>
-      prev.map((c) => (c.id === candidateId ? { ...c, reviewStatus: 'approved' } : c))
-    );
-    setAuditLogs((prev) => [
-      {
-        id: `audit_${Date.now()}`,
-        actorUid: currentUser.uid,
-        action: 'VERIFY_SOURCE_DIFF',
-        targetId: targetHackathonId,
-        summary: `Verified and applied updated registrationDeadline and venue diff to ${targetHackathonId}.`,
-        createdAt: new Date().toISOString(),
-      },
-      ...prev,
-    ]);
-    notifyToast('Verified and applied source diff to live hackathon.');
-  };
-
-  const pendingCandidateCount = eventCandidates.filter(
-    (c) => c.reviewStatus === 'new' || c.reviewStatus === 'needs_confirmation'
+  const myConversationsCount = conversations.filter((c) =>
+    c.participantUids.includes(currentUser.uid)
   ).length;
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-slate-950 text-slate-900 dark:text-slate-100">
-      {/* Top Bar */}
-      <header className="sticky top-0 z-40 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-b border-slate-200 dark:border-slate-800 px-6 py-3.5 flex items-center justify-between gap-6">
-        <a
-          href="#top"
-          onClick={(e) => {
-            e.preventDefault();
-            setActiveNav('hackathons');
-          }}
-          className="text-lg font-bold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0 font-display"
-        >
-          Assemble
-        </a>
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col">
+      {/* Minimal 3-Zone Top Navigation Bar */}
+      <header className="sticky top-0 z-30 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4">
+          {/* Zone 1: Brand Wordmark */}
+          <button
+            type="button"
+            onClick={() => navigateToTab('discover')}
+            className="flex items-center gap-2.5 text-left cursor-pointer"
+          >
+            <div className="w-8 h-8 rounded-lg bg-slate-900 dark:bg-blue-600 text-amber-400 dark:text-white flex items-center justify-center font-bold text-sm shrink-0">
+              Q
+            </div>
+            <span className="font-bold text-base tracking-tight text-slate-900 dark:text-slate-100">
+              Quackathon
+            </span>
+          </button>
 
-        {/* Navigation Links */}
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-400">
-          <button
-            onClick={() => setActiveNav('hackathons')}
-            className={`hover:text-slate-900 dark:hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-              activeNav === 'hackathons'
-                ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 font-semibold'
-                : ''
-            }`}
+          {/* Zone 2: Minimal 4-Item Student Navigation (Discover | Hackathons | Matches | Profile) */}
+          <nav
+            aria-label="Main navigation"
+            className="flex items-center gap-1 overflow-x-auto py-1"
           >
-            Hackathons
-          </button>
-          <button
-            onClick={() => setActiveNav('discover')}
-            className={`hover:text-slate-900 dark:hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-              activeNav === 'discover'
-                ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 font-semibold'
-                : ''
-            }`}
-          >
-            Discover
-          </button>
-          <button
-            onClick={() => setActiveNav('teams')}
-            className={`hover:text-slate-900 dark:hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-              activeNav === 'teams'
-                ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 font-semibold'
-                : ''
-            }`}
-          >
-            My Teams
-          </button>
-          <button
-            onClick={() => setActiveNav('matches')}
-            className={`hover:text-slate-900 dark:hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-              activeNav === 'matches'
-                ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 font-semibold'
-                : ''
-            }`}
-          >
-            Matches & Chat
-          </button>
-          <button
-            onClick={() => setActiveNav('admin')}
-            className={`hover:text-slate-900 dark:hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-              activeNav === 'admin'
-                ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 font-semibold'
-                : ''
-            }`}
-          >
-            Review Queue ({pendingCandidateCount})
-          </button>
-          <button
-            onClick={() => setActiveNav('integrations')}
-            className={`hover:text-slate-900 dark:hover:text-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 inline-flex items-center gap-1 ${
-              activeNav === 'integrations'
-                ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 font-semibold'
-                : ''
-            }`}
-          >
-            <Code2 className="w-3.5 h-3.5" />
-            Integration Tests
-          </button>
-        </nav>
+            <button
+              type="button"
+              onClick={() => navigateToTab('discover')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'discover'
+                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <Compass className="w-3.5 h-3.5" />
+              <span>Discover</span>
+            </button>
 
-        {/* Primary Action */}
-        <div className="flex items-center gap-3 shrink-0">
-          <button
-            onClick={() => setShowProfileModal(true)}
-            className="px-4 py-2 text-xs font-semibold text-white bg-slate-900 dark:bg-slate-100 dark:text-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            Edit Builder Profile
-          </button>
+            <button
+              type="button"
+              onClick={() => navigateToTab('hackathons')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'hackathons'
+                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <Calendar className="w-3.5 h-3.5" />
+              <span>Hackathons</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => navigateToTab('matches')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'matches'
+                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <span>Matches</span>
+              {(myConversationsCount > 0 || pendingTeamRequestsCount > 0) && (
+                <span className="font-mono tabular-nums text-[11px] opacity-80">
+                  {myConversationsCount + pendingTeamRequestsCount}
+                </span>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => navigateToTab('profile')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'profile'
+                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
+              }`}
+            >
+              <UserCircle className="w-3.5 h-3.5" />
+              <span>Profile</span>
+            </button>
+          </nav>
+
+          {/* Zone 3: Real Auth & Account Menu */}
+          <div className="flex items-center gap-2">
+            {!authenticatedUser && (
+              <div className="hidden md:flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={isSigningIn}
+                  onClick={handleSignInWithPesu}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>PESU Sign In</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isSigningIn}
+                  onClick={handleSignInWithGoogle}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                >
+                  <span>Google</span>
+                </button>
+              </div>
+            )}
+
+            <div className="relative" ref={accountMenuRef}>
+              <button
+                type="button"
+                onClick={() => setShowAccountMenu((prev) => !prev)}
+                aria-expanded={showAccountMenu}
+                aria-haspopup="menu"
+                className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold text-slate-800 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <UserCircle className="w-4 h-4 text-slate-500" />
+                <span className="hidden sm:inline">
+                  {currentUser.displayName}
+                </span>
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+              </button>
+
+              {showAccountMenu && (
+                <div
+                  role="menu"
+                  className="absolute right-0 mt-1.5 w-64 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-lg py-2 z-50 text-xs"
+                >
+                  {/* Current User Header */}
+                  <div className="px-3.5 py-2 border-b border-slate-100 dark:border-slate-800">
+                    <div className="font-bold text-slate-900 dark:text-slate-100">
+                      {currentUser.displayName}
+                    </div>
+                    <div className="text-[11px] text-slate-500 truncate">
+                      {authenticatedUser
+                        ? `${currentUser.pesPrnOrSrn} · ${currentUser.campus}`
+                        : 'Not signed in'}
+                    </div>
+                  </div>
+
+                  {/* Sign In / Sign Out Actions */}
+                  <div className="py-1 border-b border-slate-100 dark:border-slate-800">
+                    {!authenticatedUser ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowAccountMenu(false);
+                            void handleSignInWithPesu();
+                          }}
+                          className="w-full px-3.5 py-2 text-left font-semibold text-blue-600 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                        >
+                          <span>Sign in with PESU OAuth</span>
+                          <LogIn className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowAccountMenu(false);
+                            void handleSignInWithGoogle();
+                          }}
+                          className="w-full px-3.5 py-2 text-left font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                        >
+                          <span>Sign in with Google</span>
+                          <LogIn className="w-3.5 h-3.5 text-slate-400" />
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => navigateToTab('profile')}
+                          className="w-full px-3.5 py-2 text-left font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                        >
+                          <span>Edit Builder Profile</span>
+                          <span className="text-[11px] text-slate-400">
+                            Skills & Bio
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleSignOut()}
+                          className="w-full px-3.5 py-2 text-left font-semibold text-red-600 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                        >
+                          <span>Sign Out</span>
+                          <LogOut className="w-3.5 h-3.5" />
+                        </button>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Separated Admin & Developer Routes */}
+                  <div className="pt-1">
+                    <div className="px-3.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                      Moderator & Diagnostics
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => navigateToTab('admin')}
+                      className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer ${
+                        activeTab === 'admin'
+                          ? 'font-bold text-blue-600 bg-slate-50 dark:bg-slate-800/60'
+                          : 'text-slate-700 dark:text-slate-300'
+                      }`}
+                    >
+                      <span className="inline-flex items-center gap-2">
+                        <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
+                        Admin Event Review
+                      </span>
+                      <span className="font-mono text-[10px] text-slate-400">
+                        {pendingAdminCount}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => navigateToTab('integrations')}
+                      className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer ${
+                        activeTab === 'integrations'
+                          ? 'font-bold text-blue-600 bg-slate-50 dark:bg-slate-800/60'
+                          : 'text-slate-700 dark:text-slate-300'
+                      }`}
+                    >
+                      <span className="inline-flex items-center gap-2">
+                        <Terminal className="w-3.5 h-3.5 text-slate-500" />
+                        Integration Diagnostics
+                      </span>
+                      <span className="font-mono text-[10px] text-slate-400">
+                        #/dev/integrations
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </header>
 
-      {/* Sub-Header Workspace Toolbar: Mode Selector, PESU Session & Persona Switcher */}
-      <div className="bg-slate-100/80 dark:bg-slate-900/60 border-b border-slate-200 dark:border-slate-800 px-6 py-2.5">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-          <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-300">
-            <UserCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-            <span className="font-semibold text-slate-900 dark:text-slate-100">
-              Active Builder Session:
-            </span>
-            <select
-              aria-label="Switch Active Test Persona"
-              value={currentUser.uid}
-              onChange={(e) => handleSelectPersona(e.target.value)}
-              className="px-2.5 py-1 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-md font-semibold text-slate-900 dark:text-slate-100 cursor-pointer"
-            >
-              {users.slice(0, 4).map((u) => (
-                <option key={u.uid} value={u.uid}>
-                  {u.displayName} — {u.personaLabel}
-                </option>
-              ))}
-            </select>
-            <span className="text-slate-400 hidden lg:inline">
-              · {currentUser.campus}
-            </span>
-          </div>
-
-          {/* Mobile Navigation Fallback */}
-          <div className="flex md:hidden items-center gap-2 overflow-x-auto py-1">
-            {(
-              [
-                { id: 'hackathons', label: 'Hackathons' },
-                { id: 'discover', label: 'Discover' },
-                { id: 'teams', label: 'My Teams' },
-                { id: 'matches', label: 'Matches' },
-                { id: 'admin', label: `Review (${pendingCandidateCount})` },
-                { id: 'integrations', label: 'API Tests' },
-              ] as { id: NavTab; label: string }[]
-            ).map((tab) => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveNav(tab.id)}
-                className={`px-2.5 py-1 rounded-md font-medium whitespace-nowrap shrink-0 ${
-                  activeNav === tab.id
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300'
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Explicit Demo Mode vs Live Test Mode Selector */}
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="flex items-center gap-1 p-0.5 bg-slate-200 dark:bg-slate-800 rounded-lg">
-              <button
-                type="button"
-                onClick={() => {
-                  setExecutionMode('demo');
-                  notifyToast('Switched to Demo Mode (Simulated responses labeled explicitly).');
-                }}
-                className={`px-2.5 py-1 rounded-md text-[11px] font-semibold cursor-pointer transition-colors ${
-                  executionMode === 'demo'
-                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                    : 'text-slate-600 dark:text-slate-400'
-                }`}
-              >
-                Demo Mode
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setExecutionMode('live');
-                  notifyToast('Switched to Live Test Mode (Using real GitHub, Gemini & URL APIs).');
-                }}
-                className={`px-2.5 py-1 rounded-md text-[11px] font-semibold cursor-pointer transition-colors ${
-                  executionMode === 'live'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-slate-600 dark:text-slate-400'
-                }`}
-              >
-                Live Test Mode
-              </button>
-            </div>
-
-            <button
-              onClick={() => setShowProfileModal(true)}
-              className="text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <SlidersHorizontal className="w-3.5 h-3.5" />
-              Roles: {currentProfile.preferredRoles.join('/')}
-            </button>
-          </div>
-        </div>
-      </div>
-
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed bottom-5 right-5 z-50 max-w-md bg-slate-900 text-white px-4 py-3 rounded-xl shadow-lg border border-slate-700 flex items-center gap-2.5 text-xs">
-          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-4 right-4 z-50 max-w-md bg-slate-900 text-white px-4 py-3 rounded-xl shadow-lg border border-slate-700 flex items-center gap-2.5 text-xs font-medium"
+        >
+          <Bell className="w-4 h-4 text-amber-400 shrink-0" />
           <span>{toastMessage}</span>
         </div>
       )}
 
-      {/* Main Content Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8">
-        {activeNav === 'hackathons' && (
-          <HackathonsView
-            currentUser={currentUser}
-            hackathons={hackathons}
-            selectedHackathonId={selectedHackathonId}
-            privateHints={privateHints}
-            executionMode={executionMode}
-            onSelectHackathonForDiscovery={(id) => {
-              setSelectedHackathonId(id);
-              setActiveNav('discover');
-            }}
-            onToggleAcademyScope={handleToggleAcademyScope}
-            onSubmitEventCandidate={handleSubmitEventCandidate}
-          />
-        )}
+      {/* Main Content Workspace */}
+      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6">
+        <Suspense fallback={<ViewSkeleton />}>
+          {activeTab === 'discover' && (
+            <DiscoverView
+              currentUser={currentUser}
+              hackathons={hackathons}
+              selectedHackathonId={selectedHackathonId}
+              onSelectHackathon={setSelectedHackathonId}
+              discoveryMode={discoveryMode}
+              onChangeDiscoveryMode={setDiscoveryMode}
+              users={users}
+              profiles={profiles}
+              participations={participations}
+              teams={teams}
+              memberships={memberships}
+              interests={interests}
+              blocks={blocks}
+              onUpdateParticipation={handleUpdateParticipation}
+              onSwipeDecision={handleSwipeDecision}
+              onResetPassedCards={handleResetPassedCards}
+              onBlockUser={handleBlockUser}
+            />
+          )}
 
-        {activeNav === 'discover' && (
-          <DiscoverView
-            currentUser={currentUser}
-            hackathons={hackathons}
-            selectedHackathonId={selectedHackathonId}
-            onSelectHackathon={setSelectedHackathonId}
-            discoveryMode={discoveryMode}
-            onChangeDiscoveryMode={setDiscoveryMode}
-            users={users}
-            profiles={profiles}
-            participations={participations}
-            teams={teams}
-            memberships={memberships}
-            interests={interests}
-            blocks={blocks}
-            onUpdateParticipation={handleUpdateParticipation}
-            onSwipeDecision={handleSwipeDecision}
-            onResetPassedCards={handleResetPassedCards}
-            onBlockUser={handleBlockUser}
-          />
-        )}
+          {activeTab === 'hackathons' && (
+            <HackathonsView
+              currentUser={currentUser}
+              executionMode={executionMode}
+              hackathons={hackathons}
+              privateAcademyHints={[]}
+              onSelectHackathonForDiscovery={(id) => {
+                setSelectedHackathonId(id);
+                navigateToTab('discover');
+              }}
+              onSubmitEventCandidate={handleSubmitEventCandidate}
+            />
+          )}
 
-        {activeNav === 'teams' && (
-          <TeamsAndRequestsView
-            currentUser={currentUser}
-            hackathons={hackathons}
-            selectedHackathonId={selectedHackathonId}
-            teams={teams}
-            memberships={memberships}
-            joinRequests={joinRequests}
-            users={users}
-            lastTransactionBanner={lastTransactionBanner}
-            onClearTransactionBanner={() => setLastTransactionBanner(null)}
-            onCreateTeam={handleCreateTeam}
-            onUpdateTeam={handleUpdateTeam}
-            onResolveJoinRequest={handleResolveJoinRequest}
-            onSimulateLastSlotRace={handleSimulateLastSlotRace}
-            onSimulateDoubleTeamAttempt={handleSimulateDoubleTeamAttempt}
-            onLeaveTeam={handleLeaveTeam}
-          />
-        )}
+          {activeTab === 'matches' && (
+            <MatchesAndChatView
+              currentUser={currentUser}
+              conversations={conversations}
+              messages={messages}
+              users={users}
+              profiles={profiles}
+              hackathons={hackathons}
+              joinRequests={joinRequests}
+              teams={teams}
+              memberships={memberships}
+              onSendMessage={handleSendMessage}
+              onResolveJoinRequest={handleResolveJoinRequest}
+              onCreateTeam={handleCreateTeam}
+              onReportTarget={handleReportTarget}
+            />
+          )}
 
-        {activeNav === 'matches' && (
-          <MatchesAndChatView
-            currentUser={currentUser}
-            users={users}
-            profiles={profiles}
-            hackathons={hackathons}
-            conversations={conversations}
-            messages={messages}
-            onSendMessage={(conversationId, body) => {
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: `msg_${Date.now()}`,
-                  conversationId,
-                  senderUid: currentUser.uid,
-                  body,
-                  createdAt: new Date().toISOString(),
-                  moderationStatus: 'clean',
-                },
-              ]);
-            }}
-            onBlockUser={handleBlockUser}
-            onReportTarget={handleReportTarget}
-          />
-        )}
+          {activeTab === 'profile' && (
+            <OnboardingAndProfileModal
+              currentUser={currentUser}
+              profile={currentProfile}
+              executionMode={executionMode}
+              isInline={true}
+              onSaveProfile={handleSaveProfile}
+              onClose={() => navigateToTab('discover')}
+              onNotify={showToast}
+            />
+          )}
 
-        {activeNav === 'admin' && (
-          <AdminReviewQueueView
-            currentUser={currentUser}
-            candidates={eventCandidates}
-            hackathons={hackathons}
-            reports={reports}
-            auditLogs={auditLogs}
-            onApproveCandidate={handleApproveCandidate}
-            onRejectCandidate={handleRejectCandidate}
-            onMergeDuplicateCandidate={handleMergeDuplicateCandidate}
-            onApplyDiffCandidate={handleApplyDiffCandidate}
-            onResolveReport={(reportId, resolution) => {
-              setReports((prev) =>
-                prev.map((r) => (r.id === reportId ? { ...r, status: resolution } : r))
-              );
-              notifyToast(`Report marked as ${resolution}.`);
-            }}
-          />
-        )}
+          {activeTab === 'admin' &&
+            (isAuthorizedStaff ? (
+              <AdminReviewQueueView
+                currentUser={currentUser}
+                executionMode={executionMode}
+                candidates={eventCandidates}
+                hackathons={hackathons}
+                reports={reports}
+                auditLogs={auditLogs}
+                onApproveCandidate={handleApproveCandidate}
+                onRejectCandidate={handleRejectCandidate}
+                onMergeDuplicateCandidate={handleMergeDuplicateCandidate}
+                onApplySourceDiffCandidate={handleApplySourceDiffCandidate}
+                onResolveReport={handleResolveReport}
+                onBackToApp={() => navigateToTab('discover')}
+              />
+            ) : (
+              <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center max-w-md mx-auto my-8 space-y-3">
+                <Lock className="w-7 h-7 text-slate-400 mx-auto" />
+                <h2 className="text-base font-bold">Admin Access Required</h2>
+                <p className="text-xs text-slate-500">
+                  Route #/admin is restricted to verified event moderators. Sign in with an authorized account to review event candidates.
+                </p>
+                <div className="flex justify-center gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => navigateToTab('discover')}
+                    className="px-3.5 py-1.5 rounded-lg border border-slate-200 text-xs font-medium cursor-pointer"
+                  >
+                    Back to Discover
+                  </button>
+                  {!authenticatedUser && (
+                    <button
+                      type="button"
+                      onClick={() => void handleSignInWithPesu()}
+                      className="px-3.5 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-semibold cursor-pointer"
+                    >
+                      Sign In with PESU
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
 
-        {activeNav === 'integrations' && (
-          <IntegrationTestingView
-            executionMode={executionMode}
-            onChangeExecutionMode={setExecutionMode}
-          />
-        )}
+          {activeTab === 'integrations' &&
+            (isAuthorizedStaff || Boolean(getApiClientAuthToken()) ? (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <button
+                    type="button"
+                    onClick={() => navigateToTab('discover')}
+                    className="text-xs font-semibold text-slate-600 hover:text-slate-900 cursor-pointer"
+                  >
+                    ← Back to Student App
+                  </button>
+                  <span className="text-[11px] font-mono text-slate-400">
+                    Route: #/dev/integrations
+                  </span>
+                </div>
+                <IntegrationTestingView
+                  executionMode={executionMode}
+                  onChangeExecutionMode={setExecutionMode}
+                />
+              </div>
+            ) : (
+              <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center max-w-md mx-auto my-8 space-y-3">
+                <Lock className="w-7 h-7 text-slate-400 mx-auto" />
+                <h2 className="text-base font-bold">
+                  Developer Console Restricted
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Route #/dev/integrations is reserved for authenticated API verification.
+                </p>
+                <div className="flex justify-center gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => navigateToTab('discover')}
+                    className="px-3.5 py-1.5 rounded-lg border border-slate-200 text-xs font-medium cursor-pointer"
+                  >
+                    Back to Discover
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleSignInWithPesu()}
+                    className="px-3.5 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-semibold cursor-pointer"
+                  >
+                    Sign In with PESU
+                  </button>
+                </div>
+              </div>
+            ))}
+        </Suspense>
       </main>
 
-      {/* Quiet Institutional Disclaimer Footer */}
-      <footer className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-6 py-4 text-xs text-slate-500 dark:text-slate-400">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-          <span>
-            Assemble (Quackathon — PES Hackathon Team Finder) · Independent student project; not an official PES University registration portal.
-          </span>
-          <span>
-            Mode: {executionMode === 'live' ? 'Live Test Mode (Real APIs)' : 'Demo Mode (Simulated)'} · Zero Academy password collection · Non-LLM per-swipe matching
-          </span>
-        </div>
-      </footer>
-
-      {/* Progressive 3-Step Onboarding & Builder Profile Modal */}
+      {/* Builder Profile Modal (if opened from Account menu) */}
       {showProfileModal && (
-        <OnboardingAndProfileModal
-          currentUser={currentUser}
-          profile={currentProfile}
-          executionMode={executionMode}
-          onSaveProfile={(updated) => {
-            setProfiles((prev) => ({
-              ...prev,
-              [currentUser.uid]: updated,
-            }));
-            notifyToast('Saved builder profile and updated matching preferences.');
-          }}
-          onClose={() => setShowProfileModal(false)}
-        />
+        <Suspense fallback={<ViewSkeleton />}>
+          <OnboardingAndProfileModal
+            currentUser={currentUser}
+            profile={currentProfile}
+            executionMode={executionMode}
+            onSaveProfile={handleSaveProfile}
+            onClose={() => setShowProfileModal(false)}
+            onNotify={showToast}
+          />
+        </Suspense>
       )}
     </div>
   );
 }
+export default App;

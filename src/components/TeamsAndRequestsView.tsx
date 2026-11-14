@@ -1,17 +1,5 @@
 import React, { useState } from 'react';
 import {
-  AlertTriangle,
-  Check,
-  CheckCircle2,
-  Edit3,
-  LogOut,
-  Plus,
-  ShieldAlert,
-  Sparkles,
-  X,
-  Zap,
-} from 'lucide-react';
-import {
   Hackathon,
   JoinRequest,
   Membership,
@@ -22,22 +10,24 @@ import {
   ROLE_TAXONOMY,
   SUGGESTED_CUSTOM_SPECIALIZATIONS,
 } from '../data/seedData';
+import {
+  Users,
+  Plus,
+  Lock,
+  Check,
+  X,
+  ChevronDown,
+  ChevronUp,
+} from 'lucide-react';
 import { Modal } from './Modal';
 
 interface TeamsAndRequestsViewProps {
   currentUser: User;
   hackathons: Hackathon[];
-  selectedHackathonId: string;
   teams: Team[];
   memberships: Membership[];
   joinRequests: JoinRequest[];
   users: User[];
-  lastTransactionBanner: {
-    type: 'success' | 'error' | 'warning';
-    title: string;
-    detail: string;
-  } | null;
-  onClearTransactionBanner: () => void;
   onCreateTeam: (params: {
     hackathonId: string;
     name: string;
@@ -45,740 +35,576 @@ interface TeamsAndRequestsViewProps {
     projectIdea: string;
     rolesNeeded: string[];
     customSpecializations: string[];
-    desiredDomains: string[];
     targetSize: number;
   }) => void;
-  onUpdateTeam?: (
-    teamId: string,
-    updates: {
-      name: string;
-      pitch: string;
-      rolesNeeded: string[];
-      customSpecializations: string[];
-    }
+  onResolveJoinRequest: (
+    requestId: string,
+    decision: 'accept' | 'reject'
   ) => void;
-  onResolveJoinRequest: (requestId: string, decision: 'accepted' | 'rejected') => void;
-  onSimulateLastSlotRace: (teamId: string) => void;
-  onSimulateDoubleTeamAttempt: (hackathonId: string) => void;
-  onLeaveTeam: (hackathonId: string, teamId: string) => void;
+  onSimulateConcurrentLastSlotRace: () => void;
+  onSimulateDoubleTeamAttempt: () => void;
 }
 
-export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = ({
-  currentUser,
-  hackathons,
-  selectedHackathonId,
-  teams,
-  memberships,
-  joinRequests,
-  users,
-  lastTransactionBanner,
-  onClearTransactionBanner,
-  onCreateTeam,
-  onUpdateTeam,
-  onResolveJoinRequest,
-  onSimulateLastSlotRace,
-  onSimulateDoubleTeamAttempt,
-  onLeaveTeam,
-}) => {
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
+export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = React.memo(
+  ({
+    currentUser,
+    hackathons,
+    teams,
+    memberships,
+    joinRequests,
+    users,
+    onCreateTeam,
+    onResolveJoinRequest,
+    onSimulateConcurrentLastSlotRace,
+    onSimulateDoubleTeamAttempt,
+  }) => {
+    const [showCreateModal, setShowCreateModal] = useState(false);
+    const [showAdvancedLab, setShowAdvancedLab] = useState(false);
 
-  const [createHackathonId, setCreateHackathonId] = useState(selectedHackathonId);
-  const [teamName, setTeamName] = useState('');
-  const [teamPitch, setTeamPitch] = useState('');
-  const [projectIdea, setProjectIdea] = useState('');
-  const [rolesNeeded, setRolesNeeded] = useState<string[]>(['Frontend', 'Product/UI Design']);
-  const [customSpecializations, setCustomSpecializations] = useState<string[]>([]);
-  const [specInput, setSpecInput] = useState('');
-  const [desiredDomains] = useState<string[]>(['Applied AI/ML', 'Climate/Civic Tech']);
-  const [targetSize, setTargetSize] = useState<number>(4);
+    const matchableHackathons = hackathons.filter((h) => h.matchable);
+    const [selectedHackathonId, setSelectedHackathonId] = useState(
+      matchableHackathons[0]?.id || 'hack_terrapthon_26'
+    );
+    const [teamName, setTeamName] = useState('');
+    const [pitch, setPitch] = useState('');
+    const [projectIdea, setProjectIdea] = useState('');
+    const [rolesNeeded, setRolesNeeded] = useState<string[]>([
+      'Frontend',
+      'Backend',
+    ]);
+    const [customSpecializations, setCustomSpecializations] = useState<
+      string[]
+    >([]);
+    const [customSpecInput, setCustomSpecInput] = useState('');
+    const [targetSize, setTargetSize] = useState<number>(4);
 
-  const myMemberships = memberships.filter(
-    (m) => m.uid === currentUser.uid && m.status === 'active'
-  );
+    // Active teams where currentUser is a member
+    const myMemberships = memberships.filter(
+      (m) => m.uid === currentUser.uid && m.status === 'active'
+    );
+    const myTeamIds = new Set(myMemberships.map((m) => m.teamId));
+    const myTeams = teams.filter(
+      (t) => myTeamIds.has(t.id) || t.leaderId === currentUser.uid
+    );
 
-  // Requests where currentUser is leader of the target team OR currentUser is the applicant/recipient
-  const myTeamIds = new Set(
-    teams.filter((t) => t.leaderId === currentUser.uid).map((t) => t.id)
-  );
-
-  const relevantRequests = joinRequests.filter(
-    (req) => myTeamIds.has(req.teamId) || req.applicantUid === currentUser.uid
-  );
-
-  const selectedHackathonForCreate =
-    hackathons.find((h) => h.id === createHackathonId) ?? hackathons[0];
-
-  const isCreateEventUnconfirmed =
-    selectedHackathonForCreate.minTeamSize === null ||
-    selectedHackathonForCreate.maxTeamSize === null;
-
-  const commitSpecializationTokens = (raw: string) => {
-    const parts = raw
-      .split(',')
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-    if (parts.length === 0) return;
-
-    setCustomSpecializations((prev) => {
-      const existingLower = new Set(prev.map((item) => item.toLowerCase()));
-      const additions: string[] = [];
-      for (const p of parts) {
-        if (!existingLower.has(p.toLowerCase())) {
-          existingLower.add(p.toLowerCase());
-          additions.push(p);
-        }
-      }
-      return [...prev, ...additions];
+    // Join requests relevant to currentUser (either leader of the team or the applicant)
+    const relevantRequests = joinRequests.filter((req) => {
+      const team = teams.find((t) => t.id === req.teamId);
+      if (!team) return false;
+      return (
+        team.leaderId === currentUser.uid ||
+        req.applicantUid === currentUser.uid
+      );
     });
-  };
 
-  const handleSpecKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' || e.key === ',') {
+    const pendingRequests = relevantRequests.filter(
+      (r) => r.status === 'pending'
+    );
+    const resolvedRequests = relevantRequests.filter(
+      (r) => r.status !== 'pending'
+    );
+
+    const toggleRole = (role: string) => {
+      if (rolesNeeded.includes(role)) {
+        setRolesNeeded(rolesNeeded.filter((r) => r !== role));
+      } else {
+        setRolesNeeded([...rolesNeeded, role]);
+      }
+    };
+
+    const toggleSpec = (spec: string) => {
+      if (customSpecializations.includes(spec)) {
+        setCustomSpecializations(
+          customSpecializations.filter((s) => s !== spec)
+        );
+      } else {
+        setCustomSpecializations([...customSpecializations, spec]);
+      }
+    };
+
+    const handleAddCustomSpec = () => {
+      const trimmed = customSpecInput.trim();
+      if (trimmed && !customSpecializations.includes(trimmed)) {
+        setCustomSpecializations([...customSpecializations, trimmed]);
+        setCustomSpecInput('');
+      }
+    };
+
+    const handleSubmitTeam = (e: React.FormEvent) => {
       e.preventDefault();
-      if (specInput.trim()) {
-        commitSpecializationTokens(specInput);
-        setSpecInput('');
-      }
-    } else if (
-      e.key === 'Backspace' &&
-      !specInput &&
-      customSpecializations.length > 0
-    ) {
-      setCustomSpecializations((prev) => prev.slice(0, -1));
-    }
-  };
-
-  const handleRemoveSpecialization = (label: string) => {
-    setCustomSpecializations((prev) => prev.filter((item) => item !== label));
-  };
-
-  const openCreateTeamModal = () => {
-    setEditingTeamId(null);
-    setCreateHackathonId(selectedHackathonId);
-    const h = hackathons.find((ev) => ev.id === selectedHackathonId);
-    if (h?.maxTeamSize) setTargetSize(h.maxTeamSize);
-    setTeamName('');
-    setTeamPitch('');
-    setProjectIdea('');
-    setRolesNeeded(['Frontend', 'Product/UI Design']);
-    setCustomSpecializations([]);
-    setSpecInput('');
-    setShowCreateModal(true);
-  };
-
-  const openEditTeamModal = (team: Team) => {
-    setEditingTeamId(team.id);
-    setCreateHackathonId(team.hackathonId);
-    setTeamName(team.name);
-    setTeamPitch(team.pitch);
-    setProjectIdea(team.projectIdea ?? '');
-    setRolesNeeded([...team.rolesNeeded]);
-    setCustomSpecializations([...(team.customSpecializations ?? [])]);
-    setSpecInput('');
-    setTargetSize(team.targetSize);
-    setShowCreateModal(true);
-  };
-
-  const handleSubmitTeam = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!teamName.trim() || !teamPitch.trim()) return;
-
-    // Commit any pending text inside the specialization input
-    const finalSpecs = [...customSpecializations];
-    if (specInput.trim()) {
-      for (const token of specInput
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)) {
-        if (!finalSpecs.some((ex) => ex.toLowerCase() === token.toLowerCase())) {
-          finalSpecs.push(token);
-        }
-      }
-    }
-
-    if (editingTeamId && onUpdateTeam) {
-      onUpdateTeam(editingTeamId, {
-        name: teamName.trim(),
-        pitch: teamPitch.trim(),
-        rolesNeeded,
-        customSpecializations: finalSpecs,
-      });
-    } else {
+      if (!teamName.trim() || !pitch.trim()) return;
       onCreateTeam({
-        hackathonId: createHackathonId,
+        hackathonId: selectedHackathonId,
         name: teamName.trim(),
-        pitch: teamPitch.trim(),
+        pitch: pitch.trim(),
         projectIdea: projectIdea.trim(),
         rolesNeeded,
-        customSpecializations: finalSpecs,
-        desiredDomains,
+        customSpecializations,
         targetSize,
       });
-    }
+      setTeamName('');
+      setPitch('');
+      setProjectIdea('');
+      setCustomSpecializations([]);
+      setShowCreateModal(false);
+    };
 
-    setShowCreateModal(false);
-    setEditingTeamId(null);
-    setTeamName('');
-    setTeamPitch('');
-    setProjectIdea('');
-    setCustomSpecializations([]);
-    setSpecInput('');
-  };
-
-  const gridPulseTeam = teams.find((t) => t.id === 'team_gridpulse');
-
-  const hasUnsavedChanges =
-    teamName.trim().length > 0 ||
-    teamPitch.trim().length > 0 ||
-    specInput.trim().length > 0 ||
-    customSpecializations.length > 0;
-
-  return (
-    <div className="space-y-8">
-      {/* Header */}
-      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 pb-6 border-b border-slate-200 dark:border-slate-800">
-        <div>
-          <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">
-            Deterministic Membership Keys (`hackathonId_uid`) · Atomic Roster Transactions
-          </p>
-          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-100">
-            My Teams, Applications & Atomic Invariant Lab
-          </h1>
-          <p className="text-sm text-slate-600 dark:text-slate-300 mt-1 max-w-2xl">
-            At most one active team per student per hackathon. Leaders cannot claim members without consent, and accepting the final slot atomically expires competing pending requests.
-          </p>
-        </div>
-
-        <button
-          onClick={openCreateTeamModal}
-          className="px-4 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg inline-flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer self-start lg:self-auto"
-        >
-          <Plus className="w-4 h-4" />
-          Create New Team for Event
-        </button>
-      </div>
-
-      {/* Transaction Feedback Banner */}
-      {lastTransactionBanner && (
-        <div
-          className={`p-4 rounded-xl border flex items-start justify-between gap-4 text-xs ${
-            lastTransactionBanner.type === 'success'
-              ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
-              : lastTransactionBanner.type === 'error'
-              ? 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-900 dark:text-red-200'
-              : 'bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800 text-amber-900 dark:text-amber-200'
-          }`}
-        >
-          <div className="flex items-start gap-2.5">
-            {lastTransactionBanner.type === 'success' ? (
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-            ) : (
-              <ShieldAlert className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-            )}
-            <div className="space-y-1">
-              <div className="font-bold text-sm">{lastTransactionBanner.title}</div>
-              <p className="leading-relaxed">{lastTransactionBanner.detail}</p>
-            </div>
-          </div>
-          <button
-            onClick={onClearTransactionBanner}
-            className="text-xs underline shrink-0 cursor-pointer"
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {/* Interactive Invariant & Concurrency Verification Lab */}
-      <div className="p-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-4">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2 text-xs text-blue-600 dark:text-blue-400 font-semibold">
-              <Zap className="w-3.5 h-3.5" />
-              <span>Section 12 Acceptance Test Runner — Concurrency & Domain Invariants</span>
-            </div>
+    return (
+      <div className="space-y-4">
+        {/* Top Action Bar */}
+        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 flex items-center justify-between gap-3">
+          <div>
             <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-              Test Atomic Last-Slot Race & Single-Team-Per-Hackathon Enforcement
+              My Teams
             </h2>
-            <p className="text-xs text-slate-600 dark:text-slate-300 max-w-3xl">
-              Verify how the transactional membership service handles two simultaneous approvals for the last open slot on <span className="font-semibold">Team GridPulse (3/4 members)</span>, or attempts to join two active teams within the same hackathon.
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Manage your hackathon rosters, applications, and invitations.
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-            <button
-              onClick={() => onSimulateLastSlotRace('team_gridpulse')}
-              disabled={!gridPulseTeam || gridPulseTeam.memberCount >= gridPulseTeam.targetSize}
-              className="px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 dark:bg-slate-100 dark:text-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-lg cursor-pointer whitespace-nowrap"
-            >
-              Simulate Simultaneous Last-Slot Approval Race
-            </button>
-            <button
-              onClick={() => onSimulateDoubleTeamAttempt('hack_terrapthon_26')}
-              className="px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg cursor-pointer whitespace-nowrap"
-            >
-              Test Double-Team Membership Guard
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={() => setShowCreateModal(true)}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Create Team
+          </button>
         </div>
-      </div>
 
-      {/* Active Team Memberships for Current User */}
-      <div className="space-y-3">
-        <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100">
-          Your Active Team Rosters ({myMemberships.length})
-        </h2>
+        {/* Main Two-Column Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Left 2 Columns: Active Teams */}
+          <div className="lg:col-span-2 space-y-3">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 px-1">
+              Active Rosters ({myTeams.length})
+            </h3>
 
-        {myMemberships.length === 0 ? (
-          <div className="p-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs text-slate-500 dark:text-slate-400">
-            You have not joined a confirmed team yet. You can apply to a team in the Discover tab, accept an invitation below, or create your own team.
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {myMemberships.map((mem) => {
-              const team = teams.find((t) => t.id === mem.teamId);
-              const hack = hackathons.find((h) => h.id === mem.hackathonId);
-              if (!team || !hack) return null;
-
-              const rosterMembers = memberships.filter(
-                (m) => m.teamId === team.id && m.status === 'active'
-              );
-              const isLeader = team.leaderId === currentUser.uid;
-
-              return (
-                <div
-                  key={mem.id}
-                  className="p-5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-4 flex flex-col justify-between"
+            {myTeams.length === 0 ? (
+              <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2.5">
+                <Users className="w-7 h-7 text-slate-400 mx-auto" />
+                <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                  You aren&apos;t in any teams yet
+                </p>
+                <p className="text-xs text-slate-500">
+                  Create a team or apply to an open team in Discover.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setShowCreateModal(true)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 cursor-pointer"
                 >
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
-                      <span>{hack.name.split(' — ')[0]}</span>
-                      <span className="font-mono tabular-nums font-bold text-slate-900 dark:text-slate-100">
-                        {team.memberCount} / {team.targetSize} Members ({team.status.toUpperCase()})
-                      </span>
-                    </div>
+                  <Plus className="w-3.5 h-3.5" />
+                  Create a Team
+                </button>
+              </div>
+            ) : (
+              myTeams.map((team) => {
+                const hackathon = hackathons.find(
+                  (h) => h.id === team.hackathonId
+                );
+                const rosterMembers = memberships.filter(
+                  (m) => m.teamId === team.id && m.status === 'active'
+                );
+                const openSlots = Math.max(
+                  0,
+                  team.targetSize - team.memberCount
+                );
 
+                return (
+                  <div
+                    key={team.id}
+                    className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 space-y-3.5"
+                  >
                     <div className="flex items-start justify-between gap-2">
-                      <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
-                        {team.name}
-                      </h3>
-                      {isLeader && onUpdateTeam && (
-                        <button
-                          type="button"
-                          onClick={() => openEditTeamModal(team)}
-                          className="px-2.5 py-1 text-xs font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 rounded-md inline-flex items-center gap-1 cursor-pointer shrink-0"
-                        >
-                          <Edit3 className="w-3 h-3" />
-                          Edit Roles & Specs
-                        </button>
+                      <div>
+                        <span className="text-xs text-slate-500 dark:text-slate-400">
+                          {hackathon?.name ?? team.hackathonId}
+                        </span>
+                        <h4 className="text-base font-bold text-slate-900 dark:text-slate-100 mt-0.5">
+                          {team.name}
+                        </h4>
+                      </div>
+
+                      {team.status === 'full' || openSlots === 0 ? (
+                        <span className="inline-flex items-center gap-1 text-xs font-semibold text-slate-600 dark:text-slate-400 font-mono tabular-nums shrink-0">
+                          <Lock className="w-3.5 h-3.5" /> Full ({team.memberCount}/
+                          {team.targetSize})
+                        </span>
+                      ) : (
+                        <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 font-mono tabular-nums shrink-0">
+                          {openSlots} {openSlots === 1 ? 'slot' : 'slots'} open (
+                          {team.memberCount}/{team.targetSize})
+                        </span>
                       )}
                     </div>
 
-                    <p className="text-xs text-slate-600 dark:text-slate-300">{team.pitch}</p>
+                    <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                      {team.pitch}
+                    </p>
 
-                    {/* Complementary Roles & Custom Specializations */}
-                    <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800 text-xs">
+                    {/* Roster Members */}
+                    <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+                      <div className="text-xs font-semibold text-slate-500 mb-2">
+                        Members
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {rosterMembers.map((m) => {
+                          const u = users.find((user) => user.uid === m.uid);
+                          return (
+                            <div
+                              key={m.id}
+                              className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800 flex items-center justify-between text-xs"
+                            >
+                              <div className="min-w-0">
+                                <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                  {(u?.displayName ?? m.uid).replace(
+                                    ' (Synthetic Demo)',
+                                    ''
+                                  )}
+                                  {team.leaderId === m.uid && (
+                                    <span className="ml-1 text-[11px] font-normal text-blue-600 dark:text-blue-400">
+                                      (Lead)
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-slate-500">{m.role}</div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {team.rolesNeeded.length > 0 && openSlots > 0 && (
+                      <div className="text-xs text-slate-600 dark:text-slate-400 pt-1">
+                        <strong className="text-slate-800 dark:text-slate-200">
+                          Looking for:
+                        </strong>{' '}
+                        {team.rolesNeeded.join(' · ')}
+                        {team.customSpecializations &&
+                          team.customSpecializations.length > 0 && (
+                            <span className="text-slate-500">
+                              {' '}
+                              ({team.customSpecializations.join(' · ')})
+                            </span>
+                          )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* Right Column: Pending Requests & Invitations */}
+          <div className="space-y-3">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 px-1">
+              Pending Requests ({pendingRequests.length})
+            </h3>
+
+            <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-3">
+              {pendingRequests.length === 0 ? (
+                <p className="text-xs text-slate-500 py-4 text-center">
+                  No pending requests right now.
+                </p>
+              ) : (
+                pendingRequests.map((req) => {
+                  const team = teams.find((t) => t.id === req.teamId);
+                  const applicant = users.find(
+                    (u) => u.uid === req.applicantUid
+                  );
+                  const canDecide =
+                    (req.direction === 'application' &&
+                      team?.leaderId === currentUser.uid) ||
+                    (req.direction === 'invitation' &&
+                      req.applicantUid === currentUser.uid);
+
+                  return (
+                    <div
+                      key={req.id}
+                      className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 space-y-2 text-xs"
+                    >
                       <div>
-                        <span className="font-semibold text-slate-700 dark:text-slate-300">
-                          Complementary Roles Needed:{' '}
-                        </span>
-                        <span className="text-slate-600 dark:text-slate-400">
-                          {team.rolesNeeded.join(' · ') || 'None specified'}
-                        </span>
+                        <div className="font-bold text-slate-900 dark:text-slate-100">
+                          {req.direction === 'application'
+                            ? `${(
+                                applicant?.displayName ?? req.applicantUid
+                              ).replace(' (Synthetic Demo)', '')} → ${
+                                team?.name.split(' (')[0]
+                              }`
+                            : `${team?.name.split(' (')[0]} invited ${(
+                                applicant?.displayName ?? 'You'
+                              ).replace(' (Synthetic Demo)', '')}`}
+                        </div>
+                        <div className="text-slate-500">
+                          Role: {req.proposedRole}
+                        </div>
                       </div>
 
-                      {team.customSpecializations && team.customSpecializations.length > 0 && (
-                        <div className="space-y-1">
-                          <span className="font-semibold text-slate-700 dark:text-slate-300 block">
-                            Specific Specializations Needed:
-                          </span>
-                          <div className="flex flex-wrap gap-1.5">
-                            {team.customSpecializations.map((spec) => (
-                              <span
-                                key={spec}
-                                className="px-2 py-0.5 text-[11px] font-medium bg-indigo-50 dark:bg-indigo-950/50 text-indigo-800 dark:text-indigo-200 border border-indigo-200 dark:border-indigo-800 rounded-md"
-                              >
-                                {spec}
-                              </span>
-                            ))}
-                          </div>
+                      {req.message && (
+                        <p className="text-slate-600 dark:text-slate-300 italic">
+                          &ldquo;{req.message}&rdquo;
+                        </p>
+                      )}
+
+                      {canDecide ? (
+                        <div className="flex gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onResolveJoinRequest(req.id, 'accept')
+                            }
+                            className="flex-1 inline-flex items-center justify-center gap-1 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            Accept
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onResolveJoinRequest(req.id, 'reject')
+                            }
+                            className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 text-slate-600 dark:text-slate-300 cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="text-slate-400">
+                          Awaiting response
                         </div>
                       )}
                     </div>
+                  );
+                })
+              )}
 
-                    <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1 text-xs">
-                      <span className="font-semibold text-slate-700 dark:text-slate-300 block">
-                        Confirmed Roster (Deterministic Key `hackathonId_uid`):
-                      </span>
-                      {rosterMembers.map((rm) => {
-                        const u = users.find((usr) => usr.uid === rm.uid);
-                        return (
-                          <div key={rm.id} className="flex items-center justify-between text-slate-600 dark:text-slate-400">
-                            <span>{u ? u.displayName : rm.uid}</span>
-                            <span className="font-mono text-slate-500">{rm.role}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
+              {resolvedRequests.length > 0 && (
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1.5 text-xs">
+                  <div className="text-[11px] font-semibold text-slate-400">
+                    Recent Decisions
                   </div>
-
-                  <div className="flex items-center justify-between pt-3 border-t border-slate-100 dark:border-slate-800">
-                    <span className="text-xs text-slate-400 font-mono">{mem.id}</span>
-                    <button
-                      onClick={() => onLeaveTeam(mem.hackathonId, team.id)}
-                      className="px-3 py-1.5 text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg inline-flex items-center gap-1 cursor-pointer"
-                    >
-                      <LogOut className="w-3.5 h-3.5" />
-                      Leave Team
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* Applications & Invitations Inbox */}
-      <div className="space-y-3">
-        <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100">
-          Join Requests & Invitations Inbox ({relevantRequests.length})
-        </h2>
-
-        {relevantRequests.length === 0 ? (
-          <div className="p-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs text-slate-500">
-            No applications or invitations for this persona yet. Switch to Persona B (Ananya Sharma — Team Leader) or Persona A (Arjun Rao) in the top bar to test pending approvals.
-          </div>
-        ) : (
-          <div className="divide-y divide-slate-200 dark:divide-slate-800 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl">
-            {relevantRequests.map((req) => {
-              const team = teams.find((t) => t.id === req.teamId);
-              const applicant = users.find((u) => u.uid === req.applicantUid);
-              const hack = hackathons.find((h) => h.id === req.hackathonId);
-
-              const canCurrentUserApprove =
-                req.status === 'pending' &&
-                ((req.direction === 'application' && team?.leaderId === currentUser.uid) ||
-                  (req.direction === 'invitation' && req.applicantUid === currentUser.uid));
-
-              return (
-                <div
-                  key={req.id}
-                  className="p-5 flex flex-col md:flex-row md:items-center justify-between gap-4"
-                >
-                  <div className="space-y-1.5">
-                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                      <span className="font-semibold text-slate-800 dark:text-slate-200 uppercase">
-                        {req.direction === 'application' ? 'Team Application' : 'Team Invitation'}
-                      </span>
-                      <span aria-hidden="true">·</span>
-                      <span>{hack?.name.split(' — ')[0]}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>Proposed Role: {req.proposedRole}</span>
-                      <span aria-hidden="true">·</span>
-                      <span
-                        className={`font-semibold uppercase ${
-                          req.status === 'accepted'
-                            ? 'text-emerald-600'
-                            : req.status === 'pending'
-                            ? 'text-amber-600'
-                            : 'text-slate-400'
-                        }`}
+                  {resolvedRequests.slice(0, 4).map((req) => {
+                    const team = teams.find((t) => t.id === req.teamId);
+                    const applicant = users.find(
+                      (u) => u.uid === req.applicantUid
+                    );
+                    return (
+                      <div
+                        key={req.id}
+                        className="flex items-center justify-between text-slate-600 dark:text-slate-400 py-0.5"
                       >
-                        Status: {req.status}
-                      </span>
-                    </div>
-
-                    <div className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                      Candidate: {applicant?.displayName ?? req.applicantUid} → Team:{' '}
-                      {team?.name.split(' (')[0] ?? req.teamId}{' '}
-                      {team && (
-                        <span className="font-mono tabular-nums text-xs font-normal text-slate-500">
-                          ({team.memberCount}/{team.targetSize} members)
+                        <span className="truncate">
+                          {(
+                            applicant?.displayName ?? req.applicantUid
+                          ).replace(' (Synthetic Demo)', '')}{' '}
+                          · {team?.name.split(' (')[0]}
                         </span>
-                      )}
-                    </div>
-
-                    {req.message && (
-                      <p className="text-xs text-slate-600 dark:text-slate-300">
-                        “{req.message}”
-                      </p>
-                    )}
-
-                    {req.resolutionNote && (
-                      <p className="text-xs font-medium text-slate-500 dark:text-slate-400">
-                        Transaction Audit: {req.resolutionNote}
-                      </p>
-                    )}
-                  </div>
-
-                  <div className="flex items-center gap-2 shrink-0">
-                    {canCurrentUserApprove ? (
-                      <>
-                        <button
-                          onClick={() => onResolveJoinRequest(req.id, 'rejected')}
-                          className="px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg inline-flex items-center gap-1 cursor-pointer"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                          Decline
-                        </button>
-                        <button
-                          onClick={() => onResolveJoinRequest(req.id, 'accepted')}
-                          className="px-3.5 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg inline-flex items-center gap-1 cursor-pointer"
-                        >
-                          <Check className="w-3.5 h-3.5" />
-                          {req.direction === 'application'
-                            ? 'Approve into Roster (Atomic)'
-                            : 'Accept Invitation (Atomic)'}
-                        </button>
-                      </>
-                    ) : req.status === 'pending' ? (
-                      <span className="text-xs text-slate-400">
-                        Awaiting {req.direction === 'application' ? 'Team Leader' : 'Candidate'} action
-                      </span>
-                    ) : null}
-                  </div>
+                        <span className="text-[11px] font-semibold capitalize shrink-0">
+                          {req.status}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
+              )}
+            </div>
           </div>
-        )}
-      </div>
+        </div>
 
-      {/* Standardized Create / Edit Team Modal (Requirement #5 & #6) */}
-      {showCreateModal && (
-        <Modal
-          onClose={() => {
-            setShowCreateModal(false);
-            setEditingTeamId(null);
-          }}
-          title={editingTeamId ? 'Edit Team Roles & Specializations' : 'Create a Hackathon Team'}
-          subtitle="Select standard roles and add custom specializations to rank complementary candidates."
-          maxWidthClass="max-w-xl"
-          hasUnsavedChanges={hasUnsavedChanges}
-        >
-          <form onSubmit={handleSubmitTeam} className="space-y-5">
-            {!editingTeamId && (
-              <div>
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                  Select Hackathon
-                </label>
-                <select
-                  value={createHackathonId}
-                  onChange={(e) => {
-                    setCreateHackathonId(e.target.value);
-                    const found = hackathons.find((h) => h.id === e.target.value);
-                    if (found?.maxTeamSize) setTargetSize(found.maxTeamSize);
-                  }}
-                  className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                >
-                  {hackathons.filter((h) => h.matchable).map((h) => (
-                    <option key={h.id} value={h.id}>
-                      {h.name} (
-                      {h.minTeamSize && h.maxTeamSize
-                        ? `${h.minTeamSize}–${h.maxTeamSize} members`
-                        : 'Constraints Unconfirmed'}
-                      )
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-
-            {!editingTeamId && isCreateEventUnconfirmed ? (
-              <div className="p-3.5 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-lg text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2.5">
-                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
-                <div>
-                  <span className="font-bold block">
-                    Team Size Bounds Not Yet Confirmed
-                  </span>
-                  This event has <code className="font-mono">minTeamSize = null</code> and{' '}
-                  <code className="font-mono">maxTeamSize = null</code>. We never guess numeric capacity limits; an organizer or admin must verify the event's team size in the Review Queue before fixed-capacity rosters can be locked.
-                </div>
-              </div>
+        {/* Collapsible Roster Safeguards Section */}
+        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setShowAdvancedLab(!showAdvancedLab)}
+            className="w-full px-4 py-2.5 flex items-center justify-between text-xs font-semibold text-slate-500 hover:bg-slate-50 cursor-pointer"
+          >
+            <span>Advanced: Roster Capacity & Concurrency Checks</span>
+            {showAdvancedLab ? (
+              <ChevronUp className="w-4 h-4 text-slate-400" />
             ) : (
-              <>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <div className={editingTeamId ? 'sm:col-span-3' : 'sm:col-span-2'}>
-                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                      Team Name *
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={teamName}
-                      onChange={(e) => setTeamName(e.target.value)}
-                      placeholder="e.g., SignalForge PES"
-                      className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                    />
-                  </div>
-                  {!editingTeamId && (
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                        Target Size ({selectedHackathonForCreate.minTeamSize}–{selectedHackathonForCreate.maxTeamSize})
-                      </label>
-                      <input
-                        type="number"
-                        min={selectedHackathonForCreate.minTeamSize ?? 2}
-                        max={selectedHackathonForCreate.maxTeamSize ?? 4}
-                        value={targetSize}
-                        onChange={(e) =>
-                          setTargetSize(
-                            Math.min(
-                              selectedHackathonForCreate.maxTeamSize ?? 4,
-                              Math.max(
-                                selectedHackathonForCreate.minTeamSize ?? 2,
-                                Number(e.target.value)
-                              )
-                            )
-                          )
-                        }
-                        className="w-full px-3 py-2 text-xs font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                      />
-                    </div>
-                  )}
+              <ChevronDown className="w-4 h-4 text-slate-400" />
+            )}
+          </button>
+
+          {showAdvancedLab && (
+            <div className="p-4 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
+              <p className="text-slate-600 dark:text-slate-400">
+                Verify that simultaneous accepts on the last open slot never exceed team capacity and that students cannot join two teams in the same hackathon.
+              </p>
+              <div className="flex flex-wrap gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={onSimulateConcurrentLastSlotRace}
+                  className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-medium whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Test Last-Slot Race
+                </button>
+                <button
+                  type="button"
+                  onClick={onSimulateDoubleTeamAttempt}
+                  className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-medium whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Test Duplicate Membership Guard
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Create Team Modal */}
+        {showCreateModal && (
+          <Modal
+            title="Create a New Team"
+            subtitle="Recruit teammates for an upcoming hackathon."
+            onClose={() => setShowCreateModal(false)}
+            maxWidthClass="max-w-lg"
+          >
+            <form onSubmit={handleSubmitTeam} className="space-y-3.5 text-xs">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                <div className="sm:col-span-2">
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Hackathon
+                  </label>
+                  <select
+                    value={selectedHackathonId}
+                    onChange={(e) => setSelectedHackathonId(e.target.value)}
+                    className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  >
+                    {matchableHackathons.map((h) => (
+                      <option key={h.id} value={h.id}>
+                        {h.name}
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                    Team Pitch & What You Are Building *
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Target Team Size
                   </label>
-                  <textarea
-                    rows={2}
-                    required
-                    value={teamPitch}
-                    onChange={(e) => setTeamPitch(e.target.value)}
-                    placeholder="Summarize your problem statement and current progress..."
-                    className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
+                  <input
+                    type="number"
+                    min={2}
+                    max={6}
+                    value={targetSize}
+                    onChange={(e) => setTargetSize(Number(e.target.value))}
+                    className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
                   />
                 </div>
+              </div>
 
-                {/* Complementary Roles Needed */}
-                <div className="space-y-2">
-                  <label className="block text-xs font-semibold text-slate-800 dark:text-slate-200">
-                    Complementary Roles Needed
-                  </label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {ROLE_TAXONOMY.map((role) => {
-                      const selected = rolesNeeded.includes(role);
-                      return (
-                        <button
-                          key={role}
-                          type="button"
-                          onClick={() =>
-                            setRolesNeeded(
-                              selected
-                                ? rolesNeeded.filter((r) => r !== role)
-                                : [...rolesNeeded, role]
-                            )
-                          }
-                          className={`px-2.5 py-1 text-xs rounded-md border cursor-pointer transition-colors ${
-                            selected
-                              ? 'bg-blue-600 text-white border-blue-600'
-                              : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                          }`}
-                        >
-                          {role}
-                        </button>
-                      );
-                    })}
-                  </div>
+              <div>
+                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                  Team Name *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={teamName}
+                  onChange={(e) => setTeamName(e.target.value)}
+                  placeholder="e.g., GridPulse Telemetry"
+                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                  Pitch / What You Are Building *
+                </label>
+                <textarea
+                  rows={2}
+                  required
+                  value={pitch}
+                  onChange={(e) => setPitch(e.target.value)}
+                  placeholder="Describe your idea and what teammates will work on..."
+                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                  Roles Needed
+                </label>
+                <div className="flex flex-wrap gap-1.5">
+                  {ROLE_TAXONOMY.map((role) => {
+                    const active = rolesNeeded.includes(role);
+                    return (
+                      <button
+                        key={role}
+                        type="button"
+                        onClick={() => toggleRole(role)}
+                        className={`px-2.5 py-1 rounded-lg font-medium border whitespace-nowrap shrink-0 cursor-pointer ${
+                          active
+                            ? 'bg-blue-600 text-white border-blue-600'
+                            : 'bg-white dark:bg-slate-900 text-slate-600 border-slate-200'
+                        }`}
+                      >
+                        {role}
+                      </button>
+                    );
+                  })}
                 </div>
+              </div>
 
-                {/* Custom Specializations Input (Requirement #5) */}
-                <div className="space-y-2 pt-3 border-t border-slate-100 dark:border-slate-800">
-                  <div className="flex items-center justify-between gap-2">
-                    <label className="block text-xs font-semibold text-slate-800 dark:text-slate-200">
-                      Other specializations we're looking for
-                    </label>
-                    <span className="text-[11px] text-slate-400">
-                      Press Enter or comma (,) to add chip
-                    </span>
-                  </div>
-
-                  <div className="p-2.5 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg space-y-2">
-                    {customSpecializations.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5">
-                        {customSpecializations.map((spec) => (
-                          <span
-                            key={spec}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-indigo-600 text-white rounded-md"
-                          >
-                            <span>{spec}</span>
-                            <button
-                              type="button"
-                              onClick={() => handleRemoveSpecialization(spec)}
-                              aria-label={`Remove ${spec}`}
-                              className="hover:text-indigo-200 cursor-pointer"
-                            >
-                              <X className="w-3 h-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    )}
-
-                    <input
-                      type="text"
-                      value={specInput}
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        if (val.includes(',')) {
-                          commitSpecializationTokens(val);
-                          setSpecInput('');
-                        } else {
-                          setSpecInput(val);
-                        }
-                      }}
-                      onKeyDown={handleSpecKeyDown}
-                      placeholder='e.g. "ROS2", "Verilog", "Figma", "Smart Contracts", "RAG", "Pitch Deck"...'
-                      className="w-full px-2 py-1 text-xs bg-transparent text-slate-900 dark:text-slate-100 focus:outline-none"
-                    />
-                  </div>
-
-                  {/* Quick-add common custom specialization chips */}
-                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-                    <span className="text-[11px] text-slate-400 inline-flex items-center gap-1 mr-1">
-                      <Sparkles className="w-3 h-3 text-indigo-500" />
-                      Quick add:
-                    </span>
-                    {SUGGESTED_CUSTOM_SPECIALIZATIONS.map((suggestion) => {
-                      const alreadyAdded = customSpecializations.some(
-                        (s) => s.toLowerCase() === suggestion.toLowerCase()
-                      );
-                      return (
-                        <button
-                          key={suggestion}
-                          type="button"
-                          disabled={alreadyAdded}
-                          onClick={() => commitSpecializationTokens(suggestion)}
-                          className={`px-2 py-0.5 text-[11px] rounded border transition-colors ${
-                            alreadyAdded
-                              ? 'bg-slate-100 dark:bg-slate-800 text-slate-400 border-slate-200 dark:border-slate-800 cursor-default'
-                              : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-indigo-400 cursor-pointer'
-                          }`}
-                        >
-                          + {suggestion}
-                        </button>
-                      );
-                    })}
-                  </div>
+              <div>
+                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                  Specializations (Optional)
+                </label>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {SUGGESTED_CUSTOM_SPECIALIZATIONS.map((spec) => {
+                    const active = customSpecializations.includes(spec);
+                    return (
+                      <button
+                        key={spec}
+                        type="button"
+                        onClick={() => toggleSpec(spec)}
+                        className={`px-2.5 py-1 rounded-lg font-medium border whitespace-nowrap shrink-0 cursor-pointer ${
+                          active
+                            ? 'bg-slate-900 text-white border-slate-900'
+                            : 'bg-white dark:bg-slate-900 text-slate-600 border-slate-200'
+                        }`}
+                      >
+                        {spec}
+                      </button>
+                    );
+                  })}
                 </div>
-
-                <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 dark:border-slate-800">
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={customSpecInput}
+                    onChange={(e) => setCustomSpecInput(e.target.value)}
+                    onKeyDown={(e) =>
+                      e.key === 'Enter' &&
+                      (e.preventDefault(), handleAddCustomSpec())
+                    }
+                    placeholder="Add custom specialization..."
+                    className="flex-1 px-2.5 py-1 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  />
                   <button
-                    type="submit"
-                    className="px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer"
+                    type="button"
+                    onClick={handleAddCustomSpec}
+                    className="px-3 py-1 rounded bg-slate-100 text-slate-700 font-medium cursor-pointer"
                   >
-                    {editingTeamId ? 'Save Team Changes' : 'Create Compliant Team'}
+                    Add
                   </button>
                 </div>
-              </>
-            )}
-          </form>
-        </Modal>
-      )}
-    </div>
-  );
-};
+              </div>
+
+              <div className="flex justify-end pt-2 border-t border-slate-100 dark:border-slate-800">
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer"
+                >
+                  Create Team
+                </button>
+              </div>
+            </form>
+          </Modal>
+        )}
+      </div>
+    );
+  }
+);

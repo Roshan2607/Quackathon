@@ -1,681 +1,654 @@
 import React, { useState } from 'react';
 import {
-  AlertTriangle,
-  Calendar,
-  Check,
-  CheckCircle2,
-  ChevronDown,
-  ChevronUp,
-  Edit3,
-  ExternalLink,
-  FileText,
-  GitMerge,
-  Link2Off,
-  MapPin,
-  ShieldCheck,
-  Users,
-  X,
-} from 'lucide-react';
-import {
   AuditLog,
   CampusType,
   EventCandidate,
+  EventSourceType,
   EventType,
+  ExecutionMode,
   Hackathon,
   ReportRecord,
   User,
 } from '../types/domain';
+import { VerifyUrlResponse } from '../types/apiContracts';
+import {
+  CheckCircle2,
+  XCircle,
+  Edit3,
+  GitMerge,
+  Globe,
+  ChevronDown,
+  ChevronUp,
+  ArrowLeft,
+} from 'lucide-react';
+import { verifyLiveEventUrl } from '../services/adapters';
 
 interface AdminReviewQueueViewProps {
   currentUser: User;
+  executionMode: ExecutionMode;
   candidates: EventCandidate[];
   hackathons: Hackathon[];
   reports: ReportRecord[];
   auditLogs: AuditLog[];
-  onApproveCandidate: (candidateId: string, overrides?: Partial<EventCandidate>) => void;
+  onApproveCandidate: (
+    candidateId: string,
+    overrides?: {
+      minTeamSize: number | null;
+      maxTeamSize: number | null;
+      eventType: EventType;
+      matchable: boolean;
+      campus: CampusType | null;
+    }
+  ) => void;
   onRejectCandidate: (candidateId: string) => void;
-  onMergeDuplicateCandidate: (candidateId: string, targetHackathonId: string) => void;
-  onApplyDiffCandidate: (candidateId: string, targetHackathonId: string) => void;
-  onResolveReport: (reportId: string, resolution: 'resolved_dismissed' | 'resolved_actioned') => void;
+  onMergeDuplicateCandidate: (candidateId: string) => void;
+  onApplySourceDiffCandidate: (candidateId: string) => void;
+  onResolveReport: (
+    reportId: string,
+    resolution: 'resolved_dismissed' | 'resolved_actioned'
+  ) => void;
+  onBackToApp?: () => void;
 }
 
-export const AdminReviewQueueView: React.FC<AdminReviewQueueViewProps> = ({
-  currentUser,
-  candidates,
-  hackathons,
-  reports,
-  auditLogs,
-  onApproveCandidate,
-  onRejectCandidate,
-  onMergeDuplicateCandidate,
-  onApplyDiffCandidate,
-  onResolveReport,
-}) => {
-  // Track which candidate is currently being edited inline before approval
-  const [editingCandidateId, setEditingCandidateId] = useState<string | null>(null);
-  const [editDraft, setEditDraft] = useState<Partial<EventCandidate> | null>(null);
-  const [expandedDiagnosticsIds, setExpandedDiagnosticsIds] = useState<Record<string, boolean>>({});
+export const AdminReviewQueueView: React.FC<AdminReviewQueueViewProps> = React.memo(
+  ({
+    candidates,
+    hackathons,
+    reports,
+    auditLogs,
+    onApproveCandidate,
+    onRejectCandidate,
+    onMergeDuplicateCandidate,
+    onApplySourceDiffCandidate,
+    onResolveReport,
+    onBackToApp,
+  }) => {
+    const [activeSection, setActiveSection] = useState<
+      'EVENTS' | 'REPORTS' | 'AUDIT'
+    >('EVENTS');
+    const [editingId, setEditingId] = useState<string | null>(null);
+    const [expandedDetailIds, setExpandedDetailIds] = useState<
+      Record<string, boolean>
+    >({});
 
-  const startEditingCandidate = (cand: EventCandidate) => {
-    setEditingCandidateId(cand.id);
-    setEditDraft({
-      title: cand.title,
-      description: cand.description,
-      organizer: cand.organizer,
-      eventType: cand.eventType,
-      matchable: cand.matchable,
-      startAt: cand.startAt,
-      endAt: cand.endAt,
-      registrationDeadline: cand.registrationDeadline,
-      venue: { ...cand.venue },
-      teamSize: { ...cand.teamSize },
-      verifiedCanonicalUrl: cand.verifiedCanonicalUrl ?? null,
-      registrationUrl: cand.registrationUrl ?? null,
-      eligibilityNotes: cand.eligibilityNotes ?? null,
-      themes: [...cand.themes],
-    });
-  };
+    // Inline Edit State
+    const [editMinSize, setEditMinSize] = useState<string>('2');
+    const [editMaxSize, setEditMaxSize] = useState<string>('4');
+    const [editEventType, setEditEventType] = useState<EventType>('hackathon');
+    const [editMatchable, setEditMatchable] = useState<boolean>(true);
+    const [editCampus, setEditCampus] = useState<CampusType>('RR Campus');
 
-  const toggleDiagnostics = (id: string) => {
-    setExpandedDiagnosticsIds((prev) => ({ ...prev, [id]: !prev[id] }));
-  };
+    // Live URL Verification State
+    const [verifyingId, setVerifyingId] = useState<string | null>(null);
+    const [verifyResults, setVerifyResults] = useState<
+      Record<string, VerifyUrlResponse>
+    >({});
 
-  return (
-    <div className="space-y-8">
-      {/* Header */}
-      <div className="pb-6 border-b border-slate-200 dark:border-slate-800 flex flex-col lg:flex-row lg:items-end justify-between gap-4">
-        <div>
-          <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">
-            Event Moderation & Field Verification
-          </p>
-          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-100">
-            Admin Event Review Queue
-          </h1>
-          <p className="text-sm text-slate-600 dark:text-slate-300 mt-1 max-w-3xl">
-            Review submitted or ingested events, edit extracted fields if needed, and approve them into the live hackathon directory.
-          </p>
-        </div>
+    const toggleDetails = (id: string) => {
+      setExpandedDetailIds((prev) => ({ ...prev, [id]: !prev[id] }));
+    };
 
-        <div className="text-xs text-slate-500 font-mono shrink-0">
-          Reviewer: {currentUser.displayName} {currentUser.isAdmin ? '(Admin Verified)' : '(Demo Mode)'}
-        </div>
-      </div>
+    const startEditing = (cand: EventCandidate) => {
+      setEditingId(cand.id);
+      setEditMinSize(
+        cand.teamSize.min !== null ? String(cand.teamSize.min) : ''
+      );
+      setEditMaxSize(
+        cand.teamSize.max !== null ? String(cand.teamSize.max) : ''
+      );
+      setEditEventType(cand.eventType);
+      setEditMatchable(cand.matchable);
+      setEditCampus(cand.venue.campus ?? 'RR Campus');
+    };
 
-      {/* Staged Event Candidates Queue */}
+    const handleSaveAndApprove = (candId: string) => {
+      onApproveCandidate(candId, {
+        minTeamSize: editMinSize.trim() ? Number(editMinSize) : null,
+        maxTeamSize: editMaxSize.trim() ? Number(editMaxSize) : null,
+        eventType: editEventType,
+        matchable: editMatchable,
+        campus: editCampus,
+      });
+      setEditingId(null);
+    };
+
+    const handleVerifyUrl = async (cand: EventCandidate) => {
+      const targetUrl =
+        cand.sourceUrl || cand.originalSubmissionUrl || cand.registrationUrl;
+      if (!targetUrl) return;
+      setVerifyingId(cand.id);
+      try {
+        const res = await verifyLiveEventUrl(targetUrl);
+        setVerifyResults((prev) => ({ ...prev, [cand.id]: res }));
+        setExpandedDetailIds((prev) => ({ ...prev, [cand.id]: true }));
+      } finally {
+        setVerifyingId(null);
+      }
+    };
+
+    const formatSourceLabel = (source: EventSourceType) => {
+      switch (source) {
+        case 'pes_public_events':
+          return 'PES Public Events';
+        case 'approved_organizer':
+          return 'Organizer Feed';
+        case 'submitted_public_url':
+          return 'Student Link';
+        case 'uploaded_brochure_or_poster':
+          return 'Poster / PDF';
+        case 'academy_opt_in_hint':
+          return 'Academy Hint';
+        default:
+          return source;
+      }
+    };
+
+    const openReportsCount = reports.filter((r) => r.status === 'open').length;
+    const pendingCandidatesCount = candidates.filter(
+      (c) => c.reviewStatus === 'new' || c.reviewStatus === 'needs_confirmation'
+    ).length;
+
+    return (
       <div className="space-y-4">
-        <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100">
-          Staged Event Submissions ({candidates.length})
-        </h2>
-
-        <div className="grid grid-cols-1 gap-4">
-          {candidates.map((cand) => {
-            const duplicateTarget = cand.duplicateOfHackathonId
-              ? hackathons.find((h) => h.id === cand.duplicateOfHackathonId)
-              : undefined;
-            const diffTarget = cand.updatesExistingHackathonId
-              ? hackathons.find((h) => h.id === cand.updatesExistingHackathonId)
-              : undefined;
-
-            const isEditing = editingCandidateId === cand.id && editDraft !== null;
-            const isDiagnosticsOpen = Boolean(expandedDiagnosticsIds[cand.id]);
-
-            const statusBadgeStyles =
-              cand.reviewStatus === 'approved'
-                ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
-                : cand.reviewStatus === 'rejected' || cand.reviewStatus === 'superseded'
-                ? 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                : 'bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 border-amber-200 dark:border-amber-800';
-
-            return (
-              <div
-                key={cand.id}
-                className="p-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-4"
+        {/* Compact Header Bar */}
+        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            {onBackToApp && (
+              <button
+                type="button"
+                onClick={onBackToApp}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
               >
-                {/* Prominent Core Summary Row (Requirement #7: Event title, date, venue, team size, source, approval status) */}
-                <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-5">
-                  <div className="space-y-3 flex-1">
-                    {/* Approval Status + Category + Source Pill Row */}
-                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                      <span
-                        className={`px-2.5 py-0.5 font-semibold uppercase rounded-md border ${statusBadgeStyles}`}
-                      >
-                        {cand.reviewStatus.replace('_', ' ')}
-                      </span>
-                      <span
-                        className={`px-2.5 py-0.5 font-semibold rounded-md ${
-                          cand.matchable
-                            ? 'bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300'
-                            : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
-                        }`}
-                      >
-                        {cand.eventType.toUpperCase()} · {cand.matchable ? 'Team Matchable' : 'Non-Team Event'}
-                      </span>
-                      {cand.organizer && (
-                        <span className="text-slate-500 dark:text-slate-400">
-                          by <strong className="text-slate-700 dark:text-slate-200">{cand.organizer}</strong>
-                        </span>
-                      )}
-                    </div>
+                <ArrowLeft className="w-3.5 h-3.5" />
+                Back
+              </button>
+            )}
+            <div>
+              <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
+                Admin Event Review
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Review event candidates, source updates, and moderation reports.
+              </p>
+            </div>
+          </div>
 
-                    {/* Title & Description */}
-                    <div>
-                      <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100">
-                        {cand.title}
-                      </h3>
-                      <p className="text-xs text-slate-600 dark:text-slate-300 mt-1 leading-relaxed">
-                        {cand.description}
-                      </p>
-                    </div>
+          <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
+            <button
+              type="button"
+              onClick={() => setActiveSection('EVENTS')}
+              className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+                activeSection === 'EVENTS'
+                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              Event Queue ({pendingCandidatesCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveSection('REPORTS')}
+              className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+                activeSection === 'REPORTS'
+                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              Reports ({openReportsCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveSection('AUDIT')}
+              className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+                activeSection === 'AUDIT'
+                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              Audit Log ({auditLogs.length})
+            </button>
+          </div>
+        </div>
 
-                    {/* 4 Key Operational Fields Grid: Date, Venue, Team Size, Source Link */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 p-3.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200/80 dark:border-slate-800 rounded-lg text-xs">
-                      <div className="space-y-0.5">
-                        <span className="text-slate-400 font-medium inline-flex items-center gap-1">
-                          <Calendar className="w-3.5 h-3.5" /> Event Date & Deadline
-                        </span>
-                        <div className="font-mono font-semibold text-slate-800 dark:text-slate-200">
-                          {cand.startAt ? cand.startAt.slice(0, 10) : 'Unknown Date'}
-                        </div>
-                        <div className="text-[11px] text-slate-500">
-                          Reg Deadline: {cand.registrationDeadline ? cand.registrationDeadline.slice(0, 10) : 'Unknown'}
-                        </div>
-                      </div>
+        {/* Section 1: Event Candidate Rows */}
+        {activeSection === 'EVENTS' && (
+          <div className="space-y-2.5">
+            {candidates.length === 0 ? (
+              <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center">
+                <CheckCircle2 className="w-7 h-7 text-emerald-500 mx-auto mb-2" />
+                <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                  No event candidates in queue
+                </p>
+              </div>
+            ) : (
+              candidates.map((cand) => {
+                const isEditing = editingId === cand.id;
+                const isExpanded = Boolean(expandedDetailIds[cand.id]);
+                const duplicateHackathon = cand.duplicateOfHackathonId
+                  ? hackathons.find((h) => h.id === cand.duplicateOfHackathonId)
+                  : undefined;
+                const verifyRes = verifyResults[cand.id];
+                const isResolved =
+                  cand.reviewStatus === 'approved' ||
+                  cand.reviewStatus === 'rejected' ||
+                  cand.reviewStatus === 'superseded';
 
-                      <div className="space-y-0.5">
-                        <span className="text-slate-400 font-medium inline-flex items-center gap-1">
-                          <MapPin className="w-3.5 h-3.5" /> Venue & Campus
-                        </span>
-                        <div className="font-semibold text-slate-800 dark:text-slate-200">
-                          {cand.venue.campus ?? 'Campus Unspecified'}
-                        </div>
-                        <div className="text-[11px] text-slate-500">
-                          {cand.venue.name ?? 'Room / hall unknown'}
-                        </div>
-                      </div>
-
-                      <div className="space-y-0.5">
-                        <span className="text-slate-400 font-medium inline-flex items-center gap-1">
-                          <Users className="w-3.5 h-3.5" /> Team Size Bounds
-                        </span>
-                        <div className="font-mono font-semibold text-slate-800 dark:text-slate-200">
-                          {cand.teamSize.min !== null && cand.teamSize.max !== null
-                            ? `${cand.teamSize.min}–${cand.teamSize.max} members`
-                            : 'Not confirmed (null)'}
-                        </div>
-                        <div className="text-[11px] text-slate-500">
-                          {cand.eligibilityNotes ?? 'Eligibility not specified'}
-                        </div>
-                      </div>
-
-                      <div className="space-y-0.5">
-                        <span className="text-slate-400 font-medium block">
-                          Source & Verification
-                        </span>
-                        {cand.verifiedCanonicalUrl ? (
-                          <a
-                            href={cand.verifiedCanonicalUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-blue-600 dark:text-blue-400 hover:underline font-medium inline-flex items-center gap-1 break-all"
+                return (
+                  <div
+                    key={cand.id}
+                    className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-3"
+                  >
+                    {/* Compact Row: Event Name, Date, Source, Status + Primary Actions */}
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                            {cand.title}
+                          </h3>
+                          <span
+                            className={`text-[11px] font-semibold px-2 py-0.5 rounded capitalize whitespace-nowrap shrink-0 ${
+                              cand.reviewStatus === 'approved'
+                                ? 'bg-emerald-50 text-emerald-800'
+                                : cand.reviewStatus === 'rejected'
+                                ? 'bg-red-50 text-red-800'
+                                : 'bg-amber-50 text-amber-800'
+                            }`}
                           >
-                            Verified Event Page
-                            <ExternalLink className="w-3 h-3 shrink-0" />
-                          </a>
-                        ) : cand.uploadedAttachment ? (
-                          <span className="text-slate-700 dark:text-slate-300 font-medium inline-flex items-center gap-1">
-                            <FileText className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                            {cand.uploadedAttachment.fileName}
+                            {cand.reviewStatus.replace('_', ' ')}
                           </span>
-                        ) : (
-                          <span className="text-slate-500 inline-flex items-center gap-1">
-                            <Link2Off className="w-3.5 h-3.5 shrink-0" />
-                            Source unavailable
+                        </div>
+
+                        {/* Unboxed Metadata with Middot Separators */}
+                        <div className="text-xs text-slate-500 dark:text-slate-400 mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                          <span>{cand.organizer}</span>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono">
+                            {cand.startAt ? cand.startAt.slice(0, 10) : 'TBA'}
                           </span>
-                        )}
-                        <div className="text-[11px] text-slate-500">
-                          Channel: {cand.source} ({cand.sourceUrlStatus ?? 'unavailable'})
+                          <span aria-hidden="true">·</span>
+                          <span>
+                            Source: {formatSourceLabel(cand.source)}
+                          </span>
+                          <span aria-hidden="true">·</span>
+                          <span>
+                            {cand.teamSize.min && cand.teamSize.max
+                              ? `${cand.teamSize.min}–${cand.teamSize.max} members`
+                              : 'Size unconfirmed'}
+                          </span>
                         </div>
                       </div>
-                    </div>
 
-                    {/* Proposed Before/After Diffs */}
-                    {cand.proposedDiffs && cand.proposedDiffs.length > 0 && (
-                      <div className="p-3.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg space-y-2 text-xs">
-                        <div className="font-bold text-amber-900 dark:text-amber-200">
-                          Source Update Diff Detected for {diffTarget?.name ?? cand.updatesExistingHackathonId}
-                        </div>
-                        {cand.proposedDiffs.map((d, i) => (
-                          <div key={i} className="space-y-0.5 font-mono">
-                            <div className="text-slate-700 dark:text-slate-300">
-                              <span className="font-bold">{d.field}:</span>{' '}
-                              <span className="line-through text-red-600">{d.previousVerifiedValue}</span>{' '}
-                              → <span className="text-emerald-700 dark:text-emerald-400 font-bold">{d.newProposedValue}</span>
-                            </div>
-                            <div className="font-sans text-slate-500">Evidence: “{d.evidenceExcerpt}”</div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    {/* Warnings */}
-                    {cand.warnings.length > 0 && (
-                      <div className="space-y-1">
-                        {cand.warnings.map((w, i) => (
-                          <div key={i} className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
-                            <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                            <span>{w}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Reviewer Primary Actions */}
-                  {cand.reviewStatus === 'new' || cand.reviewStatus === 'needs_confirmation' ? (
-                    <div className="flex flex-wrap lg:flex-col items-stretch gap-2 shrink-0 min-w-[210px]">
-                      {duplicateTarget ? (
-                        <button
-                          onClick={() =>
-                            onMergeDuplicateCandidate(cand.id, duplicateTarget.id)
-                          }
-                          className="px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                        >
-                          <GitMerge className="w-3.5 h-3.5" />
-                          Merge into Live Event
-                        </button>
-                      ) : diffTarget ? (
-                        <button
-                          onClick={() => onApplyDiffCandidate(cand.id, diffTarget.id)}
-                          className="px-3.5 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          Verify & Apply Diff
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() =>
-                            onApproveCandidate(
-                              cand.id,
-                              isEditing && editDraft ? editDraft : undefined
-                            )
-                          }
-                          className="px-3.5 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                        >
-                          <Check className="w-3.5 h-3.5" />
-                          {isEditing ? 'Save Edits & Approve' : 'Approve & Publish'}
-                        </button>
-                      )}
-
-                      {!duplicateTarget && !diffTarget && (
+                      {/* Accessible Actions */}
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
                         <button
                           type="button"
-                          onClick={() => {
-                            if (isEditing) {
-                              setEditingCandidateId(null);
-                              setEditDraft(null);
-                            } else {
-                              startEditingCandidate(cand);
-                            }
-                          }}
-                          className="px-3.5 py-2 text-xs font-medium text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                          onClick={() => toggleDetails(cand.id)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 text-slate-600 dark:text-slate-300 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
                         >
-                          <Edit3 className="w-3.5 h-3.5" />
-                          {isEditing ? 'Cancel Field Edits' : 'Edit Fields Before Approval'}
+                          {isExpanded ? (
+                            <>
+                              Hide Details <ChevronUp className="w-3.5 h-3.5" />
+                            </>
+                          ) : (
+                            <>
+                              Details <ChevronDown className="w-3.5 h-3.5" />
+                            </>
+                          )}
                         </button>
-                      )}
 
-                      <button
-                        onClick={() => onRejectCandidate(cand.id)}
-                        className="px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                        Reject Submission
-                      </button>
-                    </div>
-                  ) : (
-                    <span className="text-xs font-mono uppercase text-slate-400">
-                      Resolved ({cand.reviewStatus})
-                    </span>
-                  )}
-                </div>
+                        {!isEditing && !isResolved && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => startEditing(cand)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 text-slate-700 dark:text-slate-300 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+                            >
+                              <Edit3 className="w-3.5 h-3.5" />
+                              Edit
+                            </button>
 
-                {/* Inline Field Editor for Admins Before Approving (Requirement #7) */}
-                {isEditing && editDraft && (
-                  <div className="p-4 bg-blue-50/50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-900 rounded-xl space-y-4 text-xs">
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-slate-900 dark:text-slate-100">
-                        Edit / Correct Extracted Event Fields Before Publishing
-                      </span>
-                      <span className="text-[11px] text-slate-500">
-                        Leave unknown dates or team sizes blank (`null`)
-                      </span>
-                    </div>
+                            {cand.updatesExistingHackathonId ? (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onApplySourceDiffCandidate(cand.id)
+                                }
+                                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                Approve Diff
+                              </button>
+                            ) : cand.duplicateOfHackathonId ? (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onMergeDuplicateCandidate(cand.id)
+                                }
+                                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                              >
+                                <GitMerge className="w-3.5 h-3.5" />
+                                Merge Duplicate
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => onApproveCandidate(cand.id)}
+                                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                Approve
+                              </button>
+                            )}
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                      <div className="sm:col-span-2">
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Event Title
-                        </label>
-                        <input
-                          type="text"
-                          value={editDraft.title ?? ''}
-                          onChange={(e) =>
-                            setEditDraft({ ...editDraft, title: e.target.value })
-                          }
-                          className="w-full px-2.5 py-1.5 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Organizer
-                        </label>
-                        <input
-                          type="text"
-                          value={editDraft.organizer ?? ''}
-                          onChange={(e) =>
-                            setEditDraft({ ...editDraft, organizer: e.target.value })
-                          }
-                          className="w-full px-2.5 py-1.5 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Event Category
-                        </label>
-                        <select
-                          value={editDraft.eventType ?? 'hackathon'}
-                          onChange={(e) => {
-                            const cat = e.target.value as EventType;
-                            setEditDraft({
-                              ...editDraft,
-                              eventType: cat,
-                              matchable:
-                                cat === 'hackathon' ||
-                                cat === 'ideathon' ||
-                                cat === 'buildathon' ||
-                                cat === 'team_competition',
-                            });
-                          }}
-                          className="w-full px-2.5 py-1.5 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        >
-                          <option value="hackathon">Hackathon (Team Matchable)</option>
-                          <option value="buildathon">Buildathon (Team Matchable)</option>
-                          <option value="ideathon">Ideathon (Team Matchable)</option>
-                          <option value="ctf">CTF</option>
-                          <option value="workshop">Workshop (Non-Matchable)</option>
-                          <option value="tech_talk">Tech Talk (Non-Matchable)</option>
-                        </select>
-                      </div>
-
-                      <div>
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Campus
-                        </label>
-                        <select
-                          value={editDraft.venue?.campus ?? 'RR Campus'}
-                          onChange={(e) =>
-                            setEditDraft({
-                              ...editDraft,
-                              venue: {
-                                name: editDraft.venue?.name ?? null,
-                                campus: e.target.value as CampusType,
-                              },
-                            })
-                          }
-                          className="w-full px-2.5 py-1.5 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        >
-                          <option value="RR Campus">RR Campus</option>
-                          <option value="EC Campus">EC Campus</option>
-                          <option value="Online / Multi-Campus">Online / Multi-Campus</option>
-                        </select>
-                      </div>
-
-                      <div>
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Venue Hall / Room
-                        </label>
-                        <input
-                          type="text"
-                          value={editDraft.venue?.name ?? ''}
-                          onChange={(e) =>
-                            setEditDraft({
-                              ...editDraft,
-                              venue: {
-                                campus: editDraft.venue?.campus ?? 'RR Campus',
-                                name: e.target.value.trim() || null,
-                              },
-                            })
-                          }
-                          placeholder="Unknown if blank"
-                          className="w-full px-2.5 py-1.5 bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Start Date (ISO or YYYY-MM-DD)
-                        </label>
-                        <input
-                          type="text"
-                          value={editDraft.startAt ?? ''}
-                          onChange={(e) =>
-                            setEditDraft({
-                              ...editDraft,
-                              startAt: e.target.value.trim() || null,
-                            })
-                          }
-                          placeholder="e.g. 2026-04-18"
-                          className="w-full px-2.5 py-1.5 font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Min Team Size
-                        </label>
-                        <input
-                          type="number"
-                          min={1}
-                          max={10}
-                          value={editDraft.teamSize?.min ?? ''}
-                          onChange={(e) =>
-                            setEditDraft({
-                              ...editDraft,
-                              teamSize: {
-                                min: e.target.value ? Number(e.target.value) : null,
-                                max: editDraft.teamSize?.max ?? null,
-                              },
-                            })
-                          }
-                          placeholder="null"
-                          className="w-full px-2.5 py-1.5 font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Max Team Size
-                        </label>
-                        <input
-                          type="number"
-                          min={1}
-                          max={10}
-                          value={editDraft.teamSize?.max ?? ''}
-                          onChange={(e) =>
-                            setEditDraft({
-                              ...editDraft,
-                              teamSize: {
-                                min: editDraft.teamSize?.min ?? null,
-                                max: e.target.value ? Number(e.target.value) : null,
-                              },
-                            })
-                          }
-                          placeholder="null"
-                          className="w-full px-2.5 py-1.5 font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        />
-                      </div>
-
-                      <div className="sm:col-span-2">
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Verified Canonical Event URL
-                        </label>
-                        <input
-                          type="url"
-                          value={editDraft.verifiedCanonicalUrl ?? ''}
-                          onChange={(e) =>
-                            setEditDraft({
-                              ...editDraft,
-                              verifiedCanonicalUrl: e.target.value.trim() || null,
-                              sourceUrlStatus: e.target.value.trim() ? 'verified' : 'unavailable',
-                            })
-                          }
-                          placeholder="https://events.pes.edu/... or leave empty if unavailable"
-                          className="w-full px-2.5 py-1.5 font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                          Registration URL
-                        </label>
-                        <input
-                          type="url"
-                          value={editDraft.registrationUrl ?? ''}
-                          onChange={(e) =>
-                            setEditDraft({
-                              ...editDraft,
-                              registrationUrl: e.target.value.trim() || null,
-                            })
-                          }
-                          placeholder="Optional registration link"
-                          className="w-full px-2.5 py-1.5 font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg"
-                        />
+                            <button
+                              type="button"
+                              onClick={() => onRejectCandidate(cand.id)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 hover:bg-red-50 text-red-700 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+                            >
+                              <XCircle className="w-3.5 h-3.5" />
+                              Reject
+                            </button>
+                          </>
+                        )}
                       </div>
                     </div>
-                  </div>
-                )}
 
-                {/* Expandable Technical Diagnostics, Fingerprints, Classification Scores & Raw Provenance (Requirement #7) */}
-                <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
-                  <button
-                    type="button"
-                    onClick={() => toggleDiagnostics(cand.id)}
-                    className="text-xs font-medium text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
-                  >
-                    {isDiagnosticsOpen ? (
-                      <ChevronUp className="w-3.5 h-3.5" />
-                    ) : (
-                      <ChevronDown className="w-3.5 h-3.5" />
+                    {/* Inline Edit Override Form */}
+                    {isEditing && (
+                      <div className="pt-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 p-3 rounded-lg space-y-3 text-xs">
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                              Campus
+                            </label>
+                            <select
+                              value={editCampus}
+                              onChange={(e) =>
+                                setEditCampus(e.target.value as CampusType)
+                              }
+                              className="w-full px-2 py-1.5 rounded border border-slate-300 bg-white dark:bg-slate-950"
+                            >
+                              <option value="RR Campus">RR Campus</option>
+                              <option value="EC Campus">EC Campus</option>
+                              <option value="Online / Multi-Campus">
+                                Online / Multi
+                              </option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                              Min Team
+                            </label>
+                            <input
+                              type="number"
+                              value={editMinSize}
+                              onChange={(e) => setEditMinSize(e.target.value)}
+                              className="w-full px-2 py-1.5 rounded border border-slate-300 bg-white dark:bg-slate-950"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                              Max Team
+                            </label>
+                            <input
+                              type="number"
+                              value={editMaxSize}
+                              onChange={(e) => setEditMaxSize(e.target.value)}
+                              className="w-full px-2 py-1.5 rounded border border-slate-300 bg-white dark:bg-slate-950"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                              Category
+                            </label>
+                            <select
+                              value={editEventType}
+                              onChange={(e) => {
+                                const val = e.target.value as EventType;
+                                setEditEventType(val);
+                                setEditMatchable(
+                                  val === 'hackathon' ||
+                                    val === 'buildathon' ||
+                                    val === 'ideathon' ||
+                                    val === 'ctf'
+                                );
+                              }}
+                              className="w-full px-2 py-1.5 rounded border border-slate-300 bg-white dark:bg-slate-950"
+                            >
+                              <option value="hackathon">hackathon</option>
+                              <option value="buildathon">buildathon</option>
+                              <option value="ideathon">ideathon</option>
+                              <option value="ctf">ctf</option>
+                              <option value="workshop">workshop</option>
+                              <option value="tech_talk">tech_talk</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between">
+                          <label className="inline-flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={editMatchable}
+                              onChange={(e) =>
+                                setEditMatchable(e.target.checked)
+                              }
+                            />
+                            Enable Team Matching in Discover
+                          </label>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setEditingId(null)}
+                              className="px-3 py-1 rounded border border-slate-300 bg-white text-slate-700 cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleSaveAndApprove(cand.id)}
+                              className="px-3.5 py-1 rounded bg-emerald-600 text-white font-semibold cursor-pointer"
+                            >
+                              Save & Approve
+                            </button>
+                          </div>
+                        </div>
+                      </div>
                     )}
-                    {isDiagnosticsOpen
-                      ? 'Hide Technical Diagnostics, Fingerprints & Raw Provenance'
-                      : 'Show Technical Diagnostics, Fingerprints & Raw Provenance'}
-                  </button>
 
-                  {isDiagnosticsOpen && (
-                    <div className="mt-3 p-3.5 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg space-y-2 text-xs font-mono">
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                        <div>
-                          <span className="text-slate-400">Deduplication Fingerprint: </span>
-                          <span className="text-slate-700 dark:text-slate-300 break-all">
-                            {cand.externalFingerprint}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-slate-400">Classifier Gate & Confidence: </span>
-                          <span className="text-slate-700 dark:text-slate-300">
-                            ruleGate={String(cand.classification.ruleGatePassed)} · score=
-                            {Math.round(cand.classification.mlScore * 100)}%
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-slate-400">Original Submission URL: </span>
-                          <span className="text-slate-700 dark:text-slate-300 break-all">
-                            {cand.originalSubmissionUrl ?? cand.sourceUrl ?? 'null'}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="text-slate-400">Verified Canonical URL: </span>
-                          <span className="text-slate-700 dark:text-slate-300 break-all">
-                            {cand.verifiedCanonicalUrl ?? 'null'} ({cand.sourceUrlStatus ?? 'unavailable'})
-                          </span>
-                        </div>
-                      </div>
-                      <div className="font-sans text-slate-600 dark:text-slate-400">
-                        <span className="font-semibold">Classification Rationale: </span>
-                        {cand.classification.reason}
-                      </div>
-                      <div className="p-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded text-[11px] text-slate-600 dark:text-slate-400 whitespace-pre-wrap">
-                        {JSON.stringify(cand.fieldEvidence, null, 2)}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
+                    {/* Expandable Details Section: Raw Extraction Data, Fingerprints, Confidence, Diagnostics & Provenance */}
+                    {isExpanded && (
+                      <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-3 text-xs text-slate-600 dark:text-slate-300">
+                        <p className="leading-relaxed">{cand.description}</p>
 
-      {/* Safety Reports & Operator Audit Logs */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="p-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-4">
-          <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
-            Trust & Safety Reports ({reports.length})
-          </h3>
-          <div className="divide-y divide-slate-200 dark:divide-slate-800">
+                        {cand.proposedDiffs && cand.proposedDiffs.length > 0 && (
+                          <div className="p-3 rounded-lg bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 space-y-1.5">
+                            <div className="font-semibold text-amber-900 dark:text-amber-200">
+                              Proposed Source Diffs
+                            </div>
+                            {cand.proposedDiffs.map((d, idx) => (
+                              <div key={idx} className="text-[11px]">
+                                <strong>{d.field}:</strong>{' '}
+                                <span className="line-through text-slate-400">
+                                  {d.previousVerifiedValue}
+                                </span>{' '}
+                                →{' '}
+                                <span className="font-semibold text-emerald-700">
+                                  {d.newProposedValue}
+                                </span>{' '}
+                                <span className="text-slate-500">
+                                  ({d.evidenceExcerpt})
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800 text-[11px]">
+                          <div>
+                            <div className="font-semibold text-slate-800 dark:text-slate-200">
+                              Classifier & Confidence
+                            </div>
+                            <div className="mt-0.5">
+                              Type: {cand.eventType} · Matchable:{' '}
+                              {cand.matchable ? 'Yes' : 'No'}
+                            </div>
+                            <div>
+                              Confidence:{' '}
+                              {Math.round(cand.classification.mlScore * 100)}% (
+                              {cand.classification.ruleGatePassed
+                                ? 'Rule Gate Passed'
+                                : 'Rule Gate Blocked'}
+                              )
+                            </div>
+                            <div className="text-slate-500 mt-0.5">
+                              {cand.classification.reason}
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="font-semibold text-slate-800 dark:text-slate-200">
+                              Fingerprint & Provenance
+                            </div>
+                            <div className="font-mono text-slate-600 dark:text-slate-400 break-all mt-0.5">
+                              {cand.externalFingerprint}
+                            </div>
+                            {duplicateHackathon && (
+                              <div className="text-amber-700 mt-1">
+                                Matches: {duplicateHackathon.name}
+                              </div>
+                            )}
+                            {cand.uploadedAttachment && (
+                              <div className="mt-1 text-slate-500">
+                                Attachment: {cand.uploadedAttachment.fileName}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <div className="font-semibold text-slate-800 dark:text-slate-200">
+                              Source Diagnostics
+                            </div>
+                            {(cand.sourceUrl ||
+                              cand.originalSubmissionUrl ||
+                              cand.registrationUrl) && (
+                              <button
+                                type="button"
+                                disabled={verifyingId === cand.id}
+                                onClick={() => handleVerifyUrl(cand)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-medium cursor-pointer"
+                              >
+                                <Globe className="w-3 h-3" />
+                                {verifyingId === cand.id
+                                  ? 'Checking...'
+                                  : 'Verify Source URL'}
+                              </button>
+                            )}
+                            {Object.entries(cand.fieldEvidence).map(
+                              ([field, entries]) => (
+                                <div key={field} className="text-slate-500">
+                                  <strong>{field}:</strong>{' '}
+                                  {entries[0]?.excerpt}
+                                </div>
+                              )
+                            )}
+                          </div>
+                        </div>
+
+                        {verifyRes && (
+                          <div
+                            className={`p-2.5 rounded-lg border text-[11px] font-mono ${
+                              verifyRes.ok
+                                ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                                : 'bg-red-50/70 border-red-200 text-red-900'
+                            }`}
+                          >
+                            HTTP {verifyRes.httpStatus} · Status:{' '}
+                            {verifyRes.status} · Canonical:{' '}
+                            {verifyRes.verifiedCanonicalUrl ||
+                              verifyRes.finalUrl ||
+                              'N/A'}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+
+        {/* Section 2: Moderation Reports */}
+        {activeSection === 'REPORTS' && (
+          <div className="space-y-2.5">
             {reports.map((rep) => (
-              <div key={rep.id} className="py-3 space-y-2 text-xs">
-                <div className="flex items-center justify-between">
-                  <span className="font-bold text-slate-900 dark:text-slate-100">
-                    Target: {rep.targetLabel} ({rep.targetType})
-                  </span>
-                  <span className="font-mono uppercase text-slate-500">{rep.status}</span>
+              <div
+                key={rep.id}
+                className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
+              >
+                <div>
+                  <div className="font-bold text-slate-900 dark:text-slate-100">
+                    {rep.targetLabel} ({rep.targetType})
+                  </div>
+                  <p className="text-slate-600 dark:text-slate-400 mt-0.5">
+                    {rep.reason}
+                  </p>
                 </div>
-                <p className="text-slate-600 dark:text-slate-300">Reason: {rep.reason}</p>
-                {rep.status === 'open' && (
-                  <div className="flex items-center gap-2 pt-1">
+
+                {rep.status === 'open' ? (
+                  <div className="flex gap-2 shrink-0">
                     <button
-                      onClick={() => onResolveReport(rep.id, 'resolved_actioned')}
-                      className="px-2.5 py-1 bg-red-600 text-white font-semibold rounded-md cursor-pointer"
+                      type="button"
+                      onClick={() =>
+                        onResolveReport(rep.id, 'resolved_actioned')
+                      }
+                      className="px-3 py-1.5 rounded-lg bg-red-600 text-white font-semibold cursor-pointer"
                     >
-                      Action & Restrict
+                      Action Report
                     </button>
                     <button
-                      onClick={() => onResolveReport(rep.id, 'resolved_dismissed')}
-                      className="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded-md cursor-pointer"
+                      type="button"
+                      onClick={() =>
+                        onResolveReport(rep.id, 'resolved_dismissed')
+                      }
+                      className="px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 cursor-pointer"
                     >
                       Dismiss
                     </button>
                   </div>
+                ) : (
+                  <span className="text-slate-400 font-semibold capitalize">
+                    {rep.status.replace('_', ' ')}
+                  </span>
                 )}
               </div>
             ))}
           </div>
-        </div>
+        )}
 
-        <div className="p-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-4">
-          <h3 className="text-base font-bold text-slate-900 dark:text-slate-100 inline-flex items-center gap-2">
-            <ShieldCheck className="w-4 h-4 text-emerald-600" />
-            Operator & Transaction Audit Log
-          </h3>
-          <div className="divide-y divide-slate-200 dark:divide-slate-800 max-h-64 overflow-y-auto">
+        {/* Section 3: Audit Log */}
+        {activeSection === 'AUDIT' && (
+          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 divide-y divide-slate-100 dark:divide-slate-800 text-xs">
             {auditLogs.map((log) => (
-              <div key={log.id} className="py-2.5 text-xs space-y-0.5">
-                <div className="flex items-center justify-between font-mono text-[11px] text-slate-500">
-                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+              <div
+                key={log.id}
+                className="p-3.5 flex items-center justify-between gap-3"
+              >
+                <div>
+                  <span className="font-mono font-semibold text-slate-800 dark:text-slate-200">
                     {log.action}
-                  </span>
-                  <span>{log.createdAt.slice(0, 19).replace('T', ' ')}</span>
+                  </span>{' '}
+                  — <span className="text-slate-600">{log.summary}</span>
                 </div>
-                <p className="text-slate-600 dark:text-slate-300">{log.summary}</p>
+                <span className="text-[11px] font-mono text-slate-400 shrink-0">
+                  {log.createdAt.slice(0, 10)}
+                </span>
               </div>
             ))}
           </div>
-        </div>
+        )}
       </div>
-    </div>
-  );
-};
+    );
+  }
+);

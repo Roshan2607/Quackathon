@@ -5,7 +5,7 @@
  * `src/components/IntegrationTestingView.tsx`, and `src/components/HackathonsView.tsx`.
  */
 
-import { CampusType, EventType } from './domain';
+import { CampusType, EventType, Profile, User } from './domain';
 
 export type ExternalServiceName =
   | 'gemini_api'
@@ -247,8 +247,11 @@ export interface PesuOAuthSessionStatusResponse {
   ok: boolean;
   authenticated: boolean;
   sessionId?: string;
+  sessionToken?: string | null;
   stages: PesuOAuthStageStatuses;
   identity?: PesuVerifiedIdentity | null;
+  user?: User | null;
+  profile?: Profile | null;
   lastError?: string | null;
   lastDiagnostics?: DeveloperDiagnosticTelemetry | null;
 }
@@ -261,8 +264,11 @@ export interface PesuOAuthCallbackPostMessage {
   type: 'PESU_OAUTH_RESULT';
   ok: boolean;
   state: string;
+  sessionToken?: string | null;
   stages: PesuOAuthStageStatuses;
   identity?: PesuVerifiedIdentity | null;
+  user?: User | null;
+  profile?: Profile | null;
   userMessage: string;
   errorCategory?: IntegrationErrorCategory;
   diagnostics: DeveloperDiagnosticTelemetry;

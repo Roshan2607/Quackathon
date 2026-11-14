@@ -7,8 +7,13 @@ import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   CampusType,
+  CommitmentLevel,
+  EventCandidate,
   EventType,
-} from './src/types/domain';
+  ParticipationIntent,
+  Profile,
+  User,
+} from './src/types/domain.ts';
 import {
   DeveloperDiagnosticTelemetry,
   ExtractEventFileResponse,
@@ -24,7 +29,32 @@ import {
   PesuVerifiedIdentity,
   UrlVerificationStatus,
   VerifyUrlResponse,
-} from './src/types/apiContracts';
+} from './src/types/apiContracts.ts';
+import {
+  approveEventCandidateRecord,
+  createEventCandidateRecord,
+  createMessageRecord,
+  createOAuthSessionRecord,
+  createPublishedHackathonDirect,
+  createTeamWithLeaderRecord,
+  getUserAndProfileByUid,
+  getValidOAuthSessionRecord,
+  loadBootstrapData,
+  recordSwipeAndProcessMatchRecord,
+  rejectEventCandidateRecord,
+  resetPassedSwipesForHackathon,
+  resolveJoinRequestRecord,
+  revokeOAuthSessionRecord,
+  updateUserProfileAndPrivacy,
+  upsertParticipationRecord,
+  upsertUserAndProfile,
+} from './src/db/repository.ts';
+import {
+  AuthenticatedRequest,
+  requireAdmin,
+  requireAuth,
+  resolveOptionalUser,
+} from './src/middleware/auth.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -61,10 +91,12 @@ let testOverrides: ServerTestOverrides = {};
 
 export function setServerTestOverrides(overrides: ServerTestOverrides) {
   testOverrides = { ...testOverrides, ...overrides };
+  oidcDiscoveryCache = null;
 }
 
 export function resetServerTestOverrides() {
   testOverrides = {};
+  oidcDiscoveryCache = null;
 }
 
 function getFetch(): typeof fetch {
@@ -90,9 +122,9 @@ export function getConfiguredPrimaryModel(): string {
 }
 
 export function getConfiguredMaxRetries(): number {
-  const raw = Number(process.env.GEMINI_MAX_RETRIES ?? 2);
-  if (Number.isNaN(raw)) return 2;
-  return Math.min(3, Math.max(0, Math.floor(raw)));
+  const raw = Number(process.env.GEMINI_MAX_RETRIES ?? 1);
+  if (Number.isNaN(raw)) return 1;
+  return Math.min(2, Math.max(0, Math.floor(raw)));
 }
 
 function hasValidGeminiApiKey(): boolean {
@@ -329,18 +361,35 @@ export async function callGeminiWithRetryAndFallback(params: {
   let modelUsed = primaryModel;
 
   const invokeModel = async (targetModel: string) => {
-    if (customGenerate) {
-      return customGenerate({
-        model: targetModel,
-        contents: params.contents,
-        config: params.config,
-      });
-    }
-    return ai!.models.generateContent({
-      model: targetModel,
-      contents: params.contents as never,
-      config: params.config as never,
+    const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS || 10000);
+    const generationPromise = customGenerate
+      ? customGenerate({
+          model: targetModel,
+          contents: params.contents,
+          config: params.config,
+        })
+      : ai!.models.generateContent({
+          model: targetModel,
+          contents: params.contents as never,
+          config: params.config as never,
+        });
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const timeoutErr = new Error(
+          `504 DEADLINE_EXCEEDED: Gemini call timed out after ${timeoutMs}ms`
+        ) as Error & { status?: number };
+        timeoutErr.status = 504;
+        reject(timeoutErr);
+      }, timeoutMs);
     });
+
+    try {
+      return await Promise.race([generationPromise, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   };
 
   // Phase 1: Try primary model up to (1 + maxRetries) times for transient errors
@@ -593,8 +642,8 @@ export function parseDeterministicEventText(
     }
   }
 
-  // EventType
-  let eventType: EventType = 'hackathon';
+  // EventType — never fabricate 'hackathon' when unknown
+  let eventType: EventType = 'unknown';
   if (/\bworkshop\b/i.test(normalized) && !/\bhackathon\b/i.test(normalized)) {
     eventType = 'workshop';
   } else if (/\b(?:tech\s*talk|seminar|webinar|guest\s*lecture)\b/i.test(normalized)) {
@@ -605,6 +654,8 @@ export function parseDeterministicEventText(
     eventType = 'ideathon';
   } else if (/\bctf\b|capture\s*the\s*flag/i.test(normalized)) {
     eventType = 'ctf';
+  } else if (/\b(?:hackathon|hack-a-thon|24-hour|36-hour|48-hour|team\s*sprint|team\s*competition)\b/i.test(normalized)) {
+    eventType = 'hackathon';
   }
 
   const eligibilityMatch =
@@ -620,11 +671,11 @@ export function parseDeterministicEventText(
     title,
     organizer,
     eventType,
-    themes: themes.length > 0 ? themes : ['Applied AI/ML', 'Developer Tools'],
+    themes,
     description: normalized.slice(0, 280) || null,
     venueName,
     campus,
-    format: campus === 'Online / Multi-Campus' ? 'online' : 'onsite',
+    format: campus === 'Online / Multi-Campus' ? 'online' : campus ? 'onsite' : 'unknown',
     startAt,
     endAt,
     registrationDeadline,
@@ -810,6 +861,19 @@ async function safeFetchFollowRedirects(
     error: `Exceeded maximum redirect hops (${maxHops}).`,
   };
 }
+
+// ============================================================================
+// 0. Health Check Endpoint (Always returns JSON, never HTML)
+// ============================================================================
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    status: 'healthy',
+    service: 'quackathon-api',
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+  });
+});
 
 // ============================================================================
 // 1. Integration Configuration Status Endpoint (Never exposes secret values)
@@ -1349,6 +1413,9 @@ function parseHtmlEventMetadataDeterministically(html: string, finalUrl: string)
     registrationDeadline: detTextFields.registrationDeadline,
     campus: detTextFields.campus,
     venueName: detTextFields.venueName,
+    eventType: detTextFields.eventType,
+    themes: detTextFields.themes,
+    format: detTextFields.format,
     canonicalUrl: resolvedCanonical,
     verifiedCanonicalUrl: resolvedCanonical,
     minTeamSize: detTextFields.minTeamSize,
@@ -1466,7 +1533,7 @@ app.post('/api/events/verify-url', async (req, res) => {
 
 app.post('/api/events/extract-url', async (req, res) => {
   const startTime = Date.now();
-  const { url, useGeminiFallback = true } = req.body as {
+  const { url, useGeminiFallback = false } = req.body as {
     url?: string;
     useGeminiFallback?: boolean;
   };
@@ -1541,10 +1608,10 @@ app.post('/api/events/extract-url', async (req, res) => {
   let extractionMethod: ExtractionMethodUsed = 'deterministic_html';
   let geminiDiag: DeveloperDiagnosticTelemetry | null = null;
 
-  // Prioritize deterministic JSON-LD / OpenGraph / regex parsing first.
-  // Only invoke Gemini if key constraints (both teamSize and startAt) are missing AND prose is substantial.
+  // Deterministic JSON-LD / OpenGraph / regex parsing runs first.
+  // Only invoke Gemini if explicitly requested by caller AND key constraints are missing.
   const needsGeminiPass =
-    useGeminiFallback &&
+    Boolean(useGeminiFallback) &&
     det.visibleTextExcerpt.length > 100 &&
     det.minTeamSize === null &&
     det.startAt === null;
@@ -1606,15 +1673,15 @@ ${det.visibleTextExcerpt}`,
   const mergedData: ExtractedEventFields = {
     title: aiSupplement?.title ?? det.title ?? null,
     organizer: aiSupplement?.organizer ?? det.organizer ?? null,
-    eventType: (aiSupplement?.eventType as EventType) ?? 'hackathon',
+    eventType: (aiSupplement?.eventType as EventType) ?? det.eventType ?? 'unknown',
     themes:
       aiSupplement?.themes && aiSupplement.themes.length > 0
         ? aiSupplement.themes
-        : ['Applied AI/ML', 'Developer Tools'],
+        : det.themes ?? [],
     description: det.description ?? null,
     venueName: aiSupplement?.venueName ?? det.venueName ?? null,
     campus: (aiSupplement?.campus as CampusType) ?? det.campus ?? null,
-    format: aiSupplement?.format ?? 'unknown',
+    format: aiSupplement?.format ?? det.format ?? 'unknown',
     startAt: aiSupplement?.startAt ?? det.startAt ?? null,
     endAt: aiSupplement?.endAt ?? det.endAt ?? null,
     registrationDeadline:
@@ -1978,6 +2045,9 @@ interface StoredAuthSession {
   sessionId: string;
   stages: PesuOAuthStageStatuses;
   identity: PesuVerifiedIdentity | null;
+  dbSessionToken?: string | null;
+  dbUser?: User | null;
+  dbProfile?: Profile | null;
   /** Server-side only token reference (never sent to client) */
   serverTokenMetadata?: {
     tokenType: string;
@@ -2241,6 +2311,13 @@ function createSafeDiagnosticSnippet(rawText: string, maxLen = 220): string {
   return collapsed.length > maxLen ? `${collapsed.slice(0, maxLen)}...` : collapsed;
 }
 
+let oidcDiscoveryCache: {
+  key: string;
+  expiresAt: number;
+  value: Awaited<ReturnType<typeof discoverPesuOidcEndpoints>>;
+} | null = null;
+const OIDC_DISCOVERY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
   providerReachable: boolean;
   oidcDiscoveryAvailable: boolean;
@@ -2266,6 +2343,22 @@ async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
 }> {
   const { issuerBaseUrl, configWarning } = resolveAndValidatePesuIssuerUrl(req);
   const requestedUrl = `${issuerBaseUrl}/.well-known/openid-configuration`;
+  const forceRefresh = req?.query?.refresh === 'true';
+
+  if (
+    !forceRefresh &&
+    !testOverrides.fetchImpl &&
+    !testOverrides.fetchFn &&
+    oidcDiscoveryCache &&
+    oidcDiscoveryCache.key === requestedUrl &&
+    oidcDiscoveryCache.expiresAt > Date.now()
+  ) {
+    return {
+      ...oidcDiscoveryCache.value,
+      configWarning,
+    };
+  }
+
   const redirectChain: string[] = [requestedUrl];
   const fetchFn = getFetch();
   const appOrigin = req ? resolveTrustedAppOrigin(req) : '';
@@ -2532,7 +2625,7 @@ async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
           ? cfg.scopes_supported.filter((x): x is string => typeof x === 'string')
           : DEFAULT_SUPPORTED_SCOPES;
 
-      return {
+      const successResult = {
         providerReachable: true,
         oidcDiscoveryAvailable: true,
         requestedUrl,
@@ -2552,11 +2645,21 @@ async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
         supportedScopes,
         configWarning,
         diagnosticSnippet,
-        errorCategory: 'NONE',
+        errorCategory: 'NONE' as IntegrationErrorCategory,
         note: `Validated OIDC metadata from ${discoveredIssuer} (scopes: ${supportedScopes.join(
           ', '
         )}).`,
       };
+
+      if (!testOverrides.fetchImpl && !testOverrides.fetchFn) {
+        oidcDiscoveryCache = {
+          key: requestedUrl,
+          expiresAt: Date.now() + OIDC_DISCOVERY_CACHE_TTL_MS,
+          value: successResult,
+        };
+      }
+
+      return successResult;
     }
 
     return {
@@ -2678,28 +2781,61 @@ app.get('/api/pesu-oauth/discovery', async (req, res) => {
   res.status(statusToReturn).json(response);
 });
 
-app.get('/api/pesu-oauth/session', (req, res) => {
+app.get('/api/pesu-oauth/session', async (req, res) => {
   const session = getOrCreateSession(req, res);
+  let dbUser = session.dbUser ?? null;
+  let dbProfile = session.dbProfile ?? null;
+
+  if (!dbUser) {
+    const resolved = await resolveOptionalUser(req as AuthenticatedRequest);
+    if (resolved) {
+      const record = await getUserAndProfileByUid(resolved.uid).catch(() => null);
+      if (record) {
+        dbUser = record.user;
+        dbProfile = record.profile;
+      }
+    }
+  }
+
   const resp: PesuOAuthSessionStatusResponse = {
     ok: true,
-    authenticated: session.stages.verifiedIdentity === 'verified' && Boolean(session.identity),
+    authenticated:
+      (session.stages.verifiedIdentity === 'verified' && Boolean(session.identity)) ||
+      Boolean(dbUser),
     sessionId: session.sessionId,
+    sessionToken: session.dbSessionToken ?? null,
     stages: session.stages,
     identity: session.identity,
+    user: dbUser,
+    profile: dbProfile,
     lastError: session.lastError,
     lastDiagnostics: session.lastDiagnostics,
   };
   res.json(resp);
 });
 
-app.post('/api/pesu-oauth/logout', (req, res) => {
+app.post('/api/pesu-oauth/logout', async (req, res) => {
   const session = getOrCreateSession(req, res);
+  if (session.dbSessionToken) {
+    await revokeOAuthSessionRecord(session.dbSessionToken).catch(() => {});
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  if (cookies['quackathon_oauth_token']) {
+    await revokeOAuthSessionRecord(cookies['quackathon_oauth_token']).catch(() => {});
+  }
   session.identity = null;
+  session.dbSessionToken = null;
+  session.dbUser = null;
+  session.dbProfile = null;
   session.serverTokenMetadata = undefined;
   session.lastError = null;
   session.stages.authorizationRedirect = 'idle';
   session.stages.tokenExchange = 'idle';
   session.stages.verifiedIdentity = 'unverified';
+  res.setHeader(
+    'Set-Cookie',
+    'quackathon_oauth_token=; Path=/; HttpOnly; Max-Age=0'
+  );
   res.json({
     ok: true,
     authenticated: false,
@@ -3235,9 +3371,10 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     // Store token reference strictly server-side (never send raw accessToken to frontend)
     const expiresInSec =
       typeof tokenData.expires_in === 'number' ? tokenData.expires_in : 3600;
+    const expiresAtDate = new Date(Date.now() + expiresInSec * 1000);
     targetSession.serverTokenMetadata = {
       tokenType: String(tokenData.token_type ?? 'Bearer'),
-      expiresAt: Date.now() + expiresInSec * 1000,
+      expiresAt: expiresAtDate.getTime(),
       accessTokenSha256: crypto
         .createHash('sha256')
         .update(accessToken || idToken || sub)
@@ -3248,8 +3385,67 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     targetSession.stages.verifiedIdentity = 'verified';
     targetSession.lastError = null;
 
+    // Persist the verified PESU user & OAuth session into PostgreSQL
+    const dbUid = `pesu_${sub.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const dbSessionToken = `pesu_${crypto.randomBytes(24).toString('base64url')}`;
+    const resolvedCampus: CampusType =
+      verifiedIdentity.campus && /ec/i.test(verifiedIdentity.campus)
+        ? 'EC Campus'
+        : 'RR Campus';
+
+    let syncedUser: User | null = null;
+    let syncedProfile: Profile | null = null;
+    try {
+      const synced = await upsertUserAndProfile({
+        uid: dbUid,
+        email: verifiedIdentity.email || `${dbUid}@pesu.pes.edu`,
+        displayName:
+          verifiedIdentity.name || verifiedIdentity.srn || `PES Student (${sub})`,
+        campus: resolvedCampus,
+        program: verifiedIdentity.program || 'B.Tech CSE',
+        pesuOidcSub: sub,
+        verificationStatus: 'verified_pesu_oidc',
+      });
+      syncedUser = synced.user;
+      syncedProfile = synced.profile;
+
+      await createOAuthSessionRecord({
+        sessionToken: dbSessionToken,
+        uid: dbUid,
+        pesuSub: sub,
+        accessToken: accessToken || null,
+        refreshToken:
+          typeof tokenData.refresh_token === 'string'
+            ? tokenData.refresh_token
+            : null,
+        scopes: verifiedIdentity.grantedScopes,
+        expiresAt: expiresAtDate,
+      });
+
+      const isSecure =
+        req.secure ||
+        req.headers['x-forwarded-proto'] === 'https' ||
+        Boolean(process.env.APP_URL?.startsWith('https://'));
+      const cookieFlags = isSecure
+        ? 'Path=/; HttpOnly; SameSite=None; Secure; Max-Age=3600'
+        : 'Path=/; HttpOnly; SameSite=Lax; Max-Age=3600';
+      res.append(
+        'Set-Cookie',
+        `quackathon_oauth_token=${encodeURIComponent(dbSessionToken)}; ${cookieFlags}`
+      );
+    } catch (dbErr) {
+      console.error('Failed to persist PESU OAuth user/session in PostgreSQL:', dbErr);
+    }
+
+    targetSession.dbSessionToken = dbSessionToken;
+    targetSession.dbUser = syncedUser;
+    targetSession.dbProfile = syncedProfile;
+
     // Also mirror onto current cookie session if callback arrived in a popup without prior cookie
     session.identity = verifiedIdentity;
+    session.dbSessionToken = dbSessionToken;
+    session.dbUser = syncedUser;
+    session.dbProfile = syncedProfile;
     session.serverTokenMetadata = targetSession.serverTokenMetadata;
     session.stages = { ...targetSession.stages };
 
@@ -3267,8 +3463,11 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       type: 'PESU_OAUTH_RESULT',
       ok: true,
       state,
+      sessionToken: dbSessionToken,
       stages: targetSession.stages,
       identity: verifiedIdentity,
+      user: syncedUser,
+      profile: syncedProfile,
       userMessage: `Authenticated and verified identity (${
         verifiedIdentity.name || verifiedIdentity.sub
       }) via PKCE S256 token exchange.`,
@@ -3310,6 +3509,793 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
 
 app.get(['/auth/pesu/callback', '/auth/pesu/callback/'], pesuCallbackHandler);
 
+// ============================================================================
+// 7. Real-Data MVP Persistent PostgreSQL REST Endpoints
+// ============================================================================
+
+/**
+ * Restores active user session from either PESU OAuth2 session token or Firebase ID token.
+ */
+app.get('/api/auth/session', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    if (!authUser) {
+      res.json({
+        ok: true,
+        authenticated: false,
+        user: null,
+        profile: null,
+      });
+      return;
+    }
+
+    const record = await getUserAndProfileByUid(authUser.uid);
+    if (!record) {
+      res.json({
+        ok: true,
+        authenticated: false,
+        user: null,
+        profile: null,
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      authenticated: true,
+      authSource: authUser.authSource,
+      sessionToken: authUser.pesuSessionToken ?? null,
+      user: record.user,
+      profile: record.profile,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/auth/session:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to check authentication session.',
+    });
+  }
+});
+
+/**
+ * Synchronizes a Firebase Auth user with PostgreSQL users + profiles tables.
+ */
+app.post('/api/auth/firebase-sync', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const { campus, program, graduationYear } = req.body as {
+      campus?: CampusType;
+      program?: string;
+      graduationYear?: number;
+    };
+
+    const synced = await upsertUserAndProfile({
+      uid: authUser.uid,
+      email: authUser.email || `${authUser.uid}@pesu.pes.edu`,
+      displayName: authUser.name || 'PES Student',
+      campus: campus || 'RR Campus',
+      program: program || 'B.Tech CSE',
+      graduationYear: graduationYear || 2027,
+      pesuOidcSub: `firebase_${authUser.uid}`,
+      verificationStatus: 'verified_pesu_oidc',
+      isAdmin: authUser.isAdmin,
+    });
+
+    res.json({
+      ok: true,
+      user: synced.user,
+      profile: synced.profile,
+    });
+  } catch (error) {
+    console.error('Error in POST /api/auth/firebase-sync:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to synchronize user account.',
+    });
+  }
+});
+
+/**
+ * Logs out the active user and revokes any server-side OAuth session token.
+ */
+app.post('/api/auth/logout', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    if (authUser?.pesuSessionToken) {
+      await revokeOAuthSessionRecord(authUser.pesuSessionToken).catch(() => {});
+    }
+    const cookies = parseCookies(req.headers.cookie);
+    if (cookies['quackathon_oauth_token']) {
+      await revokeOAuthSessionRecord(cookies['quackathon_oauth_token']).catch(() => {});
+    }
+    res.setHeader(
+      'Set-Cookie',
+      'quackathon_oauth_token=; Path=/; HttpOnly; Max-Age=0'
+    );
+    res.json({ ok: true, authenticated: false });
+  } catch (error) {
+    console.error('Error in POST /api/auth/logout:', error);
+    res.status(500).json({ ok: false, error: 'Failed to log out.' });
+  }
+});
+
+/**
+ * Consent-based PESU Academy announcement retrieval using server-stored OAuth token.
+ * Never exposes Academy tokens to the frontend, and never generates fake announcements.
+ */
+app.get('/api/pesu/announcements', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const record = await getUserAndProfileByUid(authUser.uid);
+    if (!record?.user.privacyPreferences.academyAnnouncementsOptIn) {
+      res.status(403).json({
+        ok: false,
+        available: false,
+        announcements: [],
+        userMessage:
+          'PESU Academy announcement retrieval requires explicit opt-in in your Profile privacy settings.',
+      });
+      return;
+    }
+
+    if (!authUser.pesuSessionToken) {
+      res.status(200).json({
+        ok: false,
+        available: false,
+        announcements: [],
+        userMessage:
+          'No active PESU OAuth2 session token found. Sign in via PESU OAuth2 with the announcements:read scope to retrieve campus announcements.',
+      });
+      return;
+    }
+
+    const oauthSess = await getValidOAuthSessionRecord(authUser.pesuSessionToken);
+    if (!oauthSess || !oauthSess.accessToken) {
+      res.status(200).json({
+        ok: false,
+        available: false,
+        announcements: [],
+        userMessage:
+          'Your PESU OAuth2 token has expired or been revoked. Please sign in again.',
+      });
+      return;
+    }
+
+    if (!oauthSess.scopes.includes('announcements:read')) {
+      res.status(200).json({
+        ok: false,
+        available: false,
+        announcements: [],
+        userMessage:
+          'Your current PESU OAuth2 session was not granted the announcements:read scope.',
+      });
+      return;
+    }
+
+    const { issuerBaseUrl } = resolveAndValidatePesuIssuerUrl(req);
+    const announcementsUrl = `${issuerBaseUrl}/api/v1/announcements`;
+    const fetchFn = getFetch();
+    const upstreamResp = await fetchFn(announcementsUrl, {
+      headers: {
+        Authorization: `Bearer ${oauthSess.accessToken}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (!upstreamResp.ok) {
+      res.status(200).json({
+        ok: false,
+        available: false,
+        httpStatus: upstreamResp.status,
+        announcements: [],
+        userMessage: `PESU Academy announcements endpoint (${announcementsUrl}) returned HTTP ${upstreamResp.status}.`,
+      });
+      return;
+    }
+
+    const rawBody = await upstreamResp.json().catch(() => null);
+    const list = Array.isArray(rawBody)
+      ? rawBody
+      : Array.isArray((rawBody as Record<string, unknown> | null)?.announcements)
+      ? ((rawBody as Record<string, unknown>).announcements as unknown[])
+      : [];
+
+    res.json({
+      ok: true,
+      available: true,
+      announcements: list,
+      userMessage: `Retrieved ${list.length} announcement(s) from PESU-Dev resource server.`,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/pesu/announcements:', error);
+    res.status(200).json({
+      ok: false,
+      available: false,
+      announcements: [],
+      userMessage:
+        'PESU Academy announcement retrieval is currently unreachable.',
+    });
+  }
+});
+
+/**
+ * Loads all real application state from PostgreSQL (zero synthetic seed data).
+ */
+app.get('/api/bootstrap', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    res.json({
+      ok: true,
+      authenticatedUser: authUser
+        ? data.users.find((u) => u.uid === authUser.uid) ?? null
+        : null,
+      ...data,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/bootstrap:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to load application data from PostgreSQL.',
+      userMessage: 'Could not load data from the database. Please refresh or try again.',
+    });
+  }
+});
+
+/**
+ * Server-side paginated hackathons catalog endpoint backed by PostgreSQL (zero synthetic data).
+ */
+app.get('/api/hackathons', async (req, res) => {
+  try {
+    const data = await loadBootstrapData(null);
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const filter = typeof req.query.filter === 'string' ? req.query.filter : 'all';
+    const campus = typeof req.query.campus === 'string' ? req.query.campus : 'ALL';
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+
+    const filtered = data.hackathons.filter((h) => {
+      if (filter === 'matchable' && !h.matchable) return false;
+      if (filter === 'non_matchable' && h.matchable) return false;
+      if (campus !== 'ALL' && h.venue.campus !== campus) return false;
+      if (q) {
+        const hay = `${h.name} ${h.organizer} ${h.themes.join(' ')}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    const startIndex = (page - 1) * limit;
+    const items = filtered.slice(startIndex, startIndex + limit);
+
+    res.json({
+      ok: true,
+      page,
+      limit,
+      total: filtered.length,
+      hasMore: startIndex + limit < filtered.length,
+      items,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/hackathons:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to query hackathons.',
+    });
+  }
+});
+
+/**
+ * Saves the authenticated student's builder profile and privacy preferences.
+ */
+app.put('/api/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const { profile, privacyPreferences } = req.body as {
+      profile?: Profile;
+      privacyPreferences?: User['privacyPreferences'];
+    };
+
+    if (!profile) {
+      res.status(400).json({
+        ok: false,
+        error: 'Profile payload is required.',
+      });
+      return;
+    }
+
+    const updated = await updateUserProfileAndPrivacy({
+      uid: authUser.uid,
+      profile: { ...profile, uid: authUser.uid },
+      privacyPreferences: privacyPreferences ?? {
+        profileVisible: true,
+        githubConsent: Boolean(profile.githubUsername),
+        aiEnrichmentConsent: false,
+        academyAnnouncementsOptIn: false,
+        academyTimetableOptIn: false,
+      },
+    });
+
+    res.json({
+      ok: true,
+      user: updated.user,
+      profile: updated.profile,
+    });
+  } catch (error) {
+    console.error('Error in PUT /api/profile:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to save profile.',
+    });
+  }
+});
+
+/**
+ * Upserts the authenticated student's participation in a specific hackathon.
+ */
+app.put(
+  '/api/participations/:hackathonSlug',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const hackathonSlug = String(req.params.hackathonSlug);
+      const body = req.body as {
+        intent?: ParticipationIntent;
+        desiredRoles?: string[];
+        skillsOffered?: string[];
+        availabilityWindows?: string[];
+        commitmentLevel?: CommitmentLevel;
+        workPreferences?: string[];
+        discoverable?: boolean;
+      };
+
+      const record = await getUserAndProfileByUid(authUser.uid);
+      const prof = record?.profile;
+
+      const participation = await upsertParticipationRecord({
+        hackathonSlug,
+        uid: authUser.uid,
+        intent: body.intent ?? 'looking',
+        desiredRoles: body.desiredRoles ?? prof?.preferredRoles ?? ['Generalist'],
+        skillsOffered: body.skillsOffered ?? prof?.skillTags ?? [],
+        availabilityWindows: body.availabilityWindows ?? [
+          'Sat Morning (8am–1pm)',
+          'Sat Night Sprint (6pm–2am)',
+        ],
+        commitmentLevel: body.commitmentLevel ?? 'intensive',
+        workPreferences: body.workPreferences ?? prof?.workingStyleTags ?? [],
+        discoverable: body.discoverable ?? true,
+      });
+
+      res.json({
+        ok: true,
+        participation,
+      });
+    } catch (error) {
+      console.error('Error in PUT /api/participations/:hackathonSlug:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to update event participation.',
+      });
+    }
+  }
+);
+
+/**
+ * Submits a hackathon/event candidate for review (or publishes directly if submitted by an admin).
+ */
+app.post(
+  '/api/hackathons/candidates',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const { candidate, publishImmediately } = req.body as {
+        candidate?: EventCandidate;
+        publishImmediately?: boolean;
+      };
+
+      if (!candidate || !candidate.title?.trim() || !candidate.organizer?.trim()) {
+        res.status(400).json({
+          ok: false,
+          error: 'Event title and organizer are required.',
+        });
+        return;
+      }
+
+      const savedCandidate = await createEventCandidateRecord({
+        ...candidate,
+        submittedByUid: authUser.uid,
+      });
+
+      if (publishImmediately && authUser.isAdmin) {
+        const approved = await approveEventCandidateRecord({
+          candidateUid: savedCandidate.id,
+          actorUid: authUser.uid,
+        });
+        res.status(201).json({
+          ok: true,
+          candidate: approved.candidate,
+          hackathon: approved.hackathon,
+        });
+        return;
+      }
+
+      res.status(201).json({
+        ok: true,
+        candidate: savedCandidate,
+      });
+    } catch (error) {
+      console.error('Error in POST /api/hackathons/candidates:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to submit event candidate.',
+      });
+    }
+  }
+);
+
+/**
+ * Admin-only: Approves an event candidate and publishes it to the hackathons catalog.
+ */
+app.post(
+  '/api/admin/candidates/:candidateUid/approve',
+  requireAdmin,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const candidateUid = String(req.params.candidateUid);
+      const { overrides } = req.body as {
+        overrides?: {
+          minTeamSize: number | null;
+          maxTeamSize: number | null;
+          eventType: EventType;
+          matchable: boolean;
+          campus: CampusType | null;
+        };
+      };
+
+      const result = await approveEventCandidateRecord({
+        candidateUid,
+        actorUid: authUser.uid,
+        overrides,
+      });
+
+      res.json({
+        ok: true,
+        hackathon: result.hackathon,
+        candidate: result.candidate,
+      });
+    } catch (error) {
+      console.error('Error in POST /api/admin/candidates/:candidateUid/approve:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to approve event candidate.',
+      });
+    }
+  }
+);
+
+/**
+ * Admin-only: Rejects an event candidate.
+ */
+app.post(
+  '/api/admin/candidates/:candidateUid/reject',
+  requireAdmin,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const candidateUid = String(req.params.candidateUid);
+      const candidate = await rejectEventCandidateRecord(candidateUid);
+      res.json({
+        ok: true,
+        candidate,
+      });
+    } catch (error) {
+      console.error('Error in POST /api/admin/candidates/:candidateUid/reject:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to reject event candidate.',
+      });
+    }
+  }
+);
+
+/**
+ * Creates a new team in a hackathon and registers the creator as Team Lead.
+ * Enforces 1 active team per user per hackathon via unique membershipKey.
+ */
+app.post('/api/teams', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const body = req.body as {
+      hackathonId?: string;
+      name?: string;
+      pitch?: string;
+      projectIdea?: string;
+      rolesNeeded?: string[];
+      customSpecializations?: string[];
+      targetSize?: number;
+    };
+
+    if (!body.hackathonId || !body.name?.trim() || !body.pitch?.trim()) {
+      res.status(400).json({
+        ok: false,
+        error: 'Hackathon, team name, and pitch are required.',
+      });
+      return;
+    }
+
+    const record = await getUserAndProfileByUid(authUser.uid);
+    const prof = record?.profile;
+
+    const created = await createTeamWithLeaderRecord({
+      hackathonSlug: body.hackathonId,
+      leaderUid: authUser.uid,
+      name: body.name.trim(),
+      pitch: body.pitch.trim(),
+      projectIdea: body.projectIdea?.trim() || undefined,
+      rolesNeeded: body.rolesNeeded ?? ['Frontend', 'Backend'],
+      customSpecializations: body.customSpecializations ?? [],
+      desiredDomains: prof?.interestTags.slice(0, 3) ?? [],
+      workStyleTags: prof?.workingStyleTags ?? [],
+      targetSize: Number(body.targetSize) || 4,
+    });
+
+    // Ensure leader also has a participation record in this hackathon
+    await upsertParticipationRecord({
+      hackathonSlug: body.hackathonId,
+      uid: authUser.uid,
+      intent: 'recruiting',
+      desiredRoles: prof?.preferredRoles ?? ['Generalist'],
+      skillsOffered: prof?.skillTags ?? [],
+      availabilityWindows: ['Sat Morning (8am–1pm)', 'Sat Night Sprint (6pm–2am)'],
+      commitmentLevel: 'intensive',
+      workPreferences: prof?.workingStyleTags ?? [],
+      discoverable: true,
+    });
+
+    res.status(201).json({
+      ok: true,
+      ...created,
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith('ALREADY_IN_TEAM:')
+    ) {
+      res.status(409).json({
+        ok: false,
+        error: error.message.replace('ALREADY_IN_TEAM: ', ''),
+        userMessage: error.message.replace('ALREADY_IN_TEAM: ', ''),
+      });
+      return;
+    }
+    console.error('Error in POST /api/teams:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to create team.',
+    });
+  }
+});
+
+/**
+ * Records a Pass or Connect swipe on a Person or Team.
+ * - Creates a mutual `direct_match` conversation when two users both swipe 'interested'.
+ * - Creates a team `join_request` when a user swipes 'interested' on an open team.
+ */
+app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const body = req.body as {
+      hackathonId?: string;
+      targetType?: 'user' | 'team';
+      targetId?: string;
+      decision?: 'interested' | 'passed';
+      proposedRole?: string;
+      note?: string;
+    };
+
+    if (
+      !body.hackathonId ||
+      !body.targetType ||
+      !body.targetId ||
+      !body.decision
+    ) {
+      res.status(400).json({
+        ok: false,
+        error: 'hackathonId, targetType, targetId, and decision are required.',
+      });
+      return;
+    }
+
+    const result = await recordSwipeAndProcessMatchRecord({
+      hackathonSlug: body.hackathonId,
+      fromUid: authUser.uid,
+      targetType: body.targetType,
+      targetId: body.targetId,
+      decision: body.decision,
+      proposedRole: body.proposedRole,
+      note: body.note,
+    });
+
+    res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('TEAM_FULL:')) {
+      res.status(409).json({
+        ok: false,
+        error: error.message.replace('TEAM_FULL: ', ''),
+        userMessage: error.message.replace('TEAM_FULL: ', ''),
+      });
+      return;
+    }
+    console.error('Error in POST /api/swipes:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to record swipe.',
+    });
+  }
+});
+
+/**
+ * Resets 'passed' swipes for the authenticated user in a hackathon.
+ */
+app.delete(
+  '/api/swipes/passed/:hackathonSlug',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const hackathonSlug = String(req.params.hackathonSlug);
+      await resetPassedSwipesForHackathon({
+        hackathonSlug,
+        uid: authUser.uid,
+      });
+      res.json({ ok: true });
+    } catch (error) {
+      console.error('Error in DELETE /api/swipes/passed/:hackathonSlug:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to restore passed profiles.',
+      });
+    }
+  }
+);
+
+/**
+ * Resolves a pending team join request or invitation ('accept' | 'reject'),
+ * enforcing max team size and single-team-per-hackathon constraints server-side.
+ */
+app.post(
+  '/api/join-requests/:requestUid/resolve',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const requestUid = String(req.params.requestUid);
+      const { decision } = req.body as { decision?: 'accept' | 'reject' };
+
+      if (decision !== 'accept' && decision !== 'reject') {
+        res.status(400).json({
+          ok: false,
+          error: 'decision must be "accept" or "reject".',
+        });
+        return;
+      }
+
+      const result = await resolveJoinRequestRecord({
+        requestUid,
+        actorUid: authUser.uid,
+        decision,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.message.startsWith('FORBIDDEN:')) {
+          res.status(403).json({
+            ok: false,
+            error: error.message.replace('FORBIDDEN: ', ''),
+            userMessage: error.message.replace('FORBIDDEN: ', ''),
+          });
+          return;
+        }
+        if (
+          error.message.startsWith('TEAM_FULL:') ||
+          error.message.startsWith('ALREADY_IN_TEAM:') ||
+          error.message.startsWith('ALREADY_RESOLVED:')
+        ) {
+          const clean = error.message.replace(/^[A-Z_]+:\s*/, '');
+          res.status(409).json({
+            ok: false,
+            error: clean,
+            userMessage: clean,
+          });
+          return;
+        }
+        if (error.message.startsWith('NOT_FOUND:')) {
+          res.status(404).json({
+            ok: false,
+            error: error.message.replace('NOT_FOUND: ', ''),
+          });
+          return;
+        }
+      }
+      console.error('Error in POST /api/join-requests/:requestUid/resolve:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to resolve join request.',
+      });
+    }
+  }
+);
+
+/**
+ * Sends a persistent message in a mutual match or team roster conversation.
+ * Verifies that the sender is an authorized participant of the conversation.
+ */
+app.post(
+  '/api/conversations/:conversationUid/messages',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const conversationUid = String(req.params.conversationUid);
+      const { body } = req.body as { body?: string };
+
+      if (!body || !body.trim()) {
+        res.status(400).json({
+          ok: false,
+          error: 'Message body cannot be empty.',
+        });
+        return;
+      }
+
+      const message = await createMessageRecord({
+        conversationUid,
+        senderUid: authUser.uid,
+        body: body.trim(),
+      });
+
+      res.status(201).json({
+        ok: true,
+        message,
+      });
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.message.startsWith('FORBIDDEN:')) {
+          res.status(403).json({
+            ok: false,
+            error: error.message.replace('FORBIDDEN: ', ''),
+            userMessage: error.message.replace('FORBIDDEN: ', ''),
+          });
+          return;
+        }
+        if (error.message.startsWith('NOT_FOUND:')) {
+          res.status(404).json({
+            ok: false,
+            error: error.message.replace('NOT_FOUND: ', ''),
+          });
+          return;
+        }
+      }
+      console.error('Error in POST /api/conversations/:conversationUid/messages:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to send message.',
+      });
+    }
+  }
+);
+
+export { createPublishedHackathonDirect };
+
 // Explicit JSON 404 guard for all /api/* routes so unrouted API requests
 // can never fall through to Vite's SPA HTML fallback.
 app.use('/api', (req, res) => {
@@ -3319,6 +4305,29 @@ app.use('/api', (req, res) => {
     userMessage: `API route not found: ${req.method} ${req.originalUrl}`,
   });
 });
+
+// Global Express error handler so malformed JSON payloads or unexpected errors on /api/*
+// always return structured JSON, never Express's default HTML error document.
+app.use(
+  (
+    err: Error & { status?: number; statusCode?: number },
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    if (req.originalUrl.startsWith('/api')) {
+      const status = err.status || err.statusCode || 500;
+      res.status(status).json({
+        ok: false,
+        errorCategory: status >= 500 ? 'UPSTREAM_5XX' : 'VALIDATION_ERROR',
+        error: err.message || 'Internal server error',
+        userMessage: err.message || 'An unexpected server error occurred.',
+      });
+      return;
+    }
+    next(err);
+  }
+);
 
 // ============================================================================
 // Mount Vite Dev Server or Production Static Bundle

@@ -1,10 +1,15 @@
 /**
- * Modular Service Adapters (Quackathon — PES Hackathon Team Finder)
+ * Modular Service Adapters (Quackathon — Real-Data MVP)
  *
- * Clearly separates:
- * - Demo Mode deterministic simulations (explicitly labeled as Demo Mode, never reported as live API calls)
- * - Live API Mode client calls to the Express backend (/api/github/fetch, /api/gemini/extract-profile,
- *   /api/events/extract-url, /api/events/extract-file, /api/events/verify-url, /api/pesu-oauth/*)
+ * Uses the shared typed API client (`src/lib/apiClient.ts`) which validates HTTP status
+ * and `Content-Type` (`application/json`) before parsing JSON, preventing HTML fallback
+ * syntax errors (`Unexpected token '<'`).
+ *
+ * Key Guarantees:
+ * - Deterministic GitHub repository extraction works immediately with 0 Gemini calls.
+ * - Optional Gemini enhancement uses a strict timeout and never blocks GitHub import.
+ * - All suggested skills and projects start as unapproved (`approved: false`), requiring explicit user confirmation.
+ * - Unknown events are never automatically classified as hackathons (`eventType: 'unknown'`, `matchable: false`).
  */
 
 import {
@@ -20,6 +25,7 @@ import {
   ExtractionMethodUsed,
   VerifyUrlResponse,
 } from '../types/apiContracts';
+import { apiFetch } from '../lib/apiClient';
 
 const ALLOWED_PUBLIC_EVENT_HOSTS = [
   'events.pes.edu',
@@ -56,7 +62,8 @@ export function validateSubmittedEventUrl(rawInput: string): UrlValidationResult
   } catch {
     return {
       allowed: false,
-      blockedReason: 'Invalid URL syntax. Only valid HTTPS public event URLs are accepted.',
+      blockedReason:
+        'Invalid URL syntax. Only valid HTTPS public event URLs are accepted.',
       requiresManualEntryFallback: true,
     };
   }
@@ -72,7 +79,8 @@ export function validateSubmittedEventUrl(rawInput: string): UrlValidationResult
   if (parsed.username || parsed.password) {
     return {
       allowed: false,
-      blockedReason: 'URLs containing embedded credentials are rejected by security policy.',
+      blockedReason:
+        'URLs containing embedded credentials are rejected by security policy.',
       requiresManualEntryFallback: true,
     };
   }
@@ -120,7 +128,7 @@ export function validateSubmittedEventUrl(rawInput: string): UrlValidationResult
       allowed: true,
       normalizedUrl: parsed.toString(),
       host: hostname,
-      blockedReason: `Host "${hostname}" is not on the Demo Mode allowlist. Switch to Live Test Mode to fetch public metadata from any safe HTTPS host, or fill event fields manually.`,
+      blockedReason: `Host "${hostname}" is not on the preset allowlist. Use Live Extraction to fetch public metadata from any safe HTTPS host, or fill event fields manually.`,
       requiresManualEntryFallback: true,
     };
   }
@@ -134,7 +142,12 @@ export function validateSubmittedEventUrl(rawInput: string): UrlValidationResult
 }
 
 /**
- * Two-Stage Hackathon-vs-Talk Classifier
+ * Deterministic Rule-Based Hackathon-vs-Talk Classifier (Requirement #5)
+ *
+ * - Never fabricates arbitrary ML confidence numbers.
+ * - Never defaults unknown events to 'hackathon'. Unknown or ambiguous events
+ *   return `eventType: 'unknown'`, `matchable: false`, `ruleGatePassed: false`,
+ *   requiring explicit moderator review before publishing.
  */
 export function classifyEventCandidateText(params: {
   title: string;
@@ -151,9 +164,12 @@ export function classifyEventCandidateText(params: {
   const combined = `${params.title} ${params.description}`.toLowerCase();
 
   const hasWorkshopOrTalkSignal =
-    /\b(workshop|webinar|guest lecture|seminar|tech talk|keynote|speaker session|hands-on session)\b/.test(
+    /\b(workshop|webinar|guest lecture|seminar|tech talk|keynote|speaker session|hands-on session|bootcamp)\b/.test(
       combined
-    ) && !/\b(24-hour hackathon|36-hour hackathon|team competition)\b/.test(combined);
+    ) &&
+    !/\b(hackathon|buildathon|ideathon|24-hour|36-hour|48-hour|team competition)\b/.test(
+      combined
+    );
 
   if (hasWorkshopOrTalkSignal) {
     const isTalk = /\b(talk|lecture|seminar|keynote|webinar)\b/.test(combined);
@@ -161,7 +177,7 @@ export function classifyEventCandidateText(params: {
       eventType: isTalk ? 'tech_talk' : 'workshop',
       matchable: false,
       ruleGatePassed: false,
-      mlScore: 0.14,
+      mlScore: 0,
       reason:
         'Rule Gate Excluded: Detected speaker/attendance workshop or tech talk without team prototype competition.',
     };
@@ -169,56 +185,80 @@ export function classifyEventCandidateText(params: {
 
   if (params.maxTeamSize === 1) {
     return {
-      eventType: combined.includes('ctf') ? 'ctf' : 'other',
+      eventType:
+        combined.includes('ctf') || combined.includes('capture the flag')
+          ? 'ctf'
+          : 'other',
       matchable: false,
       ruleGatePassed: false,
-      mlScore: 0.88,
+      mlScore: 0,
       reason:
-        'Rule Gate Excluded from Team Matching: Solo-only competition (maxTeamSize = 1). Listed in directory without People/Teams assembly.',
+        'Rule Gate Excluded from Team Matching: Solo-only competition (maxTeamSize = 1).',
     };
   }
 
-  if (combined.includes('ctf') || combined.includes('capture the flag')) {
+  if (/\b(ctf|capture the flag)\b/.test(combined)) {
     return {
       eventType: 'ctf',
       matchable: true,
       ruleGatePassed: true,
-      mlScore: 0.91,
-      reason: 'Classified as Team CTF competition with collaborative problem solving.',
+      mlScore: 1,
+      reason:
+        'Deterministic Rule Gate Passed: Explicit CTF / Capture the Flag team competition indicator.',
     };
   }
 
-  if (combined.includes('ideathon')) {
+  if (/\bideathon\b/.test(combined)) {
     return {
       eventType: 'ideathon',
       matchable: true,
       ruleGatePassed: true,
-      mlScore: 0.87,
-      reason: 'Classified as Team Ideathon competition.',
+      mlScore: 1,
+      reason:
+        'Deterministic Rule Gate Passed: Explicit Team Ideathon indicator.',
     };
   }
 
-  if (combined.includes('buildathon')) {
+  if (/\bbuildathon\b/.test(combined)) {
     return {
       eventType: 'buildathon',
       matchable: true,
       ruleGatePassed: true,
-      mlScore: 0.93,
-      reason: 'Classified as Team Buildathon with prototype submission.',
+      mlScore: 1,
+      reason:
+        'Deterministic Rule Gate Passed: Explicit Team Buildathon indicator.',
     };
   }
 
+  const hasExplicitHackathonSignal =
+    /\b(hackathon|hack-a-thon|24-hour|36-hour|48-hour|team sprint|code sprint|team competition)\b/.test(
+      combined
+    );
+
+  if (hasExplicitHackathonSignal) {
+    return {
+      eventType: 'hackathon',
+      matchable: true,
+      ruleGatePassed: true,
+      mlScore: 1,
+      reason:
+        'Deterministic Rule Gate Passed: Explicit hackathon / team sprint indicators detected.',
+    };
+  }
+
+  // Requirement #5: Do NOT automatically classify unknown events as hackathons!
   return {
-    eventType: 'hackathon',
-    matchable: true,
-    ruleGatePassed: true,
-    mlScore: 0.94,
-    reason: 'Passed team-competition rule gate (team formation + project build indicators).',
+    eventType: 'unknown',
+    matchable: false,
+    ruleGatePassed: false,
+    mlScore: 0,
+    reason:
+      'Unconfirmed Event Type: No explicit hackathon, buildathon, ideathon, or CTF keywords detected. Requires moderator confirmation before enabling team matching.',
   };
 }
 
 /**
- * DEMO MODE ONLY: Simulates deterministic public metadata preview for preset test URLs.
+ * Isolated Test/Sandbox Helper: Simulates deterministic public metadata preview for preset test URLs.
  */
 export function extractPublicEventPreview(rawUrl: string): {
   isLiveApiResult: false;
@@ -253,7 +293,8 @@ export function extractPublicEventPreview(rawUrl: string): {
   if (lowerUrl.includes('workshop') || lowerUrl.includes('talk')) {
     const cls = classifyEventCandidateText({
       title: 'Intro to Kubernetes & Cloud Native Workshop',
-      description: 'Hands-on speaker workshop for beginners. Individual attendance.',
+      description:
+        'Hands-on speaker workshop for beginners. Individual attendance.',
       minTeamSize: null,
       maxTeamSize: null,
     });
@@ -266,12 +307,13 @@ export function extractPublicEventPreview(rawUrl: string): {
         originalSubmissionUrl: rawUrl,
         verifiedCanonicalUrl: validation.normalizedUrl,
         sourceUrlStatus: 'verified',
-        title: 'Intro to Kubernetes & Cloud Native Workshop (Demo Preview)',
+        title: 'Intro to Kubernetes & Cloud Native Workshop (Sandbox Preview)',
         organizer: 'Cloud Native Club PESU',
         eventType: cls.eventType,
         matchable: cls.matchable,
         themes: ['Systems/Cloud', 'Developer Tools'],
-        description: 'Hands-on speaker workshop covering pod scheduling. No team competition.',
+        description:
+          'Hands-on speaker workshop covering pod scheduling. No team competition.',
         startAt: '2026-12-10T14:00:00+05:30',
         endAt: '2026-12-10T17:00:00+05:30',
         registrationDeadline: null,
@@ -280,7 +322,12 @@ export function extractPublicEventPreview(rawUrl: string): {
         format: 'onsite',
         teamSize: { min: null, max: null },
         fieldEvidence: {
-          title: [{ sourceUrl: validation.normalizedUrl!, excerpt: 'OG title: Intro to Kubernetes Workshop' }],
+          title: [
+            {
+              sourceUrl: validation.normalizedUrl!,
+              excerpt: 'OG title: Intro to Kubernetes Workshop',
+            },
+          ],
         },
         classification: {
           ruleGatePassed: cls.ruleGatePassed,
@@ -289,51 +336,7 @@ export function extractPublicEventPreview(rawUrl: string): {
         },
       },
       warnings: [
-        '[Demo Mode] Detected a Workshop/Talk (matchable = false). Excluded from team discovery.',
-      ],
-    };
-  }
-
-  if (lowerUrl.includes('unstop.com')) {
-    return {
-      isLiveApiResult: false,
-      validation,
-      draft: {
-        source: 'submitted_public_url',
-        sourceUrl: validation.normalizedUrl,
-        originalSubmissionUrl: rawUrl,
-        verifiedCanonicalUrl: validation.normalizedUrl,
-        sourceUrlStatus: 'verified',
-        title: 'Smart Mobility & Autonomous Transit Hackathon 2026 (Demo Preview)',
-        organizer: 'IEEE ITS & PES Mobility Cell',
-        eventType: 'hackathon',
-        matchable: true,
-        themes: ['Robotics/IoT', 'Computer Vision', 'Climate/Civic Tech'],
-        description:
-          'Demo preview: Team size was not present in structured JSON-LD and is left unconfirmed for reviewer check.',
-        startAt: '2026-12-14',
-        endAt: '2026-12-15',
-        registrationDeadline: null,
-        timezone: 'Asia/Kolkata',
-        venue: { campus: 'EC Campus', name: null },
-        format: 'hybrid',
-        teamSize: { min: null, max: null },
-        fieldEvidence: {
-          title: [
-            {
-              sourceUrl: validation.normalizedUrl!,
-              excerpt: 'JSON-LD @type=Event name: Smart Mobility & Autonomous Transit Hackathon 2026',
-            },
-          ],
-        },
-        classification: {
-          ruleGatePassed: true,
-          mlScore: 0.91,
-          reason: 'Team hackathon title and problem tracks detected; team size bounds require manual confirmation.',
-        },
-      },
-      warnings: [
-        '[Demo Mode] Missing Constraints Preserved: Team size (min/max) and registration deadline were kept as null.',
+        '[Sandbox Mode] Detected a Workshop/Talk (matchable = false). Excluded from team discovery.',
       ],
     };
   }
@@ -347,13 +350,12 @@ export function extractPublicEventPreview(rawUrl: string): {
       originalSubmissionUrl: rawUrl,
       verifiedCanonicalUrl: validation.normalizedUrl,
       sourceUrlStatus: 'verified',
-      title: 'PES Open Source & Developer Tools Sprint 2026 (Demo Preview)',
+      title: 'PES Open Source & Developer Tools Hackathon 2026 (Sandbox Preview)',
       organizer: 'PES OS Club',
       eventType: 'hackathon',
       matchable: true,
       themes: ['Developer Tools', 'Open-Source Systems', 'Applied AI/ML'],
-      description:
-        '24-hour open-source tooling and compiler plugin hackathon.',
+      description: '24-hour open-source tooling and compiler plugin hackathon.',
       startAt: '2026-12-21T09:00:00+05:30',
       endAt: '2026-12-22T12:00:00+05:30',
       registrationDeadline: '2026-12-18T23:59:00+05:30',
@@ -371,56 +373,114 @@ export function extractPublicEventPreview(rawUrl: string): {
       },
       classification: {
         ruleGatePassed: true,
-        mlScore: 0.95,
-        reason: 'Verified 24h team buildathon with explicit 2–4 team size bounds.',
+        mlScore: 1,
+        reason:
+          'Verified 24h team hackathon with explicit 2–4 team size bounds.',
       },
     },
-    warnings: ['[Demo Mode] Preview generated from synthetic preset. Switch to Live Test Mode to fetch real URLs.'],
+    warnings: [
+      '[Sandbox Mode] Preview generated from test fixture.',
+    ],
   };
 }
 
-/**
- * LIVE API MODE: Calls server-side /api/events/verify-url using the shared VerifyUrlResponse contract.
- */
-export async function verifyLiveEventUrl(rawUrl: string): Promise<VerifyUrlResponse> {
-  const start = Date.now();
-  try {
-    const resp = await fetch('/api/events/verify-url', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: rawUrl }),
-    });
-    const data = (await resp.json()) as VerifyUrlResponse;
-    return data;
-  } catch (err: unknown) {
-    return {
-      ok: false,
-      live: true,
-      status: 'broken',
-      httpStatus: 0,
-      submittedUrl: rawUrl,
-      finalUrl: null,
-      canonicalUrl: null,
-      verifiedCanonicalUrl: null,
-      redirectChain: [],
-      userMessage: 'Network error while verifying event URL.',
-      error: err instanceof Error ? err.message : String(err),
-      errorCategory: 'NETWORK_ERROR',
-      diagnostics: {
-        serviceName: 'event_url_extractor',
-        httpStatus: 0,
-        errorCategory: 'NETWORK_ERROR',
-        retryAttempts: 0,
-        durationMs: Date.now() - start,
-      },
-    };
+// In-flight deduplication and short-lived TTL cache to eliminate duplicate network requests
+const inFlightRequests = new Map<string, Promise<unknown>>();
+const responseCache = new Map<string, { expiresAt: number; value: unknown }>();
+const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+
+function withDedupeAndCache<T>(
+  key: string,
+  fetcher: () => Promise<T>,
+  shouldCache: (res: T) => boolean,
+  forceRefresh = false
+): Promise<T> {
+  if (!forceRefresh) {
+    const cached = responseCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      return Promise.resolve(cached.value as T);
+    }
   }
+  const existing = inFlightRequests.get(key);
+  if (existing) {
+    return existing as Promise<T>;
+  }
+  const promise = fetcher()
+    .then((res) => {
+      if (shouldCache(res)) {
+        responseCache.set(key, {
+          expiresAt: Date.now() + CACHE_TTL_MS,
+          value: res,
+        });
+      }
+      return res;
+    })
+    .finally(() => {
+      inFlightRequests.delete(key);
+    });
+  inFlightRequests.set(key, promise);
+  return promise;
+}
+
+/**
+ * LIVE API MODE: Calls server-side /api/events/verify-url using the shared typed API client.
+ */
+export async function verifyLiveEventUrl(
+  rawUrl: string,
+  forceRefresh = false
+): Promise<VerifyUrlResponse> {
+  const key = `verify_url:${rawUrl.trim()}`;
+  return withDedupeAndCache(
+    key,
+    async () => {
+      const start = Date.now();
+      const res = await apiFetch<VerifyUrlResponse>('/api/events/verify-url', {
+        method: 'POST',
+        body: JSON.stringify({ url: rawUrl }),
+        timeoutMs: 12000,
+      });
+
+      if (res.data && typeof res.data.status === 'string') {
+        return res.data;
+      }
+
+      return {
+        ok: false,
+        live: true,
+        status: 'broken',
+        httpStatus: res.status,
+        submittedUrl: rawUrl,
+        finalUrl: null,
+        canonicalUrl: null,
+        verifiedCanonicalUrl: null,
+        redirectChain: [],
+        userMessage:
+          res.errorMessage || 'Network error while verifying event URL.',
+        error: res.errorMessage,
+        errorCategory: 'NETWORK_ERROR',
+        diagnostics: {
+          serviceName: 'event_url_extractor',
+          httpStatus: res.status,
+          errorCategory: 'NETWORK_ERROR',
+          retryAttempts: 0,
+          durationMs: Date.now() - start,
+        },
+      };
+    },
+    (res) => res.ok,
+    forceRefresh
+  );
 }
 
 /**
  * LIVE API MODE: Calls server-side /api/events/extract-url to fetch and parse the real webpage.
+ * Uses deterministic HTML/JSON-LD extraction first; only uses Gemini when requested.
  */
-export async function extractLiveEventUrlMetadata(rawUrl: string): Promise<{
+export async function extractLiveEventUrlMetadata(
+  rawUrl: string,
+  forceRefresh = false,
+  useGeminiFallback = false
+): Promise<{
   ok: boolean;
   isLiveApiResult: true;
   draft?: Partial<EventCandidate>;
@@ -430,119 +490,142 @@ export async function extractLiveEventUrlMetadata(rawUrl: string): Promise<{
   extractionMethod?: ExtractionMethodUsed;
   diagnostics?: DeveloperDiagnosticTelemetry;
 }> {
-  try {
-    const resp = await fetch('/api/events/extract-url', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: rawUrl, useGeminiFallback: true }),
-    });
-    const payload = (await resp.json()) as ExtractEventUrlResponse;
+  const key = `extract_url:${rawUrl.trim()}:${useGeminiFallback ? 'ai' : 'det'}`;
+  return withDedupeAndCache(
+    key,
+    async () => {
+      const apiRes = await apiFetch<ExtractEventUrlResponse>(
+        '/api/events/extract-url',
+        {
+          method: 'POST',
+          body: JSON.stringify({ url: rawUrl, useGeminiFallback }),
+          timeoutMs: 15000,
+        }
+      );
 
-    if (!resp.ok || !payload.ok) {
+      const payload = apiRes.data;
+      if (!apiRes.ok || !payload || !payload.ok) {
+        return {
+          ok: false,
+          isLiveApiResult: true,
+          warnings: payload?.warnings ?? [],
+          errorMessage:
+            payload?.userMessage ??
+            apiRes.errorMessage ??
+            `Could not retrieve event page (HTTP ${apiRes.status}).`,
+          redirectChain: payload?.redirectChain,
+          extractionMethod: payload?.extractionMethod,
+          diagnostics: payload?.diagnostics,
+        };
+      }
+
+      const d = payload.data;
+      const det = payload.deterministic ?? {};
+      const ai = payload.aiSupplement ?? {};
+
+      const title = d?.title ?? ai.title ?? det.title ?? '';
+      const description = d?.description ?? det.description ?? '';
+      const minTeam = d?.minTeamSize ?? ai.minTeamSize ?? det.minTeamSize ?? null;
+      const maxTeam = d?.maxTeamSize ?? ai.maxTeamSize ?? det.maxTeamSize ?? null;
+
+      const cls = classifyEventCandidateText({
+        title,
+        description,
+        minTeamSize: minTeam,
+        maxTeamSize: maxTeam,
+      });
+
+      const warnings: string[] = [...(payload.warnings ?? [])];
+      if (minTeam === null || maxTeam === null) {
+        warnings.push(
+          'Team size (min/max) was not explicitly found on the source page and remains unconfirmed (null).'
+        );
+      }
+
+      const resolvedCanonical =
+        payload.verifiedCanonicalUrl ??
+        payload.canonicalUrl ??
+        payload.finalUrl ??
+        rawUrl;
+
+      const resolvedEventType: EventType =
+        d?.eventType && d.eventType !== 'unknown'
+          ? (d.eventType as EventType)
+          : cls.eventType;
+
+      const resolvedMatchable =
+        resolvedEventType === 'hackathon' ||
+        resolvedEventType === 'buildathon' ||
+        resolvedEventType === 'ideathon' ||
+        resolvedEventType === 'ctf'
+          ? maxTeam !== 1
+          : cls.matchable;
+
       return {
-        ok: false,
+        ok: true,
         isLiveApiResult: true,
-        warnings: payload.warnings ?? [],
-        errorMessage:
-          payload.userMessage ?? `Could not retrieve event page (HTTP ${resp.status}).`,
         redirectChain: payload.redirectChain,
         extractionMethod: payload.extractionMethod,
         diagnostics: payload.diagnostics,
+        warnings,
+        draft: {
+          source: 'submitted_public_url',
+          sourceUrl: resolvedCanonical,
+          originalSubmissionUrl: payload.submittedUrl ?? rawUrl,
+          verifiedCanonicalUrl: resolvedCanonical,
+          sourceUrlStatus:
+            (payload.redirectChain?.length ?? 0) > 1
+              ? 'redirected_valid'
+              : 'verified',
+          title,
+          organizer: d?.organizer ?? ai.organizer ?? det.organizer ?? '',
+          eventType: resolvedEventType,
+          matchable: resolvedMatchable,
+          themes:
+            Array.isArray(d?.themes) && d.themes.length > 0 ? d.themes : [],
+          description,
+          startAt: d?.startAt ?? ai.startAt ?? det.startAt ?? null,
+          endAt: d?.endAt ?? ai.endAt ?? det.endAt ?? null,
+          registrationDeadline:
+            d?.registrationDeadline ?? ai.registrationDeadline ?? null,
+          timezone: 'Asia/Kolkata',
+          venue: {
+            campus: (d?.campus as CampusType) ?? null,
+            name: d?.venueName ?? null,
+          },
+          format: d?.format ?? 'unknown',
+          teamSize: {
+            min: minTeam,
+            max: maxTeam,
+          },
+          registrationUrl: d?.registrationUrl ?? resolvedCanonical ?? null,
+          eligibilityNotes: d?.eligibilityNotes ?? null,
+          fieldEvidence: {
+            source: [
+              {
+                sourceUrl: resolvedCanonical,
+                excerpt:
+                  d?.extractedTextEvidence ??
+                  det.teamSizeExcerpt ??
+                  `Fetched live from ${resolvedCanonical}`,
+              },
+            ],
+          },
+          classification: {
+            ruleGatePassed: resolvedMatchable,
+            mlScore: resolvedMatchable ? 1 : 0,
+            reason: cls.reason,
+          },
+          reviewStatus:
+            resolvedMatchable && minTeam !== null && maxTeam !== null
+              ? 'new'
+              : 'needs_confirmation',
+        },
       };
-    }
-
-    const d = payload.data;
-    const det = payload.deterministic ?? {};
-    const ai = payload.aiSupplement ?? {};
-
-    const title = d?.title ?? ai.title ?? det.title ?? '';
-    const description = d?.description ?? det.description ?? '';
-    const minTeam = d?.minTeamSize ?? ai.minTeamSize ?? det.minTeamSize ?? null;
-    const maxTeam = d?.maxTeamSize ?? ai.maxTeamSize ?? det.maxTeamSize ?? null;
-
-    const cls = classifyEventCandidateText({
-      title: title || 'Extracted Event',
-      description,
-      minTeamSize: minTeam,
-      maxTeamSize: maxTeam,
-    });
-
-    const warnings: string[] = [...(payload.warnings ?? [])];
-    if (minTeam === null || maxTeam === null) {
-      warnings.push(
-        'Team size (min/max) was not explicitly found on the source page and remains unconfirmed (null).'
-      );
-    }
-
-    const resolvedCanonical =
-      payload.verifiedCanonicalUrl ?? payload.canonicalUrl ?? payload.finalUrl ?? rawUrl;
-
-    return {
-      ok: true,
-      isLiveApiResult: true,
-      redirectChain: payload.redirectChain,
-      extractionMethod: payload.extractionMethod,
-      diagnostics: payload.diagnostics,
-      warnings,
-      draft: {
-        source: 'submitted_public_url',
-        sourceUrl: resolvedCanonical,
-        originalSubmissionUrl: payload.submittedUrl ?? rawUrl,
-        verifiedCanonicalUrl: resolvedCanonical,
-        sourceUrlStatus:
-          (payload.redirectChain?.length ?? 0) > 1 ? 'redirected_valid' : 'verified',
-        title,
-        organizer: d?.organizer ?? ai.organizer ?? det.organizer ?? '',
-        eventType: (d?.eventType as EventType) ?? cls.eventType,
-        matchable: cls.matchable,
-        themes:
-          Array.isArray(d?.themes) && d.themes.length > 0
-            ? d.themes
-            : ['Applied AI/ML', 'Developer Tools'],
-        description,
-        startAt: d?.startAt ?? ai.startAt ?? det.startAt ?? null,
-        endAt: d?.endAt ?? ai.endAt ?? det.endAt ?? null,
-        registrationDeadline: d?.registrationDeadline ?? ai.registrationDeadline ?? null,
-        timezone: 'Asia/Kolkata',
-        venue: {
-          campus: (d?.campus as CampusType) ?? null,
-          name: d?.venueName ?? null,
-        },
-        format: d?.format ?? 'unknown',
-        teamSize: {
-          min: minTeam,
-          max: maxTeam,
-        },
-        registrationUrl: d?.registrationUrl ?? resolvedCanonical ?? null,
-        eligibilityNotes: d?.eligibilityNotes ?? null,
-        fieldEvidence: {
-          source: [
-            {
-              sourceUrl: resolvedCanonical,
-              excerpt:
-                d?.extractedTextEvidence ??
-                det.teamSizeExcerpt ??
-                `Fetched live from ${resolvedCanonical}`,
-            },
-          ],
-        },
-        classification: {
-          ruleGatePassed: cls.ruleGatePassed,
-          mlScore: cls.mlScore,
-          reason: cls.reason,
-        },
-      },
-    };
-  } catch (err: unknown) {
-    return {
-      ok: false,
-      isLiveApiResult: true,
-      warnings: [],
-      errorMessage: `Could not connect to server to extract URL metadata (${
-        err instanceof Error ? err.message : String(err)
-      }).`,
-    };
-  }
+    },
+    (res) => res.ok,
+    forceRefresh
+  );
 }
 
 /**
@@ -562,121 +645,126 @@ export async function extractLiveEventFileMetadata(file: {
   errorMessage?: string;
   diagnostics?: DeveloperDiagnosticTelemetry;
 }> {
-  try {
-    const resp = await fetch('/api/events/extract-file', {
+  const apiRes = await apiFetch<ExtractEventFileResponse>(
+    '/api/events/extract-file',
+    {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(file),
-    });
-    const payload = (await resp.json()) as ExtractEventFileResponse;
-
-    if (!resp.ok || !payload.ok) {
-      return {
-        ok: false,
-        isLiveApiResult: true,
-        fileAccepted: Boolean(payload.fileAccepted),
-        extractionMethod: payload.extractionMethod,
-        warnings: payload.warnings ?? [],
-        errorMessage:
-          payload.userMessage ??
-          "AI extraction is temporarily unavailable. Your poster was accepted, but its details couldn't be extracted. Retry extraction or enter the information manually.",
-        diagnostics: payload.diagnostics,
-      };
+      timeoutMs: 18000,
     }
+  );
 
-    const d = payload.data!;
-    const minTeam = typeof d.minTeamSize === 'number' ? d.minTeamSize : null;
-    const maxTeam = typeof d.maxTeamSize === 'number' ? d.maxTeamSize : null;
-
-    const cls = classifyEventCandidateText({
-      title: d.title || file.fileName,
-      description: d.description || '',
-      minTeamSize: minTeam,
-      maxTeamSize: maxTeam,
-    });
-
-    return {
-      ok: true,
-      isLiveApiResult: true,
-      fileAccepted: true,
-      extractionMethod: payload.extractionMethod,
-      warnings: payload.warnings ?? [],
-      diagnostics: payload.diagnostics,
-      draft: {
-        source: 'uploaded_brochure_or_poster',
-        originalSubmissionUrl: d.officialSourceUrl ?? null,
-        verifiedCanonicalUrl: null,
-        sourceUrlStatus: d.officialSourceUrl ? 'unverified' : 'unavailable',
-        uploadedAttachment: {
-          fileName: payload.fileName,
-          mimeType: payload.mimeType,
-          byteSize: payload.byteSize,
-          extractedEvidenceQuote: d.extractedTextEvidence ?? undefined,
-        },
-        title: d.title ?? '',
-        organizer: d.organizer ?? '',
-        eventType: (d.eventType as EventType) || cls.eventType,
-        matchable: cls.matchable,
-        themes: Array.isArray(d.themes) ? d.themes : [],
-        description: d.description ?? '',
-        startAt: d.startAt ?? null,
-        endAt: d.endAt ?? null,
-        registrationDeadline: d.registrationDeadline ?? null,
-        timezone: 'Asia/Kolkata',
-        venue: {
-          campus: (d.campus as CampusType) ?? null,
-          name: d.venueName ?? null,
-        },
-        format: d.format ?? 'unknown',
-        teamSize: {
-          min: minTeam,
-          max: maxTeam,
-        },
-        registrationUrl: d.registrationUrl ?? null,
-        eligibilityNotes: d.eligibilityNotes ?? null,
-        fieldEvidence: {
-          uploadedFile: [
-            {
-              sourceUrl: `attachment://${payload.fileName}`,
-              excerpt: d.extractedTextEvidence ?? `Extracted from ${payload.fileName}`,
-            },
-          ],
-        },
-        classification: {
-          ruleGatePassed: cls.ruleGatePassed,
-          mlScore: cls.mlScore,
-          reason: cls.reason,
-        },
-      },
-    };
-  } catch (err: unknown) {
+  const payload = apiRes.data;
+  if (!apiRes.ok || !payload || !payload.ok) {
     return {
       ok: false,
       isLiveApiResult: true,
-      fileAccepted: true,
-      warnings: [],
+      fileAccepted: Boolean(payload?.fileAccepted ?? true),
+      extractionMethod: payload?.extractionMethod,
+      warnings: payload?.warnings ?? [],
       errorMessage:
+        payload?.userMessage ??
+        apiRes.errorMessage ??
         "AI extraction is temporarily unavailable. Your poster was accepted, but its details couldn't be extracted. Retry extraction or enter the information manually.",
-      diagnostics: {
-        serviceName: 'file_processor',
-        httpStatus: 0,
-        errorCategory: 'NETWORK_ERROR',
-        retryAttempts: 0,
-        durationMs: 0,
-      },
+      diagnostics: payload?.diagnostics,
     };
   }
+
+  const d = payload.data!;
+  const minTeam = typeof d.minTeamSize === 'number' ? d.minTeamSize : null;
+  const maxTeam = typeof d.maxTeamSize === 'number' ? d.maxTeamSize : null;
+
+  const cls = classifyEventCandidateText({
+    title: d.title || '',
+    description: d.description || '',
+    minTeamSize: minTeam,
+    maxTeamSize: maxTeam,
+  });
+
+  const resolvedType: EventType =
+    d.eventType && d.eventType !== 'unknown'
+      ? (d.eventType as EventType)
+      : cls.eventType;
+
+  const resolvedMatchable =
+    resolvedType === 'hackathon' ||
+    resolvedType === 'buildathon' ||
+    resolvedType === 'ideathon' ||
+    resolvedType === 'ctf'
+      ? maxTeam !== 1
+      : cls.matchable;
+
+  return {
+    ok: true,
+    isLiveApiResult: true,
+    fileAccepted: true,
+    extractionMethod: payload.extractionMethod,
+    warnings: payload.warnings ?? [],
+    diagnostics: payload.diagnostics,
+    draft: {
+      source: 'uploaded_brochure_or_poster',
+      originalSubmissionUrl: d.officialSourceUrl ?? null,
+      verifiedCanonicalUrl: null,
+      sourceUrlStatus: d.officialSourceUrl ? 'unverified' : 'unavailable',
+      uploadedAttachment: {
+        fileName: payload.fileName,
+        mimeType: payload.mimeType,
+        byteSize: payload.byteSize,
+        extractedEvidenceQuote: d.extractedTextEvidence ?? undefined,
+      },
+      title: d.title ?? '',
+      organizer: d.organizer ?? '',
+      eventType: resolvedType,
+      matchable: resolvedMatchable,
+      themes: Array.isArray(d.themes) ? d.themes : [],
+      description: d.description ?? '',
+      startAt: d.startAt ?? null,
+      endAt: d.endAt ?? null,
+      registrationDeadline: d.registrationDeadline ?? null,
+      timezone: 'Asia/Kolkata',
+      venue: {
+        campus: (d.campus as CampusType) ?? null,
+        name: d.venueName ?? null,
+      },
+      format: d.format ?? 'unknown',
+      teamSize: {
+        min: minTeam,
+        max: maxTeam,
+      },
+      registrationUrl: d.registrationUrl ?? null,
+      eligibilityNotes: d.eligibilityNotes ?? null,
+      fieldEvidence: {
+        uploadedFile: [
+          {
+            sourceUrl: `attachment://${payload.fileName}`,
+            excerpt:
+              d.extractedTextEvidence ?? `Extracted from ${payload.fileName}`,
+          },
+        ],
+      },
+      classification: {
+        ruleGatePassed: resolvedMatchable,
+        mlScore: resolvedMatchable ? 1 : 0,
+        reason: cls.reason,
+      },
+      reviewStatus:
+        resolvedMatchable && minTeam !== null && maxTeam !== null
+          ? 'new'
+          : 'needs_confirmation',
+    },
+  };
 }
 
 /**
- * DEMO MODE ONLY: Simulated GitHub import + draft extraction
+ * Isolated Test/Sandbox Helper: Simulated GitHub import + draft extraction (All items start unapproved).
  */
 export function runBoundedGitHubEnrichmentDraft(params: {
   uid: string;
   githubUsername: string;
   simulateMaliciousReadme?: boolean;
 }): ProfileEvidenceDraft {
-  const cleanUser = params.githubUsername.replace(/[^a-zA-Z0-9-_]/g, '') || 'pes-student';
+  const cleanUser =
+    params.githubUsername.replace(/[^a-zA-Z0-9-_]/g, '') || 'pes-student';
 
   if (params.simulateMaliciousReadme) {
     return {
@@ -687,32 +775,33 @@ export function runBoundedGitHubEnrichmentDraft(params: {
       sourceUrl: `https://github.com/${cleanUser}/adversarial-readme-repo`,
       repoName: `${cleanUser}/adversarial-readme-repo`,
       rawEvidenceSummary:
-        '[Demo Mode] Simulated repository contains a Python Flask app. Untrusted README included a prompt injection block which was stripped.',
+        '[Sandbox Mode] Simulated repository contains a Python Flask app. Untrusted README included a prompt injection block which was stripped.',
       suggestedSkills: [
         {
           name: 'Python',
           category: 'backend',
           confidence: 'high',
           reason: 'Observable requirements.txt and app.py modules',
-          approved: true,
+          approved: false,
         },
         {
           name: 'Flask',
           category: 'backend',
           confidence: 'medium',
           reason: 'Route handlers in app.py',
-          approved: true,
+          approved: false,
         },
       ],
       suggestedProject: {
         title: 'Flask Micro-Webhook Relay',
-        description: 'Small Python Flask service relaying webhook payloads with HMAC signature verification.',
+        description:
+          'Small Python Flask service relaying webhook payloads with HMAC signature verification.',
         sourceUrl: `https://github.com/${cleanUser}/adversarial-readme-repo`,
         tags: ['Python', 'Developer Tools'],
-        approved: true,
+        approved: false,
       },
       sanitizedWarnings: [
-        '[Demo Mode] Ignored adversarial instruction inside README.md attempting to inject unverified skills.',
+        '[Sandbox Mode] Ignored adversarial instruction inside README.md attempting to inject unverified skills.',
       ],
       fetchedAt: new Date().toISOString(),
       userReviewed: false,
@@ -725,38 +814,32 @@ export function runBoundedGitHubEnrichmentDraft(params: {
     source: 'github',
     isLiveApiResult: false,
     sourceUrl: `https://github.com/${cleanUser}`,
-    repoName: `${cleanUser} (Demo Simulation)`,
+    repoName: `${cleanUser} (Sandbox Simulation)`,
     rawEvidenceSummary:
-      '[Demo Mode] Simulated public repository metadata. Switch to Live Test Mode to fetch your actual GitHub repositories and run real Gemini extraction.',
+      '[Sandbox Mode] Simulated public repository metadata.',
     suggestedSkills: [
       {
         name: 'TypeScript',
         category: 'frontend',
         confidence: 'high',
         reason: 'Typed React components in /src',
-        approved: true,
+        approved: false,
       },
       {
         name: 'FastAPI',
         category: 'backend',
         confidence: 'high',
         reason: 'Async REST router in /server',
-        approved: true,
-      },
-      {
-        name: 'GraphQL',
-        category: 'backend',
-        confidence: 'low',
-        reason: 'Mentioned in README Future Work only',
         approved: false,
       },
     ],
     suggestedProject: {
-      title: 'Campus Grid Monitor (Demo)',
-      description: 'Real-time solar inverter and classroom load dashboard built with React and FastAPI.',
+      title: 'Campus Grid Monitor',
+      description:
+        'Real-time solar inverter and classroom load dashboard built with React and FastAPI.',
       sourceUrl: `https://github.com/${cleanUser}`,
       tags: ['TypeScript', 'FastAPI', 'Climate/Civic Tech'],
-      approved: true,
+      approved: false,
     },
     sanitizedWarnings: [],
     fetchedAt: new Date().toISOString(),
@@ -764,12 +847,214 @@ export function runBoundedGitHubEnrichmentDraft(params: {
   };
 }
 
+interface GitHubFetchResponsePayload {
+  ok: boolean;
+  live: boolean;
+  userMessage?: string;
+  message?: string;
+  rateLimit?: { remaining?: string | null; limit?: string | null };
+  profile?: {
+    login: string;
+    name: string;
+    bio: string;
+    publicReposCount: number;
+    htmlUrl: string;
+  };
+  repositories?: Array<{
+    name: string;
+    url: string;
+    description: string;
+    language: string | null;
+    topics: string[];
+    stars: number;
+    updatedAt: string;
+    readmeExcerpt?: string;
+  }>;
+  diagnostics?: DeveloperDiagnosticTelemetry;
+}
+
 /**
- * LIVE API MODE: Fetches real public repositories from GitHub REST API and runs real Gemini extraction.
+ * Builds a deterministic ProfileEvidenceDraft directly from GitHub REST API repository metadata
+ * with ZERO Gemini calls. Every suggested skill and project starts with `approved: false`.
+ */
+export function buildDeterministicGitHubDraft(params: {
+  uid: string;
+  githubUsername: string;
+  ghJson: GitHubFetchResponsePayload;
+}): ProfileEvidenceDraft {
+  const repos = params.ghJson.repositories ?? [];
+  const skillMap = new Map<
+    string,
+    {
+      name: string;
+      category: string;
+      confidence: 'high' | 'medium' | 'low';
+      reason: string;
+      approved: boolean;
+    }
+  >();
+
+  for (const repo of repos) {
+    if (repo.language) {
+      const key = repo.language.toLowerCase();
+      if (!skillMap.has(key)) {
+        skillMap.set(key, {
+          name: repo.language,
+          category: 'language',
+          confidence: 'high',
+          reason: `Primary language of ${repo.name}`,
+          approved: false,
+        });
+      }
+    }
+    for (const topic of repo.topics ?? []) {
+      const cleanTopic = topic.trim();
+      if (!cleanTopic) continue;
+      const key = cleanTopic.toLowerCase();
+      if (!skillMap.has(key) && skillMap.size < 12) {
+        skillMap.set(key, {
+          name: cleanTopic,
+          category: 'topic',
+          confidence: 'medium',
+          reason: `Repository topic on ${repo.name}`,
+          approved: false,
+        });
+      }
+    }
+  }
+
+  const suggestedProjects = repos.map((repo) => {
+    const tags = [
+      ...(repo.language ? [repo.language] : []),
+      ...(repo.topics ?? []).slice(0, 3),
+    ];
+    return {
+      title: repo.name,
+      description:
+        repo.description?.trim() ||
+        (repo.readmeExcerpt
+          ? repo.readmeExcerpt.split('\n')[0].slice(0, 140)
+          : `Public repository by @${
+              params.ghJson.profile?.login ?? params.githubUsername
+            }`),
+      sourceUrl: repo.url,
+      tags,
+      approved: false, // Strictly unapproved until user explicitly checks it
+    };
+  });
+
+  const primaryProject = suggestedProjects[0] ?? {
+    title: `${params.githubUsername} Public Profile`,
+    description:
+      params.ghJson.profile?.bio ||
+      `GitHub profile for @${params.githubUsername}`,
+    sourceUrl:
+      params.ghJson.profile?.htmlUrl ??
+      `https://github.com/${params.githubUsername}`,
+    tags: Array.from(skillMap.values())
+      .slice(0, 3)
+      .map((s) => s.name),
+    approved: false,
+  };
+
+  return {
+    id: `gh_det_${Date.now()}`,
+    uid: params.uid,
+    source: 'github',
+    isLiveApiResult: true,
+    sourceUrl:
+      params.ghJson.profile?.htmlUrl ??
+      `https://github.com/${params.githubUsername}`,
+    repoName: `${params.ghJson.profile?.login ?? params.githubUsername} (${
+      repos.length
+    } public repos fetched)`,
+    rawEvidenceSummary: `Fetched ${repos.length} public repositories from GitHub REST API (${
+      params.ghJson.profile?.publicReposCount ?? repos.length
+    } total public repos). Review and check the skills or projects you want to add.`,
+    suggestedSkills: Array.from(skillMap.values()),
+    suggestedProjects,
+    suggestedProject: primaryProject,
+    sanitizedWarnings: [],
+    fetchedAt: new Date().toISOString(),
+    userReviewed: false,
+  };
+}
+
+/**
+ * Fast, zero-Gemini GitHub repository import (Requirement #7).
+ * Fetches real public repositories from `/api/github/fetch` and extracts languages,
+ * topics, and repository descriptions deterministically with all items starting `approved: false`.
+ */
+export async function fetchLiveGitHubRepositoriesDeterministically(params: {
+  uid: string;
+  githubUsername: string;
+  forceRefresh?: boolean;
+}): Promise<{
+  ok: boolean;
+  isLiveApiResult: true;
+  draft?: ProfileEvidenceDraft;
+  rawGitHubPayload?: GitHubFetchResponsePayload;
+  errorMessage?: string;
+  githubRateLimit?: { remaining?: string | null; limit?: string | null };
+  diagnostics?: DeveloperDiagnosticTelemetry;
+}> {
+  const key = `gh_det_fetch:${params.githubUsername.trim().toLowerCase()}`;
+  return withDedupeAndCache(
+    key,
+    async () => {
+      const ghRes = await apiFetch<GitHubFetchResponsePayload>(
+        '/api/github/fetch',
+        {
+          method: 'POST',
+          body: JSON.stringify({ username: params.githubUsername }),
+          timeoutMs: 10000,
+        }
+      );
+
+      const ghJson = ghRes.data;
+      if (!ghRes.ok || !ghJson || !ghJson.ok) {
+        return {
+          ok: false,
+          isLiveApiResult: true,
+          errorMessage:
+            ghJson?.userMessage ??
+            ghJson?.message ??
+            ghRes.errorMessage ??
+            `GitHub fetch failed (HTTP ${ghRes.status})`,
+          githubRateLimit: ghJson?.rateLimit,
+          diagnostics: ghJson?.diagnostics,
+        };
+      }
+
+      const draft = buildDeterministicGitHubDraft({
+        uid: params.uid,
+        githubUsername: params.githubUsername,
+        ghJson,
+      });
+
+      return {
+        ok: true,
+        isLiveApiResult: true,
+        draft,
+        rawGitHubPayload: ghJson,
+        githubRateLimit: ghJson.rateLimit,
+        diagnostics: ghJson.diagnostics,
+      };
+    },
+    (res) => res.ok,
+    Boolean(params.forceRefresh)
+  );
+}
+
+/**
+ * Optional Gemini AI enhancement on top of already-fetched GitHub repository data (Requirement #7).
+ * Uses a strict 12s timeout and keeps all suggested skills and projects unapproved (`approved: false`).
  */
 export async function runLiveGitHubAndGeminiEnrichment(params: {
   uid: string;
   githubUsername: string;
+  forceRefresh?: boolean;
+  useGemini?: boolean;
 }): Promise<{
   ok: boolean;
   isLiveApiResult: true;
@@ -778,108 +1063,127 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
   githubRateLimit?: { remaining?: string | null; limit?: string | null };
   diagnostics?: DeveloperDiagnosticTelemetry;
 }> {
-  // Step 1: Call real GitHub REST API via server
-  const ghResp = await fetch('/api/github/fetch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: params.githubUsername }),
+  const detResult = await fetchLiveGitHubRepositoriesDeterministically({
+    uid: params.uid,
+    githubUsername: params.githubUsername,
+    forceRefresh: params.forceRefresh,
   });
-  const ghJson = await ghResp.json();
 
-  if (!ghResp.ok || !ghJson.ok) {
-    return {
-      ok: false,
-      isLiveApiResult: true,
-      errorMessage:
-        ghJson.userMessage ?? ghJson.message ?? `GitHub fetch failed (HTTP ${ghResp.status})`,
-      githubRateLimit: ghJson.rateLimit,
-      diagnostics: ghJson.diagnostics,
-    };
+  if (!detResult.ok || !detResult.draft || !detResult.rawGitHubPayload) {
+    return detResult;
   }
 
-  // Step 2: Call real Gemini API via server to extract skills & projects from the retrieved repos
-  const geminiResp = await fetch('/api/gemini/extract-profile', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ githubData: ghJson }),
-  });
-  const geminiJson = await geminiResp.json();
+  // If Gemini enhancement was not explicitly requested, return the fast deterministic draft immediately
+  if (params.useGemini === false) {
+    return detResult;
+  }
 
-  if (!geminiResp.ok || !geminiJson.ok) {
+  const geminiRes = await apiFetch<{
+    ok: boolean;
+    model?: string;
+    userMessage?: string;
+    message?: string;
+    data?: {
+      suggestedSkills?: Array<{
+        name: string;
+        category: string;
+        confidence: string;
+        reason: string;
+      }>;
+      projectSummaries?: Array<{
+        title: string;
+        description: string;
+        sourceUrl?: string;
+        tags?: string[];
+      }>;
+      warnings?: string[];
+    };
+    diagnostics?: DeveloperDiagnosticTelemetry;
+  }>('/api/gemini/extract-profile', {
+    method: 'POST',
+    body: JSON.stringify({ githubData: detResult.rawGitHubPayload }),
+    timeoutMs: 12000,
+  });
+
+  const geminiJson = geminiRes.data;
+  if (!geminiRes.ok || !geminiJson || !geminiJson.ok) {
+    // Still return the real deterministic GitHub draft so the user's repos are immediately usable!
     return {
-      ok: false,
+      ok: true,
       isLiveApiResult: true,
-      errorMessage:
-        geminiJson.userMessage ??
-        geminiJson.message ??
-        `Gemini extraction failed (HTTP ${geminiResp.status})`,
-      githubRateLimit: ghJson.rateLimit,
-      diagnostics: geminiJson.diagnostics,
+      draft: {
+        ...detResult.draft,
+        sanitizedWarnings: [
+          geminiJson?.userMessage ??
+            geminiRes.errorMessage ??
+            'AI summary enhancement timed out or was unavailable; showing direct GitHub repository metadata.',
+        ],
+      },
+      githubRateLimit: detResult.githubRateLimit,
+      diagnostics: geminiJson?.diagnostics ?? detResult.diagnostics,
     };
   }
 
   const extracted = geminiJson.data ?? {};
-  const skills = Array.isArray(extracted.suggestedSkills)
-    ? extracted.suggestedSkills.map(
-        (s: { name: string; category: string; confidence: string; reason: string }) => ({
-          name: s.name,
-          category: s.category || 'general',
-          confidence:
-            s.confidence === 'high' || s.confidence === 'medium' ? s.confidence : 'low',
-          reason: s.reason || 'Extracted from public repository evidence',
-          approved: s.confidence !== 'low',
-        })
-      )
+  const aiSkills = Array.isArray(extracted.suggestedSkills)
+    ? extracted.suggestedSkills.map((s) => ({
+        name: s.name,
+        category: s.category || 'general',
+        confidence:
+          s.confidence === 'high' || s.confidence === 'medium'
+            ? (s.confidence as 'high' | 'medium')
+            : ('low' as const),
+        reason: s.reason || 'Extracted from public repository evidence',
+        approved: false, // Strictly unapproved by default (Requirement #7)
+      }))
     : [];
 
-  const projects = Array.isArray(extracted.projectSummaries)
-    ? extracted.projectSummaries.map(
-        (p: { title: string; description: string; sourceUrl?: string; tags?: string[] }) => ({
-          title: p.title,
-          description: p.description,
-          sourceUrl: p.sourceUrl || ghJson.profile?.htmlUrl || `https://github.com/${params.githubUsername}`,
-          tags: Array.isArray(p.tags) ? p.tags : [],
-          approved: true,
-        })
-      )
-    : [];
+  // Merge deterministic languages + AI skills without duplicates
+  const mergedSkillMap = new Map<string, (typeof aiSkills)[number]>();
+  for (const s of detResult.draft.suggestedSkills) {
+    mergedSkillMap.set(s.name.toLowerCase(), { ...s, approved: false });
+  }
+  for (const s of aiSkills) {
+    mergedSkillMap.set(s.name.toLowerCase(), { ...s, approved: false });
+  }
 
-  const primaryProject = projects[0] ?? {
-    title: ghJson.repositories?.[0]?.name ?? `${params.githubUsername} Repository`,
-    description:
-      ghJson.repositories?.[0]?.description ||
-      `Public repository fetched from github.com/${params.githubUsername}`,
-    sourceUrl:
-      ghJson.repositories?.[0]?.url || `https://github.com/${params.githubUsername}`,
-    tags: skills.slice(0, 3).map((s: { name: string }) => s.name),
-    approved: true,
-  };
+  const aiProjects = Array.isArray(extracted.projectSummaries)
+    ? extracted.projectSummaries.map((p) => ({
+        title: p.title,
+        description: p.description,
+        sourceUrl:
+          p.sourceUrl ||
+          detResult.rawGitHubPayload?.profile?.htmlUrl ||
+          `https://github.com/${params.githubUsername}`,
+        tags: Array.isArray(p.tags) ? p.tags : [],
+        approved: false, // Strictly unapproved by default (Requirement #7)
+      }))
+    : detResult.draft.suggestedProjects ?? [];
+
+  const primaryProject =
+    aiProjects[0] ?? {
+      ...detResult.draft.suggestedProject,
+      approved: false,
+    };
 
   return {
     ok: true,
     isLiveApiResult: true,
-    githubRateLimit: ghJson.rateLimit,
+    githubRateLimit: detResult.githubRateLimit,
     diagnostics: geminiJson.diagnostics,
     draft: {
-      id: `live_draft_${Date.now()}`,
-      uid: params.uid,
-      source: 'github',
-      isLiveApiResult: true,
-      sourceUrl: ghJson.profile?.htmlUrl ?? `https://github.com/${params.githubUsername}`,
-      repoName: `${ghJson.profile?.login} (${ghJson.repositories?.length ?? 0} public repos analyzed)`,
-      rawEvidenceSummary: `Live GitHub REST API fetched ${
-        ghJson.repositories?.length ?? 0
-      } non-fork repositories (${
-        ghJson.profile?.publicReposCount ?? 0
-      } total public repos) and extracted structured suggestions via Gemini (${
+      ...detResult.draft,
+      rawEvidenceSummary: `Fetched ${
+        detResult.rawGitHubPayload.repositories?.length ?? 0
+      } public repositories from GitHub and enhanced summaries with Gemini (${
         geminiJson.model ?? 'configured model'
-      }).`,
-      suggestedSkills: skills,
-      suggestedProjects: projects,
+      }). All suggestions start unchecked—select the ones you want to include.`,
+      suggestedSkills: Array.from(mergedSkillMap.values()),
+      suggestedProjects: aiProjects,
       suggestedProject: primaryProject,
-      sanitizedWarnings: Array.isArray(extracted.warnings) ? extracted.warnings : [],
-      fetchedAt: new Date().toISOString(),
-      userReviewed: false,
+      sanitizedWarnings: Array.isArray(extracted.warnings)
+        ? extracted.warnings
+        : [],
     },
   };
 }

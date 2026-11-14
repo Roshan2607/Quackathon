@@ -119,6 +119,63 @@ export function matchCustomSpecializations(
   };
 }
 
+interface PrecomputedTfIdfCorpus {
+  docCount: number;
+  corpusTokenSets: Set<string>[];
+}
+
+function precomputeTfIdfCorpus(corpusDocs: string[]): PrecomputedTfIdfCorpus {
+  const corpusTokenSets = corpusDocs.map((doc) => new Set(tokenizeControlled(doc)));
+  return {
+    docCount: corpusTokenSets.length + 2,
+    corpusTokenSets,
+  };
+}
+
+function computeFastTfIdfCosine(
+  tokensA: string[],
+  countsA: Map<string, number>,
+  setA: Set<string>,
+  docB: string,
+  precomputed: PrecomputedTfIdfCorpus
+): number {
+  if (tokensA.length === 0) return 0;
+  const tokensB = tokenizeControlled(docB);
+  if (tokensB.length === 0) return 0;
+
+  const countsB = new Map<string, number>();
+  const setB = new Set<string>();
+  for (const t of tokensB) {
+    countsB.set(t, (countsB.get(t) ?? 0) + 1);
+    setB.add(t);
+  }
+
+  const vocab = new Set<string>([...setA, ...setB]);
+  const { docCount, corpusTokenSets } = precomputed;
+
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (const term of vocab) {
+    let df = (setA.has(term) ? 1 : 0) + (setB.has(term) ? 1 : 0);
+    for (let i = 0; i < corpusTokenSets.length; i++) {
+      if (corpusTokenSets[i].has(term)) df += 1;
+    }
+    const idf = Math.log(1 + docCount / (df || 1));
+    const tfA = (countsA.get(term) ?? 0) / tokensA.length;
+    const tfB = (countsB.get(term) ?? 0) / tokensB.length;
+    const wA = tfA * idf;
+    const wB = tfB * idf;
+    dot += wA * wB;
+    normA += wA * wA;
+    normB += wB * wB;
+  }
+
+  if (normA === 0 || normB === 0) return 0;
+  return Math.min(1, Math.max(0, dot / (Math.sqrt(normA) * Math.sqrt(normB))));
+}
+
 /**
  * Computes TF-IDF cosine similarity between two documents within a small corpus of candidate texts.
  */
@@ -128,50 +185,15 @@ export function computeTfIdfCosineSimilarity(
   corpusDocs: string[]
 ): number {
   const tokensA = tokenizeControlled(docA);
-  const tokensB = tokenizeControlled(docB);
-  if (tokensA.length === 0 || tokensB.length === 0) return 0;
-
-  const allDocsTokens = [tokensA, tokensB, ...corpusDocs.map(tokenizeControlled)];
-  const docCount = allDocsTokens.length;
-
-  const vocab = Array.from(new Set([...tokensA, ...tokensB]));
-  const dfMap = new Map<string, number>();
-
-  for (const term of vocab) {
-    let df = 0;
-    for (const d of allDocsTokens) {
-      if (d.includes(term)) df += 1;
-    }
-    dfMap.set(term, df);
+  if (tokensA.length === 0) return 0;
+  const countsA = new Map<string, number>();
+  const setA = new Set<string>();
+  for (const t of tokensA) {
+    countsA.set(t, (countsA.get(t) ?? 0) + 1);
+    setA.add(t);
   }
-
-  const buildTfIdfVector = (tokens: string[]): number[] => {
-    const counts = new Map<string, number>();
-    for (const t of tokens) {
-      counts.set(t, (counts.get(t) ?? 0) + 1);
-    }
-    return vocab.map((term) => {
-      const tf = (counts.get(term) ?? 0) / tokens.length;
-      const df = dfMap.get(term) ?? 1;
-      const idf = Math.log(1 + docCount / df);
-      return tf * idf;
-    });
-  };
-
-  const vecA = buildTfIdfVector(tokensA);
-  const vecB = buildTfIdfVector(tokensB);
-
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < vocab.length; i++) {
-    dot += vecA[i] * vecB[i];
-    normA += vecA[i] * vecA[i];
-    normB += vecB[i] * vecB[i];
-  }
-
-  if (normA === 0 || normB === 0) return 0;
-  return Math.min(1, Math.max(0, dot / (Math.sqrt(normA) * Math.sqrt(normB))));
+  const precomputed = precomputeTfIdfCorpus(corpusDocs);
+  return computeFastTfIdfCosine(tokensA, countsA, setA, docB, precomputed);
 }
 
 function jaccardOverlap(listA: string[], listB: string[]): { score: number; shared: string[] } {
@@ -291,6 +313,183 @@ export function computeInterestCircles(
 }
 
 /**
+ * Fast O(N) Pass-1 count of eligible People without running TF-IDF when on the Teams tab.
+ */
+export function countEligiblePeopleForHackathon(params: {
+  viewerUid: string;
+  hackathon: Hackathon;
+  users: User[];
+  profiles: Record<string, Profile>;
+  participations: Participation[];
+  memberships: Membership[];
+  interests: Interest[];
+  blocks: BlockRecord[];
+  activeCircleTags?: string[];
+  roleFilter?: string;
+  onlyFirstTimeHackers?: boolean;
+  searchQuery?: string;
+}): number {
+  const {
+    viewerUid,
+    hackathon,
+    users,
+    profiles,
+    participations,
+    memberships,
+    interests,
+    blocks,
+    activeCircleTags,
+    roleFilter,
+    onlyFirstTimeHackers,
+    searchQuery,
+  } = params;
+
+  if (!hackathon.matchable) return 0;
+
+  const userMap = new Map<string, User>();
+  for (let i = 0; i < users.length; i++) {
+    userMap.set(users[i].uid, users[i]);
+  }
+
+  const blockedUids = new Set(
+    blocks
+      .filter((b) => b.blockerUid === viewerUid || b.blockedUid === viewerUid)
+      .map((b) => (b.blockerUid === viewerUid ? b.blockedUid : b.blockerUid))
+  );
+
+  const swipedUserIds = new Set(
+    interests
+      .filter(
+        (i) => i.hackathonId === hackathon.id && i.fromUid === viewerUid && i.targetType === 'user'
+      )
+      .map((i) => i.targetId)
+  );
+
+  const activeMemberUidsInEvent = new Set(
+    memberships
+      .filter((m) => m.hackathonId === hackathon.id && m.status === 'active')
+      .map((m) => m.uid)
+  );
+
+  const normQuery = searchQuery?.trim().toLowerCase() ?? '';
+
+  let count = 0;
+  for (let i = 0; i < participations.length; i++) {
+    const part = participations[i];
+    if (part.hackathonId !== hackathon.id) continue;
+    if (part.uid === viewerUid) continue;
+    if (!part.discoverable) continue;
+    if (blockedUids.has(part.uid)) continue;
+    if (swipedUserIds.has(part.uid)) continue;
+    if (activeMemberUidsInEvent.has(part.uid)) continue;
+
+    const candidateUser = userMap.get(part.uid);
+    const candidateProfile = profiles[part.uid];
+    if (!candidateUser || candidateUser.accountStatus !== 'active') continue;
+    if (candidateUser.verificationStatus === 'unverified') continue;
+    if (!candidateProfile || candidateProfile.visibility !== 'public_verified_students') continue;
+    if (onlyFirstTimeHackers && !candidateProfile.isFirstTimeHacker) continue;
+
+    if (roleFilter && roleFilter !== 'ALL') {
+      const hasRole =
+        part.desiredRoles.includes(roleFilter) ||
+        candidateProfile.preferredRoles.includes(roleFilter) ||
+        candidateProfile.rolesWantToLearn.includes(roleFilter);
+      if (!hasRole) continue;
+    }
+
+    if (activeCircleTags && activeCircleTags.length > 0) {
+      const inCircle = candidateProfile.interestTags.some((t) => activeCircleTags.includes(t));
+      if (!inCircle) continue;
+    }
+
+    if (normQuery) {
+      const hay = `${candidateUser.displayName} ${candidateProfile.headline} ${candidateProfile.skillTags.join(' ')} ${candidateProfile.interestTags.join(' ')}`.toLowerCase();
+      if (!hay.includes(normQuery)) continue;
+    }
+
+    count += 1;
+  }
+
+  return count;
+}
+
+/**
+ * Fast O(N) Pass-1 count of eligible Teams without running TF-IDF when on the People tab.
+ */
+export function countEligibleTeamsForHackathon(params: {
+  viewerUid: string;
+  hackathon: Hackathon;
+  teams: Team[];
+  interests: Interest[];
+  blocks: BlockRecord[];
+  activeCircleTags?: string[];
+  roleFilter?: string;
+  searchQuery?: string;
+}): number {
+  const {
+    viewerUid,
+    hackathon,
+    teams,
+    interests,
+    blocks,
+    activeCircleTags,
+    roleFilter,
+    searchQuery,
+  } = params;
+
+  if (!hackathon.matchable) return 0;
+
+  const blockedUids = new Set(
+    blocks
+      .filter((b) => b.blockerUid === viewerUid || b.blockedUid === viewerUid)
+      .map((b) => (b.blockerUid === viewerUid ? b.blockedUid : b.blockerUid))
+  );
+
+  const swipedTeamIds = new Set(
+    interests
+      .filter(
+        (i) => i.hackathonId === hackathon.id && i.fromUid === viewerUid && i.targetType === 'team'
+      )
+      .map((i) => i.targetId)
+  );
+
+  const normQuery = searchQuery?.trim().toLowerCase() ?? '';
+
+  let count = 0;
+  for (let i = 0; i < teams.length; i++) {
+    const team = teams[i];
+    if (team.hackathonId !== hackathon.id) continue;
+    if (team.status !== 'open') continue;
+    if (team.memberCount >= team.targetSize) continue;
+    if (blockedUids.has(team.leaderId)) continue;
+    if (swipedTeamIds.has(team.id)) continue;
+
+    if (roleFilter && roleFilter !== 'ALL') {
+      const inStandardRole = team.rolesNeeded.includes(roleFilter);
+      const inCustomSpec = (team.customSpecializations ?? []).some(
+        (s) => s.toLowerCase() === roleFilter.toLowerCase()
+      );
+      if (!inStandardRole && !inCustomSpec) continue;
+    }
+
+    if (activeCircleTags && activeCircleTags.length > 0) {
+      const inCircle = team.desiredDomains.some((d) => activeCircleTags.includes(d));
+      if (!inCircle) continue;
+    }
+
+    if (normQuery) {
+      const hay = `${team.name} ${team.pitch} ${team.rolesNeeded.join(' ')} ${(team.customSpecializations ?? []).join(' ')}`.toLowerCase();
+      if (!hay.includes(normQuery)) continue;
+    }
+
+    count += 1;
+  }
+
+  return count;
+}
+
+/**
  * Ranks People cards for a viewer within a selected hackathon.
  */
 export function rankPeopleForHackathon(params: {
@@ -306,6 +505,7 @@ export function rankPeopleForHackathon(params: {
   activeCircleTags?: string[];
   roleFilter?: string;
   onlyFirstTimeHackers?: boolean;
+  searchQuery?: string;
 }): { cards: CandidateCard[]; internalScores: Map<string, number> } {
   const {
     viewerUid,
@@ -320,10 +520,16 @@ export function rankPeopleForHackathon(params: {
     activeCircleTags,
     roleFilter,
     onlyFirstTimeHackers,
+    searchQuery,
   } = params;
 
   if (!hackathon.matchable) {
     return { cards: [], internalScores: new Map() };
+  }
+
+  const userMap = new Map<string, User>();
+  for (let i = 0; i < users.length; i++) {
+    userMap.set(users[i].uid, users[i]);
   }
 
   const viewerProfile = profiles[viewerUid];
@@ -354,6 +560,8 @@ export function rankPeopleForHackathon(params: {
       .map((m) => m.uid)
   );
 
+  const normQuery = searchQuery?.trim().toLowerCase() ?? '';
+
   const eligibleParticipations = participations.filter((part) => {
     if (part.hackathonId !== hackathon.id) return false;
     if (part.uid === viewerUid) return false;
@@ -362,7 +570,7 @@ export function rankPeopleForHackathon(params: {
     if (swipedUserIds.has(part.uid)) return false;
     if (activeMemberUidsInEvent.has(part.uid)) return false;
 
-    const candidateUser = users.find((u) => u.uid === part.uid);
+    const candidateUser = userMap.get(part.uid);
     const candidateProfile = profiles[part.uid];
     if (!candidateUser || candidateUser.accountStatus !== 'active') return false;
     if (candidateUser.verificationStatus === 'unverified') return false;
@@ -383,11 +591,18 @@ export function rankPeopleForHackathon(params: {
       if (!inCircle) return false;
     }
 
+    if (normQuery) {
+      const hay = `${candidateUser.displayName} ${candidateProfile.headline} ${candidateProfile.skillTags.join(' ')} ${candidateProfile.interestTags.join(' ')}`.toLowerCase();
+      if (!hay.includes(normQuery)) return false;
+    }
+
     return true;
   });
 
   const buildProfileAbstract = (prof: Profile, part?: Participation): string => {
-    const projText = prof.featuredProjects.map((p) => `${p.title} ${p.description} ${p.tags.join(' ')}`).join(' ');
+    const projText = prof.featuredProjects
+      .map((p) => `${p.title} ${p.description} ${p.tags.join(' ')}`)
+      .join(' ');
     return [
       prof.headline,
       prof.about,
@@ -400,22 +615,41 @@ export function rankPeopleForHackathon(params: {
     ].join(' ');
   };
 
-  const corpusDocs = eligibleParticipations.map((p) => buildProfileAbstract(profiles[p.uid], p));
+  const candidateAbstracts = eligibleParticipations.map((p) =>
+    buildProfileAbstract(profiles[p.uid], p)
+  );
+  const precomputedCorpus = precomputeTfIdfCorpus(candidateAbstracts);
+
   const viewerAbstract = viewerTeam
     ? `${viewerTeam.name} ${viewerTeam.pitch} ${viewerTeam.projectIdea ?? ''} ${viewerTeam.desiredDomains.join(' ')} ${viewerTeam.rolesNeeded.join(' ')} ${(viewerTeam.customSpecializations ?? []).join(' ')}`
     : viewerProfile
     ? buildProfileAbstract(viewerProfile, viewerParticipation)
     : hackathon.themes.join(' ');
 
+  const viewerTokens = tokenizeControlled(viewerAbstract);
+  const viewerCounts = new Map<string, number>();
+  const viewerSet = new Set<string>();
+  for (const t of viewerTokens) {
+    viewerCounts.set(t, (viewerCounts.get(t) ?? 0) + 1);
+    viewerSet.add(t);
+  }
+
   const internalScores = new Map<string, number>();
   const scoredCards: { card: CandidateCard; score: number }[] = [];
 
-  for (const part of eligibleParticipations) {
-    const user = users.find((u) => u.uid === part.uid)!;
+  for (let idx = 0; idx < eligibleParticipations.length; idx++) {
+    const part = eligibleParticipations[idx];
+    const user = userMap.get(part.uid)!;
     const prof = profiles[part.uid]!;
-    const candidateAbstract = buildProfileAbstract(prof, part);
+    const candidateAbstract = candidateAbstracts[idx];
 
-    const tfidfSim = computeTfIdfCosineSimilarity(viewerAbstract, candidateAbstract, corpusDocs);
+    const tfidfSim = computeFastTfIdfCosine(
+      viewerTokens,
+      viewerCounts,
+      viewerSet,
+      candidateAbstract,
+      precomputedCorpus
+    );
 
     const viewerInterests = viewerTeam
       ? viewerTeam.desiredDomains
@@ -606,6 +840,7 @@ export function rankTeamsForHackathon(params: {
   blocks: BlockRecord[];
   activeCircleTags?: string[];
   roleFilter?: string;
+  searchQuery?: string;
 }): CandidateCard[] {
   const {
     viewerUid,
@@ -617,6 +852,7 @@ export function rankTeamsForHackathon(params: {
     blocks,
     activeCircleTags,
     roleFilter,
+    searchQuery,
   } = params;
 
   if (!hackathon.matchable) return [];
@@ -640,6 +876,8 @@ export function rankTeamsForHackathon(params: {
       .map((i) => i.targetId)
   );
 
+  const normQuery = searchQuery?.trim().toLowerCase() ?? '';
+
   const eligibleTeams = teams.filter((team) => {
     if (team.hackathonId !== hackathon.id) return false;
     if (team.status !== 'open') return false;
@@ -660,26 +898,46 @@ export function rankTeamsForHackathon(params: {
       if (!inCircle) return false;
     }
 
+    if (normQuery) {
+      const hay = `${team.name} ${team.pitch} ${team.rolesNeeded.join(' ')} ${(team.customSpecializations ?? []).join(' ')}`.toLowerCase();
+      if (!hay.includes(normQuery)) return false;
+    }
+
     return true;
   });
 
-  const corpusDocs = eligibleTeams.map(
+  const teamDocs = eligibleTeams.map(
     (t) =>
       `${t.name} ${t.pitch} ${t.projectIdea ?? ''} ${t.desiredDomains.join(' ')} ${(
         t.customSpecializations ?? []
       ).join(' ')}`
   );
+  const precomputedCorpus = precomputeTfIdfCorpus(teamDocs);
+
   const viewerDoc = viewerProfile
     ? `${viewerProfile.headline} ${viewerProfile.about} ${viewerProfile.skillTags.join(' ')} ${viewerProfile.interestTags.join(' ')} ${viewerProfile.projectDomains.join(' ')}`
     : hackathon.themes.join(' ');
 
+  const viewerTokens = tokenizeControlled(viewerDoc);
+  const viewerCounts = new Map<string, number>();
+  const viewerSet = new Set<string>();
+  for (const t of viewerTokens) {
+    viewerCounts.set(t, (viewerCounts.get(t) ?? 0) + 1);
+    viewerSet.add(t);
+  }
+
   const scored: { card: CandidateCard; score: number }[] = [];
 
-  for (const team of eligibleTeams) {
-    const teamDoc = `${team.name} ${team.pitch} ${team.projectIdea ?? ''} ${team.desiredDomains.join(' ')} ${(
-      team.customSpecializations ?? []
-    ).join(' ')}`;
-    const tfidfSim = computeTfIdfCosineSimilarity(viewerDoc, teamDoc, corpusDocs);
+  for (let idx = 0; idx < eligibleTeams.length; idx++) {
+    const team = eligibleTeams[idx];
+    const teamDoc = teamDocs[idx];
+    const tfidfSim = computeFastTfIdfCosine(
+      viewerTokens,
+      viewerCounts,
+      viewerSet,
+      teamDoc,
+      precomputedCorpus
+    );
 
     const viewerRoles = Array.from(
       new Set([
@@ -783,3 +1041,4 @@ export function rankTeamsForHackathon(params: {
   scored.sort((a, b) => b.score - a.score);
   return scored.map((s) => s.card);
 }
+

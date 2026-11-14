@@ -681,3 +681,440 @@ test('17. PESU OIDC discovery rejects incomplete OIDC JSON metadata and /api cat
   assert.equal(unknownApiData.ok, false);
 });
 
+test('18. GET /api/health returns 200 JSON and /api/bootstrap contains zero synthetic SEED_* records', async () => {
+  const healthRes = await fetch(`${baseUrl}/api/health`);
+  const contentType = healthRes.headers.get('content-type') ?? '';
+  assert.equal(healthRes.status, 200);
+  assert.ok(contentType.includes('application/json'));
+  const healthData = await healthRes.json();
+  assert.equal(healthData.ok, true);
+  assert.equal(healthData.status, 'healthy');
+
+  const bootRes = await fetch(`${baseUrl}/api/bootstrap`);
+  assert.equal(bootRes.status, 200);
+  const bootData = await bootRes.json();
+  assert.equal(bootData.ok, true);
+  // Ensure no synthetic seed IDs exist in the live PostgreSQL database
+  assert.ok(!bootData.users.some((u: { uid: string }) => u.uid === 'u_solo_arjun'));
+  assert.ok(!bootData.hackathons.some((h: { id: string }) => h.id === 'hack_terrapthon_26'));
+});
+
+test('19. Deterministic GitHub enrichment requires 0 Gemini calls and starts all skills/projects with approved = false', async () => {
+  const { buildDeterministicGitHubDraft } = await import('../src/services/adapters.ts');
+  const draft = buildDeterministicGitHubDraft({
+    uid: 'pesu_pesu_student_007',
+    githubUsername: 'Roshan2607',
+    ghJson: {
+      ok: true,
+      repositories: [
+        {
+          name: 'Quackathon',
+          description: 'PES University Hackathon Team Finder',
+          language: 'TypeScript',
+          topics: ['react', 'postgresql'],
+          htmlUrl: 'https://github.com/Roshan2607/Quackathon',
+          updatedAt: '2026-11-13T00:00:00Z',
+        },
+      ],
+    },
+  });
+
+  assert.equal(draft.isLiveApiResult, true);
+  assert.ok(draft.suggestedSkills.length >= 2);
+  assert.ok(draft.suggestedSkills.every((s) => s.approved === false));
+  assert.ok(draft.suggestedProjects && draft.suggestedProjects.length === 1);
+  assert.equal(draft.suggestedProjects![0].approved, false);
+  assert.equal(draft.suggestedProject?.approved, false);
+});
+
+test('20. Event URL extraction does not fabricate missing team size or misclassify workshops as hackathons', async () => {
+  setServerTestOverrides({
+    fetchFn: async () => {
+      const html = `<!doctype html><html><head><title>Intro to Rust Programming Seminar</title><meta name="description" content="A 2-hour seminar on Rust ownership and borrowing." /></head><body><h1>Intro to Rust Programming Seminar</h1><p>Organizer: PES Open Source Society</p></body></html>`;
+      return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html' } });
+    },
+  });
+
+  const res = await fetch(`${baseUrl}/api/events/extract-url`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: 'https://events.pes.edu/rust-seminar',
+      useGeminiFallback: false,
+    }),
+  });
+  const data = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(data.ok, true);
+  assert.equal(data.data.minTeamSize, null);
+  assert.equal(data.data.maxTeamSize, null);
+  assert.notEqual(data.data.eventType, 'hackathon');
+});
+
+test('21. Multi-user PostgreSQL persistence: PESU session restoration, profile update, event publishing, team creation, join request, and mutual matching + messaging', async () => {
+  const { upsertUserAndProfile, createOAuthSessionRecord } = await import(
+    '../src/db/repository.ts'
+  );
+
+  // Create 3 real users in PostgreSQL (Admin/User A, User B, User C)
+  const uidA = `pesu_test_a_${Date.now()}`;
+  const uidB = `pesu_test_b_${Date.now()}`;
+  const uidC = `pesu_test_c_${Date.now()}`;
+
+  await upsertUserAndProfile({
+    uid: uidA,
+    email: 'alice@pesu.pes.edu',
+    displayName: 'Alice PES',
+    pesuOidcSub: 'PES1UG23CS101',
+    isAdmin: true,
+  });
+  await upsertUserAndProfile({
+    uid: uidB,
+    email: 'bob@pesu.pes.edu',
+    displayName: 'Bob PES',
+    pesuOidcSub: 'PES1UG23CS102',
+    isAdmin: false,
+  });
+  await upsertUserAndProfile({
+    uid: uidC,
+    email: 'charlie@pesu.pes.edu',
+    displayName: 'Charlie PES',
+    pesuOidcSub: 'PES1UG23CS103',
+    isAdmin: false,
+  });
+
+  const tokenA = `pesu_tok_a_${Date.now()}`;
+  const tokenB = `pesu_tok_b_${Date.now()}`;
+  const tokenC = `pesu_tok_c_${Date.now()}`;
+
+  const expiresAt = new Date(Date.now() + 3600_000);
+  await createOAuthSessionRecord({
+    sessionToken: tokenA,
+    uid: uidA,
+    pesuSub: 'PES1UG23CS101',
+    accessToken: 'acc_a',
+    refreshToken: null,
+    scopes: ['openid', 'profile', 'email'],
+    expiresAt,
+  });
+  await createOAuthSessionRecord({
+    sessionToken: tokenB,
+    uid: uidB,
+    pesuSub: 'PES1UG23CS102',
+    accessToken: 'acc_b',
+    refreshToken: null,
+    scopes: ['openid', 'profile', 'email'],
+    expiresAt,
+  });
+  await createOAuthSessionRecord({
+    sessionToken: tokenC,
+    uid: uidC,
+    pesuSub: 'PES1UG23CS103',
+    accessToken: 'acc_c',
+    refreshToken: null,
+    scopes: ['openid', 'profile', 'email'],
+    expiresAt,
+  });
+
+  // 1. Verify /api/auth/session restores User A
+  const sessRes = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Authorization: `Bearer ${tokenA}` },
+  });
+  const sessData = await sessRes.json();
+  assert.equal(sessData.authenticated, true);
+  assert.equal(sessData.user.uid, uidA);
+
+  // 2. Update User A profile via PUT /api/profile
+  const profRes = await fetch(`${baseUrl}/api/profile`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenA}`,
+    },
+    body: JSON.stringify({
+      profile: {
+        headline: 'Distributed Systems & Rust Builder',
+        skillTags: ['Rust', 'TypeScript', 'PostgreSQL'],
+        preferredRoles: ['Backend / APIs'],
+      },
+    }),
+  });
+  const profData = await profRes.json();
+  assert.equal(profRes.status, 200);
+  assert.equal(profData.profile.headline, 'Distributed Systems & Rust Builder');
+
+  // 3. Submit an event candidate & approve it as Admin User A (maxTeamSize = 2)
+  const candRes = await fetch(`${baseUrl}/api/hackathons/candidates`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenB}`,
+    },
+    body: JSON.stringify({
+      source: 'submitted_public_url',
+      sourceUrl: 'https://events.pes.edu/real-hack-2026',
+      originalSubmissionUrl: 'https://events.pes.edu/real-hack-2026',
+      verifiedCanonicalUrl: 'https://events.pes.edu/real-hack-2026',
+      sourceUrlStatus: 'verified_canonical',
+      externalFingerprint: `pes__real_hack_2026__${Date.now()}`,
+      title: 'PES Real Systems Hackathon 2026',
+      organizer: 'PES Innovation Lab',
+      eventType: 'hackathon',
+      matchable: true,
+      themes: ['Systems & Cloud'],
+      description: '24-hour systems hackathon.',
+      startAt: '2026-12-20',
+      endAt: '2026-12-21',
+      registrationDeadline: '2026-12-18',
+      timezone: 'Asia/Kolkata',
+      venue: { campus: 'RR Campus', name: 'MRD Auditorium' },
+      format: 'onsite',
+      teamSize: { min: 1, max: 2 },
+      registrationUrl: 'https://events.pes.edu/real-hack-2026',
+      eligibilityNotes: 'Verified PES students',
+      fieldEvidence: {},
+      classification: {
+        ruleGatePassed: true,
+        mlScore: 1,
+        reason: 'Verified hackathon',
+      },
+      warnings: [],
+    }),
+  });
+  const candData = await candRes.json();
+  assert.equal(candRes.status, 201);
+  const candidateUid = candData.candidate.id;
+
+  // Non-admin User B cannot approve candidate
+  const unauthApprove = await fetch(
+    `${baseUrl}/api/admin/candidates/${candidateUid}/approve`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenB}`,
+      },
+      body: JSON.stringify({}),
+    }
+  );
+  assert.equal(unauthApprove.status, 403);
+
+  // Admin User A approves candidate -> publishes Hackathon with maxTeamSize = 2
+  const approveRes = await fetch(
+    `${baseUrl}/api/admin/candidates/${candidateUid}/approve`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({
+        minTeamSize: 1,
+        maxTeamSize: 2,
+        eventType: 'hackathon',
+        matchable: true,
+        campus: 'RR Campus',
+      }),
+    }
+  );
+  const approveData = await approveRes.json();
+  assert.equal(approveRes.status, 200);
+  const hackathonSlug = approveData.hackathon.id;
+
+  // 4. Mutual Tinder swipe between User A and User B creates a direct_match conversation
+  const swipe1 = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenA}`,
+    },
+    body: JSON.stringify({
+      hackathonId: hackathonSlug,
+      targetType: 'user',
+      targetId: uidB,
+      decision: 'interested',
+    }),
+  });
+  const swipe1Data = await swipe1.json();
+  assert.equal(swipe1.status, 200);
+  assert.equal(swipe1Data.matchedConversation, undefined);
+
+  const swipe2 = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenB}`,
+    },
+    body: JSON.stringify({
+      hackathonId: hackathonSlug,
+      targetType: 'user',
+      targetId: uidA,
+      decision: 'interested',
+      customNote: 'Hey Alice, let us build together!',
+    }),
+  });
+  const swipe2Data = await swipe2.json();
+  assert.equal(swipe2.status, 200);
+  assert.ok(swipe2Data.matchedConversation);
+  const matchConvId = swipe2Data.matchedConversation.id;
+
+  // 5. Messaging in matched conversation succeeds for participant and returns 403 for non-participant User C
+  const msgRes = await fetch(
+    `${baseUrl}/api/conversations/${matchConvId}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({ body: 'Awesome, let us create a team!' }),
+    }
+  );
+  assert.equal(msgRes.status, 201);
+
+  const forbiddenMsgRes = await fetch(
+    `${baseUrl}/api/conversations/${matchConvId}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenC}`,
+      },
+      body: JSON.stringify({ body: 'Intruder message' }),
+    }
+  );
+  assert.equal(forbiddenMsgRes.status, 403);
+
+  // 6. User A creates a team (targetSize 2), User B and User C apply, User A accepts User B -> team becomes full (2/2) and User C's request auto-expires
+  const teamRes = await fetch(`${baseUrl}/api/teams`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenA}`,
+    },
+    body: JSON.stringify({
+      hackathonId: hackathonSlug,
+      name: 'KernelBuilders',
+      pitch: 'Building a zero-copy telemetry engine',
+      rolesNeeded: ['Backend / APIs'],
+      targetSize: 2,
+    }),
+  });
+  const teamData = await teamRes.json();
+  assert.equal(teamRes.status, 201);
+  const teamId = teamData.team.id;
+
+  // Duplicate team creation by User A in same hackathon is rejected with 409
+  const dupTeamRes = await fetch(`${baseUrl}/api/teams`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenA}`,
+    },
+    body: JSON.stringify({
+      hackathonId: hackathonSlug,
+      name: 'SecondTeam',
+      pitch: 'Should fail',
+      rolesNeeded: ['Backend / APIs'],
+      targetSize: 2,
+    }),
+  });
+  assert.equal(dupTeamRes.status, 409);
+
+  // User B and User C swipe right on teamId -> creates join requests
+  const reqBRes = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenB}`,
+    },
+    body: JSON.stringify({
+      hackathonId: hackathonSlug,
+      targetType: 'team',
+      targetId: teamId,
+      decision: 'interested',
+      proposedRole: 'Backend / APIs',
+    }),
+  });
+  const reqBData = await reqBRes.json();
+  const reqBId = reqBData.createdJoinRequest.id;
+
+  const reqCRes = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenC}`,
+    },
+    body: JSON.stringify({
+      hackathonId: hackathonSlug,
+      targetType: 'team',
+      targetId: teamId,
+      decision: 'interested',
+      proposedRole: 'Frontend / UI',
+    }),
+  });
+  const reqCData = await reqCRes.json();
+  const reqCId = reqCData.createdJoinRequest.id;
+
+  // Leader User A accepts User B -> team reaches capacity (2/2)
+  const acceptB = await fetch(
+    `${baseUrl}/api/join-requests/${reqBId}/resolve`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({ decision: 'accept' }),
+    }
+  );
+  const acceptBData = await acceptB.json();
+  assert.equal(acceptB.status, 200);
+  assert.equal(acceptBData.becomesFull, true);
+  assert.equal(acceptBData.newMemberCount, 2);
+
+  // Attempting to accept User C now fails because team is full / request auto-expired
+  const acceptC = await fetch(
+    `${baseUrl}/api/join-requests/${reqCId}/resolve`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({ decision: 'accept' }),
+    }
+  );
+  assert.equal(acceptC.status, 404);
+
+  // Clean up test records from PostgreSQL so live state stays pristine
+  const { db } = await import('../src/db/index.ts');
+  const {
+    users,
+    profiles,
+    oauthSessions,
+    hackathons,
+    eventCandidates,
+    teams,
+    memberships,
+    swipes,
+    joinRequests,
+    conversations,
+    messages,
+  } = await import('../src/db/schema.ts');
+  const { eq, inArray } = await import('drizzle-orm');
+
+  await db.delete(messages).where(eq(messages.conversationUid, matchConvId));
+  await db.delete(conversations).where(eq(conversations.hackathonSlug, hackathonSlug));
+  await db.delete(joinRequests).where(eq(joinRequests.hackathonSlug, hackathonSlug));
+  await db.delete(swipes).where(eq(swipes.hackathonSlug, hackathonSlug));
+  await db.delete(memberships).where(eq(memberships.hackathonSlug, hackathonSlug));
+  await db.delete(teams).where(eq(teams.hackathonSlug, hackathonSlug));
+  await db.delete(hackathons).where(eq(hackathons.slug, hackathonSlug));
+  await db.delete(eventCandidates).where(eq(eventCandidates.candidateUid, candidateUid));
+  await db.delete(oauthSessions).where(inArray(oauthSessions.uid, [uidA, uidB, uidC]));
+  await db.delete(profiles).where(inArray(profiles.uid, [uidA, uidB, uidC]));
+  await db.delete(users).where(inArray(users.uid, [uidA, uidB, uidC]));
+});
+
+
