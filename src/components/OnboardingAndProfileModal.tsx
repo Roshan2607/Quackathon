@@ -28,6 +28,179 @@ import {
 } from '../services/adapters';
 import { Modal } from './Modal';
 
+interface ChipListEditorProps {
+  label: string;
+  hint?: string;
+  placeholder: string;
+  values: string[];
+  onChange: (values: string[]) => void;
+}
+
+/**
+ * Compact chip editor used by the optional profile fields. Keeps the student
+ * UX short: type, press Add, remove with the × on a chip.
+ */
+const ChipListEditor: React.FC<ChipListEditorProps> = ({
+  label,
+  hint,
+  placeholder,
+  values,
+  onChange,
+}) => {
+  const [draft, setDraft] = useState('');
+
+  const addValue = () => {
+    const trimmed = draft.trim();
+    if (
+      trimmed &&
+      !values.some((v) => v.toLowerCase() === trimmed.toLowerCase())
+    ) {
+      onChange([...values, trimmed]);
+      setDraft('');
+    }
+  };
+
+  return (
+    <div>
+      <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+        {label}
+        {hint && (
+          <span className="ml-1 font-normal text-slate-400">{hint}</span>
+        )}
+      </label>
+      {values.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 mb-1.5">
+          {values.map((value) => (
+            <span
+              key={value}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 text-xs font-medium"
+            >
+              {value}
+              <button
+                type="button"
+                onClick={() => onChange(values.filter((v) => v !== value))}
+                className="text-slate-400 hover:text-red-600 cursor-pointer"
+                aria-label={`Remove ${value}`}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              addValue();
+            }
+          }}
+          placeholder={placeholder}
+          className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+        />
+        <button
+          type="button"
+          onClick={addValue}
+          className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+        >
+          Add
+        </button>
+      </div>
+    </div>
+  );
+};
+
+interface PortfolioLink {
+  label: string;
+  url: string;
+}
+
+const PortfolioLinkEditor: React.FC<{
+  links: PortfolioLink[];
+  onChange: (links: PortfolioLink[]) => void;
+}> = ({ links, onChange }) => {
+  const [label, setLabel] = useState('');
+  const [url, setUrl] = useState('');
+
+  const addLink = () => {
+    const trimmedLabel = label.trim();
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) return;
+    onChange([
+      ...links,
+      {
+        label: trimmedLabel || trimmedUrl,
+        url: trimmedUrl,
+      },
+    ]);
+    setLabel('');
+    setUrl('');
+  };
+
+  return (
+    <div>
+      <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+        Portfolio Links
+        <span className="ml-1 font-normal text-slate-400">(Optional)</span>
+      </label>
+      {links.length > 0 && (
+        <div className="space-y-1.5 mb-2">
+          {links.map((link, index) => (
+            <div
+              key={`${link.url}-${index}`}
+              className="flex items-center justify-between gap-2 text-xs text-slate-600 dark:text-slate-400"
+            >
+              <span className="truncate">
+                <strong className="text-slate-700 dark:text-slate-300">
+                  {link.label}
+                </strong>{' '}
+                · {link.url}
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  onChange(links.filter((_, i) => i !== index))
+                }
+                className="text-slate-400 hover:text-red-600 cursor-pointer shrink-0"
+                aria-label="Remove portfolio link"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+          placeholder="Label (e.g. GitHub)"
+          className="w-28 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+        />
+        <input
+          type="url"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://…"
+          className="flex-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+        />
+        <button
+          type="button"
+          onClick={addLink}
+          className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+        >
+          Add
+        </button>
+      </div>
+    </div>
+  );
+};
+
 interface OnboardingAndProfileModalProps {
   currentUser: User;
   profile: Profile;
@@ -121,6 +294,20 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     User['privacyPreferences']
   >(currentUser.privacyPreferences);
 
+  // Interest-first profile detail (persisted server-side)
+  const [projectDomains, setProjectDomains] = useState<string[]>(
+    initial.projectDomains ?? []
+  );
+  const [topicsToExplore, setTopicsToExplore] = useState<string[]>(
+    initial.topicsToExplore ?? []
+  );
+  const [hackathonGoals, setHackathonGoals] = useState<string[]>(
+    initial.hackathonGoals ?? []
+  );
+  const [portfolioLinks, setPortfolioLinks] = useState<
+    { label: string; url: string }[]
+  >(initial.portfolioLinks ?? []);
+
   useEffect(() => {
     setHeadline(profile.headline);
     setInterestTags(profile.interestTags);
@@ -135,6 +322,10 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     setIsFirstTimeHacker(Boolean(profile.isFirstTimeHacker));
     setVisibility(profile.visibility);
     setPrivacyPreferences(currentUser.privacyPreferences);
+    setProjectDomains(profile.projectDomains ?? []);
+    setTopicsToExplore(profile.topicsToExplore ?? []);
+    setHackathonGoals(profile.hackathonGoals ?? []);
+    setPortfolioLinks(profile.portfolioLinks ?? []);
   }, [currentUser.uid, profile, currentUser.privacyPreferences]);
 
   const toggleItem = (
@@ -202,7 +393,9 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
         if (res.ok && res.draft) {
           setEnrichmentDraft(res.draft);
           onNotify?.(
-            `Fetched ${res.repositories?.length ?? 0} public repositories from GitHub. Select items to include.`
+            `Fetched ${
+              res.rawGitHubPayload?.repositories?.length ?? 0
+            } public repositories from GitHub. Select items to include.`
           );
           return;
         }
@@ -269,7 +462,16 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     setEnrichmentDraft({
       ...enrichmentDraft,
       suggestedProjects: next,
-      suggestedProject: next[0] ?? enrichmentDraft.suggestedProject,
+      suggestedProject: next[0]
+        ? {
+            ...next[0],
+            sourceUrl:
+              next[0].sourceUrl ??
+              (githubUsername.trim()
+                ? `https://github.com/${githubUsername.trim()}`
+                : ''),
+          }
+        : enrichmentDraft.suggestedProject,
     });
   };
 
@@ -328,10 +530,17 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     about: about.trim(),
     interestTags,
     skillTags,
+    // "What I like building" defaults to the selected interests so the
+    // matching engine always has a domain signal.
+    projectDomains:
+      projectDomains.length > 0 ? projectDomains : interestTags,
+    topicsToExplore,
     preferredRoles:
       preferredRoles.length > 0 ? preferredRoles : ['Generalist'],
     rolesWantToLearn,
     workingStyleTags,
+    hackathonGoals,
+    portfolioLinks,
     featuredProjects,
     githubUsername: githubUsername.trim() || undefined,
     icebreakerPrompt: icebreakerPrompt.trim() || undefined,
@@ -886,6 +1095,35 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
                 className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
               />
             </div>
+
+            <ChipListEditor
+              label="What I like building"
+              hint="(Optional)"
+              placeholder="e.g., Real-time transit telemetry"
+              values={projectDomains}
+              onChange={setProjectDomains}
+            />
+
+            <ChipListEditor
+              label="Topics I want to explore"
+              hint="(Optional)"
+              placeholder="e.g., Rust, LLM evaluation"
+              values={topicsToExplore}
+              onChange={setTopicsToExplore}
+            />
+
+            <ChipListEditor
+              label="Hackathon goals"
+              hint="(Optional)"
+              placeholder="e.g., Ship a usable app"
+              values={hackathonGoals}
+              onChange={setHackathonGoals}
+            />
+
+            <PortfolioLinkEditor
+              links={portfolioLinks}
+              onChange={setPortfolioLinks}
+            />
 
             <div className="flex items-center justify-between pt-1">
               <span className="font-semibold text-slate-700 dark:text-slate-300">

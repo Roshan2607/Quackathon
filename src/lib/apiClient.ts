@@ -33,9 +33,39 @@ function createDiagnosticSnippet(rawBody: string, maxLen = 180): string {
     : collapsed;
 }
 
+/**
+ * Options accepted by {@link apiFetch}.
+ *
+ * `body` additionally accepts a plain JavaScript object. Plain objects are
+ * JSON-encoded automatically (and get an `application/json` content type),
+ * which prevents `fetch` from serialising them as the literal string
+ * "[object Object]" and the server from rejecting the payload as malformed
+ * JSON. Explicit `JSON.stringify(...)` calls keep working unchanged.
+ */
+export interface ApiClientOptions extends Omit<RequestInit, 'body'> {
+  timeoutMs?: number;
+  body?: BodyInit | object | null;
+}
+
+function isPlainJsonBody(body: unknown): body is Record<string, unknown> {
+  if (body === null || typeof body !== 'object') return false;
+  if (typeof Blob !== 'undefined' && body instanceof Blob) return false;
+  if (typeof FormData !== 'undefined' && body instanceof FormData) return false;
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams)
+    return false;
+  if (
+    typeof ArrayBuffer !== 'undefined' &&
+    (body instanceof ArrayBuffer || ArrayBuffer.isView(body))
+  )
+    return false;
+  if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream)
+    return false;
+  return true;
+}
+
 export async function apiFetch<T = Record<string, unknown>>(
   path: string,
-  options: RequestInit & { timeoutMs?: number } = {}
+  options: ApiClientOptions = {}
 ): Promise<ApiClientResult<T>> {
   const { timeoutMs = 15000, headers: customHeaders, ...restOptions } = options;
 
@@ -47,7 +77,12 @@ export async function apiFetch<T = Record<string, unknown>>(
     ...(customHeaders as Record<string, string> | undefined),
   };
 
-  if (restOptions.body && !headers['Content-Type']) {
+  const isJsonObjectBody = isPlainJsonBody(restOptions.body);
+  const body: BodyInit | null | undefined = isJsonObjectBody
+    ? JSON.stringify(restOptions.body)
+    : (restOptions.body as BodyInit | null | undefined);
+
+  if (body && !headers['Content-Type']) {
     headers['Content-Type'] = 'application/json';
   }
 
@@ -58,6 +93,7 @@ export async function apiFetch<T = Record<string, unknown>>(
   try {
     const resp = await fetch(path, {
       ...restOptions,
+      body,
       headers,
       credentials: 'include',
       signal: controller.signal,

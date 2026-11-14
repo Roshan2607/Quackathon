@@ -3891,12 +3891,17 @@ app.post(
   async (req: AuthenticatedRequest, res) => {
     try {
       const authUser = req.user!;
-      const { candidate, publishImmediately } = req.body as {
-        candidate?: EventCandidate;
-        publishImmediately?: boolean;
-      };
+      // Accept both the wrapped contract ({ candidate: {...} }) and the flat
+      // contract (the candidate fields at the top level of the request body).
+      const rawBody = (req.body ?? {}) as Record<string, unknown>;
+      const candidate = (
+        rawBody.candidate && typeof rawBody.candidate === 'object'
+          ? rawBody.candidate
+          : rawBody
+      ) as EventCandidate;
+      const publishImmediately = rawBody.publishImmediately === true;
 
-      if (!candidate || !candidate.title?.trim() || !candidate.organizer?.trim()) {
+      if (!candidate.title?.trim() || !candidate.organizer?.trim()) {
         res.status(400).json({
           ok: false,
           error: 'Event title and organizer are required.',
@@ -3946,15 +3951,59 @@ app.post(
     try {
       const authUser = req.user!;
       const candidateUid = String(req.params.candidateUid);
-      const { overrides } = req.body as {
-        overrides?: {
-          minTeamSize: number | null;
-          maxTeamSize: number | null;
-          eventType: EventType;
-          matchable: boolean;
-          campus: CampusType | null;
-        };
-      };
+      // Accept both the wrapped contract ({ overrides: {...} }) and the flat
+      // contract (the override fields at the top level of the request body).
+      const rawBody = (req.body ?? {}) as Record<string, unknown>;
+      const OVERRIDE_KEYS = [
+        'minTeamSize',
+        'maxTeamSize',
+        'eventType',
+        'matchable',
+        'campus',
+      ];
+      const hasFlatOverrides = OVERRIDE_KEYS.some((key) => key in rawBody);
+      const overrideSource = (
+        rawBody.overrides && typeof rawBody.overrides === 'object'
+          ? rawBody.overrides
+          : hasFlatOverrides
+          ? rawBody
+          : undefined
+      ) as
+        | {
+            minTeamSize?: number | null;
+            maxTeamSize?: number | null;
+            eventType?: EventType;
+            matchable?: boolean;
+            campus?: CampusType | null;
+          }
+        | undefined;
+
+      const overrides =
+        overrideSource === undefined
+          ? undefined
+          : ({
+              ...('minTeamSize' in overrideSource
+                ? { minTeamSize: overrideSource.minTeamSize ?? null }
+                : {}),
+              ...('maxTeamSize' in overrideSource
+                ? { maxTeamSize: overrideSource.maxTeamSize ?? null }
+                : {}),
+              ...('eventType' in overrideSource
+                ? { eventType: overrideSource.eventType ?? ('hackathon' as EventType) }
+                : {}),
+              ...('matchable' in overrideSource
+                ? { matchable: overrideSource.matchable ?? true }
+                : {}),
+              ...('campus' in overrideSource
+                ? { campus: overrideSource.campus ?? null }
+                : {}),
+            } as {
+              minTeamSize?: number | null;
+              maxTeamSize?: number | null;
+              eventType?: EventType;
+              matchable?: boolean;
+              campus?: CampusType | null;
+            });
 
       const result = await approveEventCandidateRecord({
         candidateUid,
@@ -4094,6 +4143,7 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
       decision?: 'interested' | 'passed';
       proposedRole?: string;
       note?: string;
+      customNote?: string;
     };
 
     if (
@@ -4116,13 +4166,29 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
       targetId: body.targetId,
       decision: body.decision,
       proposedRole: body.proposedRole,
-      note: body.note,
+      note: body.note ?? body.customNote,
     });
 
-    res.json({
+    // Response contract used by the student UI: `matchedConversation` for a
+    // mutual person match and `createdJoinRequest` for a team application.
+    // The repository-level names are kept as aliases for compatibility.
+    const payload: Record<string, unknown> = {
       ok: true,
-      ...result,
-    });
+      interest: result.interest,
+    };
+    if (result.mutualMatchConversation) {
+      payload.matchedConversation = result.mutualMatchConversation;
+      payload.mutualMatchConversation = result.mutualMatchConversation;
+    }
+    if (result.joinRequest) {
+      payload.createdJoinRequest = result.joinRequest;
+      payload.joinRequest = result.joinRequest;
+    }
+    if (result.initialMessage) {
+      payload.initialMessage = result.initialMessage;
+    }
+
+    res.json(payload);
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('TEAM_FULL:')) {
       res.status(409).json({
@@ -4192,9 +4258,18 @@ app.post(
         decision,
       });
 
+      // Team capacity summary consumed by the student UI.
+      const resolvedTeam = result.updatedTeam;
+
       res.json({
         ok: true,
         ...result,
+        newMemberCount: resolvedTeam?.memberCount ?? null,
+        cap: resolvedTeam?.targetSize ?? null,
+        becomesFull:
+          resolvedTeam !== undefined &&
+          (resolvedTeam.status === 'full' ||
+            resolvedTeam.memberCount >= resolvedTeam.targetSize),
       });
     } catch (error) {
       if (error instanceof Error) {

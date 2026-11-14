@@ -89,21 +89,22 @@ type NavTab =
 
 const GUEST_USER: User = {
   uid: 'guest_unauthenticated',
-  pesPrnOrSrn: 'UNVERIFIED',
   displayName: 'Guest Student',
   personaLabel: 'Sign in with PESU or Google',
   campus: 'RR Campus',
   program: 'PES University',
   graduationYear: 2028,
-  verified: false,
+  verificationStatus: 'unverified',
+  pesuOidcSub: 'UNVERIFIED',
   isAdmin: false,
   createdAt: new Date().toISOString(),
-  lastActiveAt: new Date().toISOString(),
+  accountStatus: 'active',
   privacyPreferences: {
-    showGraduationYear: true,
-    allowTeamInvites: true,
+    profileVisible: false,
+    githubConsent: false,
+    aiEnrichmentConsent: false,
     academyAnnouncementsOptIn: false,
-    consentUpdatedAt: new Date().toISOString(),
+    academyTimetableOptIn: false,
   },
 };
 
@@ -113,9 +114,13 @@ const GUEST_PROFILE: Profile = {
   about: '',
   interestTags: [],
   skillTags: [],
+  projectDomains: [],
+  topicsToExplore: [],
   preferredRoles: ['Generalist'],
   rolesWantToLearn: [],
   workingStyleTags: [],
+  hackathonGoals: [],
+  portfolioLinks: [],
   featuredProjects: [],
   visibility: 'public_verified_students',
   updatedAt: new Date().toISOString(),
@@ -979,7 +984,7 @@ export function App() {
                     </div>
                     <div className="text-[11px] text-slate-500 truncate">
                       {authenticatedUser
-                        ? `${currentUser.pesPrnOrSrn} · ${currentUser.campus}`
+                        ? `${currentUser.personaLabel} · ${currentUser.campus}`
                         : 'Not signed in'}
                     </div>
                   </div>

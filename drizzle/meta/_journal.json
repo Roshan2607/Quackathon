@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1794629819089,
+      "tag": "0000_lucky_pandemic",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1794632108584,
+      "tag": "0001_elite_solo",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794634000000,
+      "tag": "0002_integrity_check_constraints",
+      "breakpoints": true
+    }
+  ]
+}

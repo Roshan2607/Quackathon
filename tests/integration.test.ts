@@ -706,13 +706,15 @@ test('19. Deterministic GitHub enrichment requires 0 Gemini calls and starts all
     githubUsername: 'Roshan2607',
     ghJson: {
       ok: true,
+      live: true,
       repositories: [
         {
           name: 'Quackathon',
+          url: 'https://github.com/Roshan2607/Quackathon',
           description: 'PES University Hackathon Team Finder',
           language: 'TypeScript',
           topics: ['react', 'postgresql'],
-          htmlUrl: 'https://github.com/Roshan2607/Quackathon',
+          stars: 0,
           updatedAt: '2026-11-13T00:00:00Z',
         },
       ],
@@ -855,7 +857,7 @@ test('21. Multi-user PostgreSQL persistence: PESU session restoration, profile u
       sourceUrl: 'https://events.pes.edu/real-hack-2026',
       originalSubmissionUrl: 'https://events.pes.edu/real-hack-2026',
       verifiedCanonicalUrl: 'https://events.pes.edu/real-hack-2026',
-      sourceUrlStatus: 'verified_canonical',
+      sourceUrlStatus: 'verified',
       externalFingerprint: `pes__real_hack_2026__${Date.now()}`,
       title: 'PES Real Systems Hackathon 2026',
       organizer: 'PES Innovation Lab',
@@ -1115,6 +1117,292 @@ test('21. Multi-user PostgreSQL persistence: PESU session restoration, profile u
   await db.delete(oauthSessions).where(inArray(oauthSessions.uid, [uidA, uidB, uidC]));
   await db.delete(profiles).where(inArray(profiles.uid, [uidA, uidB, uidC]));
   await db.delete(users).where(inArray(users.uid, [uidA, uidB, uidC]));
+});
+
+test('22. Profile detail fields (domains, topics to explore, goals, portfolio links) persist in PostgreSQL', async () => {
+  const {
+    upsertUserAndProfile,
+    createOAuthSessionRecord,
+    getUserAndProfileByUid,
+  } = await import('../src/db/repository.ts');
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
+  const { eq, inArray } = await import('drizzle-orm');
+
+  const uid = `pesu_test_profile_${Date.now()}`;
+  const token = `pesu_tok_profile_${Date.now()}`;
+
+  const { profile: createdProfile } = await upsertUserAndProfile({
+    uid,
+    email: 'profile@pesu.pes.edu',
+    displayName: 'Profile Person',
+    pesuOidcSub: 'PES1UG23CS900',
+  });
+
+  // New accounts start from the interest-based defaults.
+  assert.deepEqual(createdProfile.projectDomains, [
+    'Applied AI/ML',
+    'Developer Tools',
+  ]);
+  assert.deepEqual(createdProfile.topicsToExplore, []);
+  assert.deepEqual(createdProfile.hackathonGoals, []);
+  assert.deepEqual(createdProfile.portfolioLinks, []);
+
+  await createOAuthSessionRecord({
+    sessionToken: token,
+    uid,
+    pesuSub: 'PES1UG23CS900',
+    accessToken: null,
+    refreshToken: null,
+    scopes: ['openid', 'profile'],
+    expiresAt: new Date(Date.now() + 3600_000),
+  });
+
+  const updated = {
+    ...createdProfile,
+    projectDomains: ['Transit telemetry', 'Edge vision'],
+    topicsToExplore: ['Rust', 'LLM evaluation'],
+    hackathonGoals: ['Ship a usable app'],
+    portfolioLinks: [
+      { label: 'GitHub', url: 'https://github.com/example' },
+      { label: 'Portfolio', url: 'https://example.dev' },
+    ],
+  };
+
+  const putRes = await fetch(`${baseUrl}/api/profile`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ profile: updated }),
+  });
+  assert.equal(putRes.status, 200);
+  const putData = await putRes.json();
+  assert.deepEqual(putData.profile.projectDomains, [
+    'Transit telemetry',
+    'Edge vision',
+  ]);
+  assert.deepEqual(putData.profile.topicsToExplore, ['Rust', 'LLM evaluation']);
+  assert.deepEqual(putData.profile.hackathonGoals, ['Ship a usable app']);
+  assert.equal(putData.profile.portfolioLinks.length, 2);
+
+  // Read back from PostgreSQL (not from the HTTP response).
+  const stored = await getUserAndProfileByUid(uid);
+  assert.deepEqual(stored?.profile.projectDomains, [
+    'Transit telemetry',
+    'Edge vision',
+  ]);
+  assert.deepEqual(stored?.profile.topicsToExplore, ['Rust', 'LLM evaluation']);
+  assert.deepEqual(stored?.profile.hackathonGoals, ['Ship a usable app']);
+  assert.deepEqual(stored?.profile.portfolioLinks, [
+    { label: 'GitHub', url: 'https://github.com/example' },
+    { label: 'Portfolio', url: 'https://example.dev' },
+  ]);
+
+  // A client that omits the new fields must not wipe the stored values.
+  const partialRes = await fetch(`${baseUrl}/api/profile`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      profile: {
+        ...createdProfile,
+        headline: 'Updated headline only',
+      },
+    }),
+  });
+  assert.equal(partialRes.status, 200);
+  const afterPartial = await getUserAndProfileByUid(uid);
+  assert.equal(afterPartial?.profile.headline, 'Updated headline only');
+  assert.deepEqual(afterPartial?.profile.projectDomains, [
+    'Transit telemetry',
+    'Edge vision',
+  ]);
+  assert.deepEqual(afterPartial?.profile.hackathonGoals, [
+    'Ship a usable app',
+  ]);
+
+  await db.delete(oauthSessions).where(inArray(oauthSessions.uid, [uid]));
+  await db.delete(profiles).where(inArray(profiles.uid, [uid]));
+  await db.delete(users).where(inArray(users.uid, [uid]));
+});
+
+test('23. Concurrent team accepts cannot exceed the maximum team size', async () => {
+  const {
+    upsertUserAndProfile,
+    createOAuthSessionRecord,
+    createPublishedHackathonDirect,
+  } = await import('../src/db/repository.ts');
+  const { db } = await import('../src/db/index.ts');
+  const {
+    users,
+    profiles,
+    oauthSessions,
+    hackathons,
+    teams,
+    memberships,
+    swipes,
+    joinRequests,
+    conversations,
+    messages,
+  } = await import('../src/db/schema.ts');
+  const { eq, inArray } = await import('drizzle-orm');
+
+  const stamp = Date.now();
+  const uidLeader = `pesu_conc_leader_${stamp}`;
+  const uidB = `pesu_conc_b_${stamp}`;
+  const uidC = `pesu_conc_c_${stamp}`;
+  const uids = [uidLeader, uidB, uidC];
+
+  const createUser = async (uid: string, name: string, sub: string) => {
+    await upsertUserAndProfile({
+      uid,
+      email: `${uid}@pesu.pes.edu`,
+      displayName: name,
+      pesuOidcSub: sub,
+      isAdmin: false,
+    });
+    const token = `pesu_tok_${uid}_${stamp}`;
+    await createOAuthSessionRecord({
+      sessionToken: token,
+      uid,
+      pesuSub: sub,
+      accessToken: null,
+      refreshToken: null,
+      scopes: ['openid'],
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+    return token;
+  };
+
+  const tokenLeader = await createUser(uidLeader, 'Leader PES', 'PES1UG23CS200');
+  const tokenB = await createUser(uidB, 'Racer One', 'PES1UG23CS201');
+  const tokenC = await createUser(uidC, 'Racer Two', 'PES1UG23CS202');
+
+  const hackathon = await createPublishedHackathonDirect({
+    name: 'Concurrency Systems Hackathon',
+    organizer: 'PES Innovation Lab',
+    description: 'Capacity enforcement test event.',
+    eventType: 'hackathon',
+    matchable: true,
+    themes: ['Systems/Cloud'],
+    campus: 'RR Campus',
+    venueName: null,
+    format: 'onsite',
+    startAt: '2026-12-20',
+    endAt: '2026-12-21',
+    registrationDeadline: null,
+    minTeamSize: 2,
+    maxTeamSize: 2,
+    registrationUrl: null,
+    verifiedCanonicalUrl: null,
+    sourceUrlStatus: 'verified',
+    createdByUid: uidLeader,
+  });
+
+  // Leader opens a team with exactly one free slot.
+  const teamRes = await fetch(`${baseUrl}/api/teams`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenLeader}`,
+    },
+    body: JSON.stringify({
+      hackathonId: hackathon.id,
+      name: 'CapacityTestTeam',
+      pitch: 'Verifying that a full team stays full.',
+      rolesNeeded: ['Backend / APIs'],
+      targetSize: 2,
+    }),
+  });
+  assert.equal(teamRes.status, 201);
+  const teamData = await teamRes.json();
+  const teamId = teamData.team.id;
+
+  // Two students apply for the single remaining slot.
+  const apply = async (token: string) => {
+    const res = await fetch(`${baseUrl}/api/swipes`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        hackathonId: hackathon.id,
+        targetType: 'team',
+        targetId: teamId,
+        decision: 'interested',
+        proposedRole: 'Backend / APIs',
+      }),
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    return data.createdJoinRequest.id as string;
+  };
+
+  const requestB = await apply(tokenB);
+  const requestC = await apply(tokenC);
+
+  // Both leaders accept at the same time.
+  const resolve = async (requestUid: string) => {
+    const res = await fetch(
+      `${baseUrl}/api/join-requests/${encodeURIComponent(requestUid)}/resolve`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokenLeader}`,
+        },
+        body: JSON.stringify({ decision: 'accept' }),
+      }
+    );
+    return res.status;
+  };
+
+  const [statusB, statusC] = await Promise.all([
+    resolve(requestB),
+    resolve(requestC),
+  ]);
+
+  const statuses = [statusB, statusC].sort();
+  assert.equal(statuses[0], 200, 'exactly one accept must succeed');
+  assert.ok(
+    statuses[1] === 409 || statuses[1] === 404,
+    `the second accept must be rejected, got HTTP ${statuses[1]}`
+  );
+
+  // The team must never exceed its capacity.
+  const teamRows = await db
+    .select()
+    .from(teams)
+    .where(eq(teams.teamSlug, teamId));
+  assert.equal(teamRows[0].memberCount, 2);
+  assert.equal(teamRows[0].status, 'full');
+
+  const membershipRows = await db
+    .select()
+    .from(memberships)
+    .where(eq(memberships.teamSlug, teamId));
+  assert.equal(membershipRows.length, 2);
+
+  // Cleanup
+  await db.delete(messages).where(
+    eq(messages.conversationUid, `team_roster_${teamId}`)
+  );
+  await db.delete(conversations).where(
+    eq(conversations.hackathonSlug, hackathon.id)
+  );
+  await db.delete(joinRequests).where(eq(joinRequests.hackathonSlug, hackathon.id));
+  await db.delete(swipes).where(eq(swipes.hackathonSlug, hackathon.id));
+  await db.delete(memberships).where(eq(memberships.hackathonSlug, hackathon.id));
+  await db.delete(teams).where(eq(teams.hackathonSlug, hackathon.id));
+  await db.delete(hackathons).where(eq(hackathons.slug, hackathon.id));
+  await db.delete(oauthSessions).where(inArray(oauthSessions.uid, uids));
+  await db.delete(profiles).where(inArray(profiles.uid, uids));
+  await db.delete(users).where(inArray(users.uid, uids));
 });
 
 

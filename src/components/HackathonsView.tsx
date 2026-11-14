@@ -3,7 +3,6 @@ import {
   CampusType,
   EventCandidate,
   ExecutionMode,
-  FieldEvidence,
   Hackathon,
   PrivateAcademyHint,
   User,
@@ -28,6 +27,12 @@ import {
 } from '../services/adapters';
 import { apiFetch } from '../lib/apiClient';
 import { Modal } from './Modal';
+
+/**
+ * Per-field extraction evidence: where the value came from and the excerpt
+ * that grounded it. Mirrors `EventCandidate['fieldEvidence']`.
+ */
+type FieldEvidence = { sourceUrl: string; excerpt?: string };
 
 interface HackathonsViewProps {
   currentUser: User;
@@ -82,7 +87,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
     const [description, setDescription] = useState('');
     const [extractedThemes, setExtractedThemes] = useState<string[]>([]);
     const [extractedEvidence, setExtractedEvidence] = useState<
-      Record<string, FieldEvidence>
+      Record<string, FieldEvidence[]>
     >({});
     const [extractedWarnings, setExtractedWarnings] = useState<string[]>([]);
     const [verifiedUrl, setVerifiedUrl] = useState<string | null>(null);
@@ -294,7 +299,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
         originalSubmissionUrl: sourceUrl.trim() || null,
         verifiedCanonicalUrl: verifiedUrl,
         sourceUrlStatus: verifiedUrl
-          ? 'verified_canonical'
+          ? 'verified'
           : sourceUrl.trim()
           ? 'unverified'
           : 'unavailable',

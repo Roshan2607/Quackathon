@@ -73,20 +73,26 @@ export function mapDbProfileToDomain(
 ): Profile {
   const skillTags = safeJsonParse<string[]>(row.skillTagsJson, []);
   const interestTags = safeJsonParse<string[]>(row.interestTagsJson, []);
+  const projectDomains = safeJsonParse<string[]>(row.projectDomainsJson, []);
   return {
     uid: row.uid,
     headline: row.headline,
     about: row.about,
     skillTags,
     interestTags,
-    projectDomains: interestTags,
-    topicsToExplore: [],
+    // "What I like building". Older rows predate the dedicated column, so the
+    // interest tags are used as the initial value instead of an empty list.
+    projectDomains: projectDomains.length > 0 ? projectDomains : interestTags,
+    topicsToExplore: safeJsonParse<string[]>(row.topicsToExploreJson, []),
     preferredRoles: safeJsonParse<string[]>(row.preferredRolesJson, []),
     rolesWantToLearn: safeJsonParse<string[]>(row.rolesWantToLearnJson, []),
     workingStyleTags: safeJsonParse<string[]>(row.workingStyleTagsJson, []),
-    hackathonGoals: [],
+    hackathonGoals: safeJsonParse<string[]>(row.hackathonGoalsJson, []),
     icebreakerPrompt: row.icebreakerPrompt ?? undefined,
-    portfolioLinks: [],
+    portfolioLinks: safeJsonParse<{ label: string; url: string }[]>(
+      row.portfolioLinksJson,
+      []
+    ),
     featuredProjects: safeJsonParse<FeaturedProject[]>(
       row.featuredProjectsJson,
       []
@@ -262,6 +268,13 @@ export async function upsertUserAndProfile(params: {
           about: '',
           skillTagsJson: JSON.stringify([]),
           interestTagsJson: JSON.stringify(['Applied AI/ML', 'Developer Tools']),
+          projectDomainsJson: JSON.stringify([
+            'Applied AI/ML',
+            'Developer Tools',
+          ]),
+          topicsToExploreJson: JSON.stringify([]),
+          hackathonGoalsJson: JSON.stringify([]),
+          portfolioLinksJson: JSON.stringify([]),
           preferredRolesJson: JSON.stringify(['Generalist']),
           rolesWantToLearnJson: JSON.stringify([]),
           workingStyleTagsJson: JSON.stringify(['Fast prototyping']),
@@ -346,7 +359,40 @@ export async function updateUserProfileAndPrivacy(params: {
       .where(eq(schema.users.uid, params.uid))
       .returning();
 
-    const p = params.profile;
+    const p = params.profile as Partial<Profile> & Profile;
+
+    // A client may omit the newer profile fields. In that case the stored
+    // value is preserved instead of being silently reset.
+    const existingProfileRows = await db
+      .select()
+      .from(schema.profiles)
+      .where(eq(schema.profiles.uid, params.uid));
+    const existing = existingProfileRows[0];
+
+    const projectDomainsJson = JSON.stringify(
+      Array.isArray(p.projectDomains)
+        ? p.projectDomains
+        : safeJsonParse<string[]>(existing?.projectDomainsJson, [])
+    );
+    const topicsToExploreJson = JSON.stringify(
+      Array.isArray(p.topicsToExplore)
+        ? p.topicsToExplore
+        : safeJsonParse<string[]>(existing?.topicsToExploreJson, [])
+    );
+    const hackathonGoalsJson = JSON.stringify(
+      Array.isArray(p.hackathonGoals)
+        ? p.hackathonGoals
+        : safeJsonParse<string[]>(existing?.hackathonGoalsJson, [])
+    );
+    const portfolioLinksJson = JSON.stringify(
+      Array.isArray(p.portfolioLinks)
+        ? p.portfolioLinks
+        : safeJsonParse<{ label: string; url: string }[]>(
+            existing?.portfolioLinksJson,
+            []
+          )
+    );
+
     const [updatedProfileRow] = await db
       .insert(schema.profiles)
       .values({
@@ -355,6 +401,10 @@ export async function updateUserProfileAndPrivacy(params: {
         about: p.about,
         skillTagsJson: JSON.stringify(p.skillTags),
         interestTagsJson: JSON.stringify(p.interestTags),
+        projectDomainsJson,
+        topicsToExploreJson,
+        hackathonGoalsJson,
+        portfolioLinksJson,
         preferredRolesJson: JSON.stringify(p.preferredRoles),
         rolesWantToLearnJson: JSON.stringify(p.rolesWantToLearn),
         workingStyleTagsJson: JSON.stringify(p.workingStyleTags),
@@ -372,6 +422,10 @@ export async function updateUserProfileAndPrivacy(params: {
           about: p.about,
           skillTagsJson: JSON.stringify(p.skillTags),
           interestTagsJson: JSON.stringify(p.interestTags),
+          projectDomainsJson,
+          topicsToExploreJson,
+          hackathonGoalsJson,
+          portfolioLinksJson,
           preferredRolesJson: JSON.stringify(p.preferredRoles),
           rolesWantToLearnJson: JSON.stringify(p.rolesWantToLearn),
           workingStyleTagsJson: JSON.stringify(p.workingStyleTags),
@@ -824,11 +878,11 @@ export async function approveEventCandidateRecord(params: {
   candidateUid: string;
   actorUid: string;
   overrides?: {
-    minTeamSize: number | null;
-    maxTeamSize: number | null;
-    eventType: EventType;
-    matchable: boolean;
-    campus: CampusType | null;
+    minTeamSize?: number | null;
+    maxTeamSize?: number | null;
+    eventType?: EventType;
+    matchable?: boolean;
+    campus?: CampusType | null;
   };
 }): Promise<{ hackathon: Hackathon; candidate: EventCandidate }> {
   try {
@@ -842,21 +896,24 @@ export async function approveEventCandidateRecord(params: {
       throw new Error('Event candidate not found.');
     }
 
-    const finalMin =
-      params.overrides !== undefined
-        ? params.overrides.minTeamSize
-        : cand.minTeamSize;
-    const finalMax =
-      params.overrides !== undefined
-        ? params.overrides.maxTeamSize
-        : cand.maxTeamSize;
+    // Overrides are applied per field: an omitted field keeps the candidate's
+    // submitted value, while an explicit `null` is honoured (e.g. "team size
+    // unknown" -> unconfirmed constraints).
+    const hasOverride = (key: string) =>
+      params.overrides !== undefined && key in params.overrides;
+
+    const finalMin = hasOverride('minTeamSize')
+      ? (params.overrides!.minTeamSize ?? null)
+      : cand.minTeamSize;
+    const finalMax = hasOverride('maxTeamSize')
+      ? (params.overrides!.maxTeamSize ?? null)
+      : cand.maxTeamSize;
     const finalType =
       params.overrides?.eventType ?? (cand.eventType as EventType);
     const finalMatchable = params.overrides?.matchable ?? cand.matchable;
-    const finalCampus =
-      params.overrides !== undefined
-        ? params.overrides.campus
-        : (cand.campus as CampusType | null);
+    const finalCampus = hasOverride('campus')
+      ? (params.overrides!.campus ?? null)
+      : ((cand.campus as CampusType | null) ?? null);
 
     const slugBase = cand.title
       .toLowerCase()
@@ -1446,254 +1503,306 @@ export async function resolveJoinRequestRecord(params: {
   updatedConversation?: Conversation;
 }> {
   try {
-    const reqRows = await db
-      .select()
-      .from(schema.joinRequests)
-      .where(eq(schema.joinRequests.requestUid, params.requestUid));
-    const reqRow = reqRows[0];
-    if (!reqRow) {
-      throw new Error('NOT_FOUND: Join request not found.');
-    }
-    if (reqRow.status !== 'pending') {
-      throw new Error(
-        `ALREADY_RESOLVED: Join request is already ${reqRow.status}.`
-      );
-    }
+    // The whole resolution runs inside one transaction. The team row is locked
+    // first (`FOR UPDATE`) and the request row second, which gives every
+    // caller the same lock order and therefore serialises concurrent
+    // accept/reject calls for the same team. The member counter, the
+    // membership row and the request status can no longer disagree, and two
+    // simultaneous accepts can no longer push a team past its maximum size.
+    return await db.transaction(async (tx) => {
+      // 1. Read the request (unlocked) to learn which team it belongs to.
+      const initialReqRows = await tx
+        .select()
+        .from(schema.joinRequests)
+        .where(eq(schema.joinRequests.requestUid, params.requestUid))
+        .limit(1);
+      const initialReq = initialReqRows[0];
+      if (!initialReq) {
+        throw new Error('NOT_FOUND: Join request not found.');
+      }
 
-    const teamRows = await db
-      .select()
-      .from(schema.teams)
-      .where(eq(schema.teams.teamSlug, reqRow.teamSlug));
-    const teamRow = teamRows[0];
-    if (!teamRow) {
-      throw new Error('NOT_FOUND: Team not found.');
-    }
+      // 2. Lock the team row first (consistent lock order avoids deadlocks).
+      const teamRows = await tx
+        .select()
+        .from(schema.teams)
+        .where(eq(schema.teams.teamSlug, initialReq.teamSlug))
+        .for('update');
+      const teamRow = teamRows[0];
+      if (!teamRow) {
+        throw new Error('NOT_FOUND: Team not found.');
+      }
 
-    // Verify actor authorization:
-    // - For an 'application', the team leader must accept/reject
-    // - For an 'invitation', the invited applicant (or team leader) can accept/reject
-    const isAuthorized =
-      (reqRow.direction === 'application' &&
-        teamRow.leaderUid === params.actorUid) ||
-      (reqRow.direction === 'invitation' &&
-        (reqRow.applicantUid === params.actorUid ||
-          teamRow.leaderUid === params.actorUid));
+      // 3. Lock the request row and re-validate its current state.
+      const reqRows = await tx
+        .select()
+        .from(schema.joinRequests)
+        .where(eq(schema.joinRequests.requestUid, params.requestUid))
+        .for('update');
+      const reqRow = reqRows[0];
+      if (!reqRow) {
+        throw new Error('NOT_FOUND: Join request not found.');
+      }
+      if (reqRow.status !== 'pending') {
+        // A request that was auto-expired (e.g. the team reached capacity) no
+        // longer exists as an actionable request, so it is reported as 404.
+        if (reqRow.status === 'expired') {
+          throw new Error('NOT_FOUND: Join request no longer exists.');
+        }
+        throw new Error(
+          `ALREADY_RESOLVED: Join request is already ${reqRow.status}.`
+        );
+      }
 
-    if (!isAuthorized) {
-      throw new Error(
-        'FORBIDDEN: Only the team leader or invited student can resolve this request.'
-      );
-    }
+      // Verify actor authorization:
+      // - For an 'application', the team leader must accept/reject
+      // - For an 'invitation', the invited applicant (or team leader) can accept/reject
+      const isAuthorized =
+        (reqRow.direction === 'application' &&
+          teamRow.leaderUid === params.actorUid) ||
+        (reqRow.direction === 'invitation' &&
+          (reqRow.applicantUid === params.actorUid ||
+            teamRow.leaderUid === params.actorUid));
 
-    const now = new Date();
-    if (params.decision === 'reject') {
-      const [rejectedRow] = await db
+      if (!isAuthorized) {
+        throw new Error(
+          'FORBIDDEN: Only the team leader or invited student can resolve this request.'
+        );
+      }
+
+      const now = new Date();
+      if (params.decision === 'reject') {
+        const [rejectedRow] = await tx
+          .update(schema.joinRequests)
+          .set({ status: 'rejected', resolvedAt: now })
+          .where(eq(schema.joinRequests.requestUid, params.requestUid))
+          .returning();
+
+        return {
+          updatedRequest: {
+            id: rejectedRow.requestUid,
+            hackathonId: rejectedRow.hackathonSlug,
+            teamId: rejectedRow.teamSlug,
+            applicantUid: rejectedRow.applicantUid,
+            initiatorUid: rejectedRow.initiatorUid,
+            proposedRole: rejectedRow.proposedRole,
+            message: rejectedRow.message ?? undefined,
+            direction:
+              (rejectedRow.direction as RequestDirection) || 'application',
+            status: 'rejected',
+            createdAt: rejectedRow.createdAt.toISOString(),
+            resolvedAt: now.toISOString(),
+          },
+        };
+      }
+
+      // Enforce max team size & single-team-per-hackathon constraint
+      const hackRows = await tx
+        .select()
+        .from(schema.hackathons)
+        .where(eq(schema.hackathons.slug, reqRow.hackathonSlug));
+      const hack = hackRows[0];
+      const maxCap =
+        hack?.maxTeamSize != null
+          ? Math.min(teamRow.targetSize, hack.maxTeamSize)
+          : teamRow.targetSize;
+
+      if (teamRow.memberCount >= maxCap || teamRow.status !== 'open') {
+        // The request is marked as expired by the caller (outside this
+        // transaction) so that the marking survives the rollback.
+        throw new Error(
+          `TEAM_FULL: Team "${teamRow.name}" has already reached maximum size (${maxCap}).`
+        );
+      }
+
+      const membershipKey = `${reqRow.hackathonSlug}_${reqRow.applicantUid}`;
+      const existingMember = await tx
+        .select()
+        .from(schema.memberships)
+        .where(
+          and(
+            eq(schema.memberships.membershipKey, membershipKey),
+            eq(schema.memberships.status, 'active')
+          )
+        );
+
+      if (existingMember.length > 0) {
+        throw new Error(
+          'ALREADY_IN_TEAM: Student is already an active member of a team in this hackathon.'
+        );
+      }
+
+      const newCount = teamRow.memberCount + 1;
+      const becomesFull = newCount >= maxCap;
+
+      const [updatedTeamRow] = await tx
+        .update(schema.teams)
+        .set({
+          memberCount: newCount,
+          status: becomesFull ? 'full' : 'open',
+        })
+        .where(eq(schema.teams.teamSlug, teamRow.teamSlug))
+        .returning();
+
+      const [newMemberRow] = await tx
+        .insert(schema.memberships)
+        .values({
+          membershipKey,
+          hackathonSlug: reqRow.hackathonSlug,
+          teamSlug: teamRow.teamSlug,
+          uid: reqRow.applicantUid,
+          role: reqRow.proposedRole,
+          status: 'active',
+        })
+        .returning();
+
+      const [acceptedReqRow] = await tx
         .update(schema.joinRequests)
-        .set({ status: 'rejected', resolvedAt: now })
+        .set({ status: 'accepted', resolvedAt: now })
         .where(eq(schema.joinRequests.requestUid, params.requestUid))
         .returning();
 
-      return {
-        updatedRequest: {
-          id: rejectedRow.requestUid,
-          hackathonId: rejectedRow.hackathonSlug,
-          teamId: rejectedRow.teamSlug,
-          applicantUid: rejectedRow.applicantUid,
-          initiatorUid: rejectedRow.initiatorUid,
-          proposedRole: rejectedRow.proposedRole,
-          message: rejectedRow.message ?? undefined,
-          direction: (rejectedRow.direction as RequestDirection) || 'application',
-          status: 'rejected',
-          createdAt: rejectedRow.createdAt.toISOString(),
-          resolvedAt: now.toISOString(),
-        },
-      };
-    }
+      if (becomesFull) {
+        await tx
+          .update(schema.joinRequests)
+          .set({
+            status: 'expired',
+            resolutionNote: 'Auto-expired because team reached maximum capacity.',
+            resolvedAt: now,
+          })
+          .where(
+            and(
+              eq(schema.joinRequests.teamSlug, teamRow.teamSlug),
+              eq(schema.joinRequests.status, 'pending')
+            )
+          );
+      }
 
-    // Enforce max team size & single-team-per-hackathon constraint
-    const hackRows = await db
-      .select()
-      .from(schema.hackathons)
-      .where(eq(schema.hackathons.slug, reqRow.hackathonSlug));
-    const hack = hackRows[0];
-    const maxCap =
-      hack?.maxTeamSize != null
-        ? Math.min(teamRow.targetSize, hack.maxTeamSize)
-        : teamRow.targetSize;
-
-    if (teamRow.memberCount >= maxCap || teamRow.status !== 'open') {
-      await db
-        .update(schema.joinRequests)
-        .set({
-          status: 'expired',
-          resolutionNote: 'Team reached maximum capacity.',
-          resolvedAt: now,
-        })
-        .where(eq(schema.joinRequests.requestUid, params.requestUid));
-
-      throw new Error(
-        `TEAM_FULL: Team "${teamRow.name}" has already reached maximum size (${maxCap}).`
-      );
-    }
-
-    const membershipKey = `${reqRow.hackathonSlug}_${reqRow.applicantUid}`;
-    const existingMember = await db
-      .select()
-      .from(schema.memberships)
-      .where(
-        and(
-          eq(schema.memberships.membershipKey, membershipKey),
-          eq(schema.memberships.status, 'active')
-        )
-      );
-
-    if (existingMember.length > 0) {
-      throw new Error(
-        'ALREADY_IN_TEAM: Student is already an active member of a team in this hackathon.'
-      );
-    }
-
-    const newCount = teamRow.memberCount + 1;
-    const becomesFull = newCount >= maxCap;
-
-    const [updatedTeamRow] = await db
-      .update(schema.teams)
-      .set({
-        memberCount: newCount,
-        status: becomesFull ? 'full' : 'open',
-      })
-      .where(eq(schema.teams.teamSlug, teamRow.teamSlug))
-      .returning();
-
-    const [newMemberRow] = await db
-      .insert(schema.memberships)
-      .values({
-        membershipKey,
-        hackathonSlug: reqRow.hackathonSlug,
-        teamSlug: teamRow.teamSlug,
-        uid: reqRow.applicantUid,
-        role: reqRow.proposedRole,
-        status: 'active',
-      })
-      .returning();
-
-    const [acceptedReqRow] = await db
-      .update(schema.joinRequests)
-      .set({ status: 'accepted', resolvedAt: now })
-      .where(eq(schema.joinRequests.requestUid, params.requestUid))
-      .returning();
-
-    if (becomesFull) {
-      await db
-        .update(schema.joinRequests)
-        .set({
-          status: 'expired',
-          resolutionNote: 'Auto-expired because team reached maximum capacity.',
-          resolvedAt: now,
-        })
-        .where(
-          and(
-            eq(schema.joinRequests.teamSlug, teamRow.teamSlug),
-            eq(schema.joinRequests.status, 'pending')
-          )
+      // Add new member to team_roster conversation
+      const convRows = await tx
+        .select()
+        .from(schema.conversations)
+        .where(eq(schema.conversations.teamSlug, teamRow.teamSlug));
+      let updatedConversation: Conversation | undefined;
+      if (convRows[0]) {
+        const currentParticipants = safeJsonParse<string[]>(
+          convRows[0].participantUidsJson,
+          []
         );
-    }
+        const nextParticipants = Array.from(
+          new Set([...currentParticipants, reqRow.applicantUid])
+        );
+        const [updatedConvRow] = await tx
+          .update(schema.conversations)
+          .set({
+            participantUidsJson: JSON.stringify(nextParticipants),
+            lastMessageAt: now,
+          })
+          .where(
+            eq(schema.conversations.conversationUid, convRows[0].conversationUid)
+          )
+          .returning();
 
-    // Add new member to team_roster conversation
-    const convRows = await db
-      .select()
-      .from(schema.conversations)
-      .where(eq(schema.conversations.teamSlug, teamRow.teamSlug));
-    let updatedConversation: Conversation | undefined;
-    if (convRows[0]) {
-      const currentParticipants = safeJsonParse<string[]>(
-        convRows[0].participantUidsJson,
+        updatedConversation = {
+          id: updatedConvRow.conversationUid,
+          hackathonId: updatedConvRow.hackathonSlug,
+          type: 'team_roster',
+          title: updatedConvRow.title,
+          participantUids: nextParticipants,
+          teamId: updatedConvRow.teamSlug ?? undefined,
+          createdAt: updatedConvRow.createdAt.toISOString(),
+          lastMessageAt: updatedConvRow.lastMessageAt.toISOString(),
+        };
+      }
+
+      const specs = safeJsonParse<string[]>(
+        updatedTeamRow.customSpecializationsJson,
         []
       );
-      const nextParticipants = Array.from(
-        new Set([...currentParticipants, reqRow.applicantUid])
-      );
-      const [updatedConvRow] = await db
-        .update(schema.conversations)
-        .set({
-          participantUidsJson: JSON.stringify(nextParticipants),
-          lastMessageAt: now,
-        })
-        .where(
-          eq(schema.conversations.conversationUid, convRows[0].conversationUid)
-        )
-        .returning();
 
-      updatedConversation = {
-        id: updatedConvRow.conversationUid,
-        hackathonId: updatedConvRow.hackathonSlug,
-        type: 'team_roster',
-        title: updatedConvRow.title,
-        participantUids: nextParticipants,
-        teamId: updatedConvRow.teamSlug ?? undefined,
-        createdAt: updatedConvRow.createdAt.toISOString(),
-        lastMessageAt: updatedConvRow.lastMessageAt.toISOString(),
+      return {
+        updatedRequest: {
+          id: acceptedReqRow.requestUid,
+          hackathonId: acceptedReqRow.hackathonSlug,
+          teamId: acceptedReqRow.teamSlug,
+          applicantUid: acceptedReqRow.applicantUid,
+          initiatorUid: acceptedReqRow.initiatorUid,
+          proposedRole: acceptedReqRow.proposedRole,
+          message: acceptedReqRow.message ?? undefined,
+          direction:
+            (acceptedReqRow.direction as RequestDirection) || 'application',
+          status: 'accepted',
+          createdAt: acceptedReqRow.createdAt.toISOString(),
+          resolvedAt: now.toISOString(),
+        },
+        updatedTeam: {
+          id: updatedTeamRow.teamSlug,
+          hackathonId: updatedTeamRow.hackathonSlug,
+          leaderId: updatedTeamRow.leaderUid,
+          name: updatedTeamRow.name,
+          pitch: updatedTeamRow.pitch,
+          projectIdea: updatedTeamRow.projectIdea ?? undefined,
+          rolesNeeded: safeJsonParse<string[]>(
+            updatedTeamRow.rolesNeededJson,
+            []
+          ),
+          customSpecializations: specs.length > 0 ? specs : undefined,
+          desiredDomains: safeJsonParse<string[]>(
+            updatedTeamRow.desiredDomainsJson,
+            []
+          ),
+          availabilitySummary: updatedTeamRow.availabilitySummary,
+          workStyleTags: safeJsonParse<string[]>(
+            updatedTeamRow.workStyleTagsJson,
+            []
+          ),
+          targetSize: updatedTeamRow.targetSize,
+          memberCount: updatedTeamRow.memberCount,
+          status:
+            (updatedTeamRow.status as 'open' | 'full' | 'locked') || 'open',
+          visibility: 'public',
+          createdAt: updatedTeamRow.createdAt.toISOString(),
+        },
+        newMembership: {
+          id: newMemberRow.membershipKey,
+          hackathonId: newMemberRow.hackathonSlug,
+          teamId: newMemberRow.teamSlug,
+          uid: newMemberRow.uid,
+          role: newMemberRow.role,
+          joinedAt: newMemberRow.joinedAt.toISOString(),
+          status: 'active',
+        },
+        updatedConversation,
       };
-    }
-
-    const specs = safeJsonParse<string[]>(
-      updatedTeamRow.customSpecializationsJson,
-      []
-    );
-
-    return {
-      updatedRequest: {
-        id: acceptedReqRow.requestUid,
-        hackathonId: acceptedReqRow.hackathonSlug,
-        teamId: acceptedReqRow.teamSlug,
-        applicantUid: acceptedReqRow.applicantUid,
-        initiatorUid: acceptedReqRow.initiatorUid,
-        proposedRole: acceptedReqRow.proposedRole,
-        message: acceptedReqRow.message ?? undefined,
-        direction: (acceptedReqRow.direction as RequestDirection) || 'application',
-        status: 'accepted',
-        createdAt: acceptedReqRow.createdAt.toISOString(),
-        resolvedAt: now.toISOString(),
-      },
-      updatedTeam: {
-        id: updatedTeamRow.teamSlug,
-        hackathonId: updatedTeamRow.hackathonSlug,
-        leaderId: updatedTeamRow.leaderUid,
-        name: updatedTeamRow.name,
-        pitch: updatedTeamRow.pitch,
-        projectIdea: updatedTeamRow.projectIdea ?? undefined,
-        rolesNeeded: safeJsonParse<string[]>(
-          updatedTeamRow.rolesNeededJson,
-          []
-        ),
-        customSpecializations: specs.length > 0 ? specs : undefined,
-        desiredDomains: safeJsonParse<string[]>(
-          updatedTeamRow.desiredDomainsJson,
-          []
-        ),
-        availabilitySummary: updatedTeamRow.availabilitySummary,
-        workStyleTags: safeJsonParse<string[]>(
-          updatedTeamRow.workStyleTagsJson,
-          []
-        ),
-        targetSize: updatedTeamRow.targetSize,
-        memberCount: updatedTeamRow.memberCount,
-        status: (updatedTeamRow.status as 'open' | 'full' | 'locked') || 'open',
-        visibility: 'public',
-        createdAt: updatedTeamRow.createdAt.toISOString(),
-      },
-      newMembership: {
-        id: newMemberRow.membershipKey,
-        hackathonId: newMemberRow.hackathonSlug,
-        teamId: newMemberRow.teamSlug,
-        uid: newMemberRow.uid,
-        role: newMemberRow.role,
-        joinedAt: newMemberRow.joinedAt.toISOString(),
-        status: 'active',
-      },
-      updatedConversation,
-    };
+    });
   } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith('TEAM_FULL:')
+    ) {
+      // The team is full: mark the pending request as expired. This runs
+      // outside the rolled-back transaction so the status is persisted.
+      try {
+        await db
+          .update(schema.joinRequests)
+          .set({
+            status: 'expired',
+            resolutionNote: 'Team reached maximum capacity.',
+            resolvedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(schema.joinRequests.requestUid, params.requestUid),
+              eq(schema.joinRequests.status, 'pending')
+            )
+          );
+      } catch (updateError) {
+        console.error(
+          'Database error while expiring join request for a full team:',
+          updateError
+        );
+      }
+      throw error;
+    }
     console.error('Database error in resolveJoinRequestRecord:', error);
     if (
       error instanceof Error &&

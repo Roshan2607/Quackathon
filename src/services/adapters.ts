@@ -23,6 +23,7 @@ import {
   ExtractEventFileResponse,
   ExtractEventUrlResponse,
   ExtractionMethodUsed,
+  PesuOAuthUrlResponse,
   VerifyUrlResponse,
 } from '../types/apiContracts';
 import { apiFetch } from '../lib/apiClient';
@@ -1147,25 +1148,31 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
     mergedSkillMap.set(s.name.toLowerCase(), { ...s, approved: false });
   }
 
+  const fallbackProjectUrl =
+    detResult.rawGitHubPayload?.profile?.htmlUrl ??
+    `https://github.com/${params.githubUsername}`;
+
   const aiProjects = Array.isArray(extracted.projectSummaries)
     ? extracted.projectSummaries.map((p) => ({
         title: p.title,
         description: p.description,
-        sourceUrl:
-          p.sourceUrl ||
-          detResult.rawGitHubPayload?.profile?.htmlUrl ||
-          `https://github.com/${params.githubUsername}`,
+        sourceUrl: p.sourceUrl || fallbackProjectUrl,
         tags: Array.isArray(p.tags) ? p.tags : [],
         approved: false, // Strictly unapproved by default (Requirement #7)
       }))
-    : detResult.draft.suggestedProjects ?? [];
+    : (detResult.draft.suggestedProjects ?? []).map((p) => ({
+        title: p.title,
+        description: p.description,
+        sourceUrl: p.sourceUrl ?? fallbackProjectUrl,
+        tags: Array.isArray(p.tags) ? p.tags : [],
+        approved: false, // Strictly unapproved by default (Requirement #7)
+      }));
 
   const primaryProject =
     aiProjects[0] ?? {
       ...detResult.draft.suggestedProject,
       approved: false,
     };
-
   return {
     ok: true,
     isLiveApiResult: true,
@@ -1186,4 +1193,55 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
         : [],
     },
   };
+}
+
+export interface PesuOAuthSignInStartResult {
+  ok: boolean;
+  authUrl?: string;
+  state?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Starts the PESU OAuth2 + PKCE authorization-code flow.
+ *
+ * The Express API performs OIDC discovery, PKCE generation and state binding,
+ * and answers with an authorization URL. The caller opens that URL in a popup;
+ * the server performs the code exchange and posts the result back to the
+ * opener window (`PESU_OAUTH_RESULT`).
+ */
+export async function startPesuOAuthSignIn(
+  scopes: string[] = ['openid', 'profile']
+): Promise<PesuOAuthSignInStartResult> {
+  const requestedScopes = scopes.filter(Boolean).length
+    ? scopes.filter(Boolean)
+    : ['openid', 'profile'];
+
+  const res = await apiFetch<PesuOAuthUrlResponse>(
+    `/api/pesu-oauth/url?scope=${encodeURIComponent(requestedScopes.join(' '))}`,
+    { timeoutMs: 20000 }
+  );
+
+  const data = res.data;
+  if (!res.ok || !data || !data.ok) {
+    return {
+      ok: false,
+      errorMessage:
+        data?.userMessage ??
+        res.errorMessage ??
+        'Could not start PESU OAuth2 sign-in.',
+    };
+  }
+
+  const authUrl = data.authorizationUrl ?? data.authUrl;
+  if (!authUrl) {
+    return {
+      ok: false,
+      errorMessage:
+        data.userMessage ??
+        'PESU OAuth2 did not return an authorization URL. Check the server configuration.',
+    };
+  }
+
+  return { ok: true, authUrl, state: data.state };
 }
