@@ -123,7 +123,7 @@ export interface ProfileEvidenceDraft {
   suggestedProjects?: {
     title: string;
     description: string;
-    sourceUrl?: string;
+    sourceUrl: string;
     tags: string[];
     approved: boolean;
   }[];

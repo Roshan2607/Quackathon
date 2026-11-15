@@ -49,35 +49,12 @@ import {
   User,
 } from './types/domain';
 
-// Lazy-loaded route views to reduce initial bundle parse & execution latency
-const DiscoverView = React.lazy(() =>
-  import('./components/DiscoverView').then((m) => ({ default: m.DiscoverView }))
-);
-const HackathonsView = React.lazy(() =>
-  import('./components/HackathonsView').then((m) => ({
-    default: m.HackathonsView,
-  }))
-);
-const MatchesAndChatView = React.lazy(() =>
-  import('./components/MatchesAndChatView').then((m) => ({
-    default: m.MatchesAndChatView,
-  }))
-);
-const OnboardingAndProfileModal = React.lazy(() =>
-  import('./components/OnboardingAndProfileModal').then((m) => ({
-    default: m.OnboardingAndProfileModal,
-  }))
-);
-const AdminReviewQueueView = React.lazy(() =>
-  import('./components/AdminReviewQueueView').then((m) => ({
-    default: m.AdminReviewQueueView,
-  }))
-);
-const IntegrationTestingView = React.lazy(() =>
-  import('./components/IntegrationTestingView').then((m) => ({
-    default: m.IntegrationTestingView,
-  }))
-);
+import { DiscoverView } from './components/DiscoverView';
+import { HackathonsView } from './components/HackathonsView';
+import { MatchesAndChatView } from './components/MatchesAndChatView';
+import { OnboardingAndProfileModal } from './components/OnboardingAndProfileModal';
+import { AdminReviewQueueView } from './components/AdminReviewQueueView';
+import { IntegrationTestingView } from './components/IntegrationTestingView';
 
 type NavTab =
   | 'discover'
@@ -186,6 +163,17 @@ export function App() {
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
+  const pesuPopupRef = useRef<Window | null>(null);
+  const pesuPopupPollRef = useRef<number | null>(null);
+  const activeOAuthStateRef = useRef<string | null>(null);
+  const handledOAuthStatesRef = useRef<Set<string>>(new Set());
+
+  const clearPesuPopupMonitor = useCallback(() => {
+    if (pesuPopupPollRef.current !== null) {
+      window.clearInterval(pesuPopupPollRef.current);
+      pesuPopupPollRef.current = null;
+    }
+  }, []);
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -235,7 +223,7 @@ export function App() {
     }
   }, []);
 
-  const restoreAuthSession = useCallback(async () => {
+  const restoreAuthSession = useCallback(async (): Promise<User | null> => {
     const res = await apiFetch<{
       ok: boolean;
       authenticated: boolean;
@@ -251,38 +239,135 @@ export function App() {
           [res.data!.user!.uid]: res.data!.profile!,
         }));
       }
+      return res.data.user;
     }
+    return null;
   }, []);
 
   useEffect(() => {
     void restoreAuthSession().then(() => refreshBootstrap());
   }, [restoreAuthSession, refreshBootstrap]);
 
-  // Listen for PESU OAuth2 Popup Callback
+  // Listen for PESU OAuth2 Popup Callback, Same-Origin BroadcastChannel, or Redirect Fallback
   useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      if (event.origin !== window.location.origin) return;
-      const data = event.data;
+    const params = new URLSearchParams(window.location.search);
+    const oauthQuery = params.get('pesu_oauth');
+    const queryState = params.get('state') || '';
+    const queryMessage = params.get('message') || '';
+
+    if (oauthQuery === 'complete' || oauthQuery === 'error') {
+      const cleanUrl = window.location.pathname + window.location.hash;
+      window.history.replaceState(null, '', cleanUrl);
+      if (queryState) {
+        handledOAuthStatesRef.current.add(queryState);
+      }
+      setIsSigningIn(false);
+      if (oauthQuery === 'complete') {
+        void restoreAuthSession().then((restoredUser) => {
+          void refreshBootstrap();
+          if (restoredUser) {
+            showToast(`Signed in with PESU as ${restoredUser.displayName}.`);
+          }
+        });
+      } else {
+        showToast(queryMessage || 'PESU OAuth sign-in did not complete.');
+      }
+    }
+
+    const processOAuthResult = (data: Record<string, unknown>) => {
       if (!data || data.type !== 'PESU_OAUTH_RESULT') return;
 
-      if (data.status === 'success') {
-        if (data.sessionToken) {
-          setApiClientAuthToken(String(data.sessionToken));
-        }
-        if (data.user) {
+      const stateStr = typeof data.state === 'string' ? data.state : '';
+      const expectedState =
+        activeOAuthStateRef.current ||
+        (() => {
+          try {
+            return sessionStorage.getItem('quackathon_oauth_state');
+          } catch {
+            return null;
+          }
+        })();
+
+      if (expectedState && stateStr && stateStr !== expectedState) {
+        return;
+      }
+
+      if (stateStr && handledOAuthStatesRef.current.has(stateStr)) {
+        return;
+      }
+      if (stateStr) {
+        handledOAuthStatesRef.current.add(stateStr);
+      }
+
+      clearPesuPopupMonitor();
+      setIsSigningIn(false);
+      activeOAuthStateRef.current = null;
+
+      const isSuccess = data.status === 'success' && data.ok !== false;
+      if (isSuccess) {
+        if (data.user && typeof data.user === 'object') {
           setAuthenticatedUser(data.user as User);
         }
-        void restoreAuthSession().then(() => refreshBootstrap());
-        showToast(
-          `Signed in with PESU as ${data.profile?.name || data.user?.displayName || 'Verified Student'}.`
-        );
+        void restoreAuthSession().then((restoredUser) => {
+          void refreshBootstrap();
+          const identityObj =
+            data.identity && typeof data.identity === 'object'
+              ? (data.identity as { name?: string })
+              : null;
+          const userObj =
+            data.user && typeof data.user === 'object'
+              ? (data.user as { displayName?: string })
+              : null;
+          const displayLabel =
+            restoredUser?.displayName ||
+            identityObj?.name ||
+            userObj?.displayName ||
+            'Verified Student';
+          showToast(`Signed in with PESU as ${displayLabel}.`);
+        });
       } else {
-        showToast(data.error || 'PESU OAuth sign-in did not complete.');
+        const errMsg =
+          (typeof data.error === 'string' && data.error) ||
+          (typeof data.userMessage === 'string' && data.userMessage) ||
+          'PESU OAuth sign-in failed.';
+        showToast(errMsg);
       }
     };
+
+    const handleMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data && typeof event.data === 'object') {
+        processOAuthResult(event.data as Record<string, unknown>);
+      }
+    };
+
     window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, [restoreAuthSession, refreshBootstrap, showToast]);
+
+    let bc: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        bc = new BroadcastChannel('quackathon_pesu_oauth');
+        bc.onmessage = (ev: MessageEvent) => {
+          if (ev.data && typeof ev.data === 'object') {
+            processOAuthResult(ev.data as Record<string, unknown>);
+          }
+        };
+      }
+    } catch {
+      // BroadcastChannel optional
+    }
+
+    return () => {
+      window.removeEventListener('message', handleMessage);
+      if (bc) {
+        try {
+          bc.close();
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, [clearPesuPopupMonitor, restoreAuthSession, refreshBootstrap, showToast]);
 
   // Sync URL hash for routes
   useEffect(() => {
@@ -328,22 +413,89 @@ export function App() {
 
   // Authentication Handlers
   const handleSignInWithPesu = useCallback(async () => {
+    // Prevent duplicate login launches if a popup is already open or a request is in flight
+    if (pesuPopupRef.current && !pesuPopupRef.current.closed) {
+      pesuPopupRef.current.focus();
+      return;
+    }
+    if (isSigningIn) {
+      return;
+    }
+
     setIsSigningIn(true);
+    clearPesuPopupMonitor();
+
     try {
       const res = await startPesuOAuthSignIn(['openid', 'profile', 'email']);
       if (!res.ok || !res.authUrl) {
+        setIsSigningIn(false);
         showToast(res.errorMessage || 'Could not start PESU OAuth2 sign-in.');
         return;
       }
-      window.open(
+
+      if (res.state) {
+        activeOAuthStateRef.current = res.state;
+        try {
+          sessionStorage.setItem('quackathon_oauth_state', res.state);
+        } catch {
+          // ignore storage error
+        }
+      }
+
+      const popup = window.open(
         res.authUrl,
         'pesu_oauth_popup',
         'width=520,height=660,menubar=no,toolbar=no'
       );
-    } finally {
+
+      if (!popup) {
+        setIsSigningIn(false);
+        showToast(
+          'Sign-in popup was blocked by your browser. Please allow popups for this site and try again.'
+        );
+        return;
+      }
+
+      pesuPopupRef.current = popup;
+      const launchedState = res.state || '';
+
+      // Monitor popup closure to distinguish user cancellation from completed/failed callback
+      pesuPopupPollRef.current = window.setInterval(() => {
+        if (!pesuPopupRef.current || pesuPopupRef.current.closed) {
+          clearPesuPopupMonitor();
+          pesuPopupRef.current = null;
+          window.setTimeout(async () => {
+            if (
+              launchedState &&
+              handledOAuthStatesRef.current.has(launchedState)
+            ) {
+              return;
+            }
+            const restored = await restoreAuthSession();
+            setIsSigningIn(false);
+            if (restored) {
+              if (launchedState) {
+                handledOAuthStatesRef.current.add(launchedState);
+              }
+              await refreshBootstrap();
+              showToast(`Signed in with PESU as ${restored.displayName}.`);
+            } else {
+              showToast('PESU sign-in was cancelled before completion.');
+            }
+          }, 450);
+        }
+      }, 450);
+    } catch {
       setIsSigningIn(false);
+      showToast('Could not start PESU OAuth2 sign-in.');
     }
-  }, [showToast]);
+  }, [
+    clearPesuPopupMonitor,
+    isSigningIn,
+    refreshBootstrap,
+    restoreAuthSession,
+    showToast,
+  ]);
 
   const handleSignInWithGoogle = useCallback(async () => {
     setIsSigningIn(true);

@@ -2,19 +2,35 @@ import { Request, Response, NextFunction } from 'express';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import {
   getUserAndProfileByUid,
+  getValidOAuthSessionByInitiatingSessionId,
   getValidOAuthSessionRecord,
   upsertUserAndProfile,
 } from '../db/repository.ts';
+import {
+  SESSION_COOKIE_NAME,
+  verifySignedSessionCookie,
+} from '../lib/crypto.ts';
 
 export interface AuthenticatedRequest extends Request {
   user?: {
     uid: string;
     email?: string;
     name?: string;
+    verificationStatus: 'verified_pesu_oidc' | 'pilot_invite' | 'unverified';
     isAdmin?: boolean;
     authSource: 'firebase' | 'pesu_oauth';
     pesuSessionToken?: string;
   };
+}
+
+let customFirebaseVerifierForTest:
+  | ((token: string) => Promise<{ uid: string; email?: string; name?: string }>)
+  | null = null;
+
+export function setFirebaseTokenVerifierForTest(
+  fn: ((token: string) => Promise<{ uid: string; email?: string; name?: string }>) | null
+) {
+  customFirebaseVerifierForTest = fn;
 }
 
 function parseCookieHeader(cookieHeader: string | undefined): Record<string, string> {
@@ -33,7 +49,8 @@ function parseCookieHeader(cookieHeader: string | undefined): Record<string, str
 
 /**
  * Resolves the authenticated user from either:
- * 1. `Authorization: Bearer pesu_<session_token>` or `quackathon_oauth_token` cookie (PESU OAuth2 persistent session)
+ * 1. `Authorization: Bearer pesu_<session_token>`, `quackathon_oauth_token` cookie,
+ *    or signed `quackathon_oauth_sid` cookie correlated with a persistent PESU OAuth2 session
  * 2. `Authorization: Bearer <firebase_id_token>` (Firebase Auth Google Sign-In)
  */
 export async function resolveOptionalUser(
@@ -52,9 +69,15 @@ export async function resolveOptionalUser(
       ? rawBearer
       : cookies['quackathon_oauth_token'] || '';
 
-  if (pesuToken) {
+  const signedSid = verifySignedSessionCookie(cookies[SESSION_COOKIE_NAME]);
+
+  if (pesuToken || signedSid) {
     try {
-      const oauthSess = await getValidOAuthSessionRecord(pesuToken);
+      const oauthSess = pesuToken
+        ? await getValidOAuthSessionRecord(pesuToken)
+        : signedSid
+        ? await getValidOAuthSessionByInitiatingSessionId(signedSid)
+        : null;
       if (oauthSess) {
         const record = await getUserAndProfileByUid(oauthSess.uid);
         if (record) {
@@ -62,9 +85,10 @@ export async function resolveOptionalUser(
             uid: record.user.uid,
             email: undefined,
             name: record.user.displayName,
+            verificationStatus: record.user.verificationStatus,
             isAdmin: Boolean(record.user.isAdmin),
             authSource: 'pesu_oauth',
-            pesuSessionToken: pesuToken,
+            pesuSessionToken: pesuToken || signedSid || undefined,
           };
           req.user = authUser;
           return authUser;
@@ -77,21 +101,28 @@ export async function resolveOptionalUser(
 
   if (rawBearer && !rawBearer.startsWith('pesu_')) {
     try {
-      const decoded = await adminAuth.verifyIdToken(rawBearer);
-      const email = decoded.email ?? `${decoded.uid}@pesu.pes.edu`;
+      const decoded = customFirebaseVerifierForTest
+        ? await customFirebaseVerifierForTest(rawBearer)
+        : await adminAuth.verifyIdToken(rawBearer);
+      const email = decoded.email ?? `${decoded.uid}@external.auth`;
       const displayName =
-        decoded.name ?? email.split('@')[0] ?? 'PES Student';
+        decoded.name ?? email.split('@')[0] ?? 'Authenticated User';
+
+      // IMPORTANT: Firebase-authenticated users are NOT granted PESU-verified status
+      // based on email, domain, or client claims. They remain 'unverified' unless
+      // they have already completed a trusted PESU OIDC verification flow.
       const synced = await upsertUserAndProfile({
         uid: decoded.uid,
         email,
         displayName,
-        pesuOidcSub: `firebase_${decoded.uid}`,
-        verificationStatus: 'verified_pesu_oidc',
+        pesuOidcSub: 'UNVERIFIED',
+        verificationStatus: 'unverified',
       });
       const authUser: AuthenticatedRequest['user'] = {
         uid: synced.user.uid,
         email,
         name: synced.user.displayName,
+        verificationStatus: synced.user.verificationStatus,
         isAdmin: Boolean(synced.user.isAdmin),
         authSource: 'firebase',
       };
@@ -117,6 +148,34 @@ export async function requireAuth(
       errorCategory: 'AUTH_ERROR',
       error: 'Authentication required. Please sign in with PESU OAuth2 or Google.',
       userMessage: 'Please sign in with PESU OAuth2 or Google to perform this action.',
+    });
+    return;
+  }
+  next();
+}
+
+export async function requireVerifiedStudent(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) {
+  const user = await resolveOptionalUser(req);
+  if (!user) {
+    res.status(401).json({
+      ok: false,
+      errorCategory: 'AUTH_ERROR',
+      error: 'Authentication required.',
+      userMessage: 'Please sign in with PESU OAuth2 to perform this action.',
+    });
+    return;
+  }
+  if (user.verificationStatus !== 'verified_pesu_oidc' && !user.isAdmin) {
+    res.status(403).json({
+      ok: false,
+      errorCategory: 'STUDENT_VERIFICATION_REQUIRED',
+      error: 'Forbidden: PESU-verified student identity required.',
+      userMessage:
+        'This action requires a verified PESU student identity. Please verify via PESU OAuth2.',
     });
     return;
   }

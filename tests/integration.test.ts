@@ -35,6 +35,12 @@ test.after(async () => {
   await new Promise<void>((resolve) => {
     serverInstance.close(() => resolve());
   });
+  try {
+    const { pool } = await import('../src/db/index.ts');
+    await pool.end();
+  } catch {
+    // ignore pool shutdown errors
+  }
 });
 
 test('1. Missing OAuth client ID returns 400 MISSING_CONFIG and stages.configuration = missing_client_id', async () => {
@@ -1405,12 +1411,548 @@ test('23. Concurrent team accepts cannot exceed the maximum team size', async ()
   );
   await db.delete(joinRequests).where(eq(joinRequests.hackathonSlug, hackathon.id));
   await db.delete(swipes).where(eq(swipes.hackathonSlug, hackathon.id));
-  await db.delete(memberships).where(eq(memberships.hackathonSlug, hackathon.id));
+  await db.delete(memberships).where(eq(memberships.teamSlug, teamId));
   await db.delete(teams).where(eq(teams.hackathonSlug, hackathon.id));
   await db.delete(hackathons).where(eq(hackathons.slug, hackathon.id));
   await db.delete(oauthSessions).where(inArray(oauthSessions.uid, uids));
   await db.delete(profiles).where(inArray(profiles.uid, uids));
   await db.delete(users).where(inArray(users.uid, uids));
 });
+
+test('24. OAuth state persists in PostgreSQL across server restarts / multi-instance callbacks, enforces single-use replay & expiry protection, and never leaks tokens in postMessage', async () => {
+  const { clearInMemoryOAuthStoresForTest } = await import('../server.ts');
+  const { createOAuthTransactionRecord } = await import('../src/db/repository.ts');
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions, oauthTransactions } = await import(
+    '../src/db/schema.ts'
+  );
+  const { eq } = await import('drizzle-orm');
+
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_client_multi';
+  process.env.PESU_OAUTH_CLIENT_SECRET = 'secret_multi_instance_key';
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url === 'https://oauth.pesu.mock/token') {
+        const idToken = createBase64UrlJwt({
+          iss: 'https://oauth.pesu.mock',
+          aud: 'test_pesu_client_multi',
+          sub: 'pesu_multi_inst_user',
+          name: 'Multi Instance Student',
+          email: 'multi@pesu.pes.edu',
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        });
+        return new Response(
+          JSON.stringify({
+            access_token: 'provider_access_token_never_leak',
+            refresh_token: 'provider_refresh_token_never_leak',
+            token_type: 'Bearer',
+            expires_in: 3600,
+            scope: 'openid profile email',
+            id_token: idToken,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url === 'https://oauth.pesu.mock/userinfo') {
+        return new Response(
+          JSON.stringify({
+            sub: 'pesu_multi_inst_user',
+            name: 'Multi Instance Student',
+            email: 'multi@pesu.pes.edu',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  // 1. Start OAuth flow on Instance 1
+  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const setCookieHeader = urlRes.headers.get('set-cookie') ?? '';
+  const sidCookie = setCookieHeader.split(';')[0];
+  const urlData = await urlRes.json();
+  assert.equal(urlRes.status, 200);
+  assert.ok(urlData.state);
+
+  // 2. Simulate server restart / callback arriving on Instance 2 with empty in-memory maps
+  clearInMemoryOAuthStoresForTest();
+
+  // 3. Callback still succeeds because transaction is stored in PostgreSQL
+  const cbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=auth_code_multi_1&state=${encodeURIComponent(
+      urlData.state
+    )}`
+  );
+  const cbHtml = await cbRes.text();
+  assert.equal(cbRes.status, 200);
+  assert.ok(cbHtml.includes('"status":"success"'));
+  assert.ok(cbHtml.includes('"ok":true'));
+  assert.ok(!cbHtml.includes('sessionToken'), 'Bearer sessionToken must never be sent via postMessage');
+  assert.ok(!cbHtml.includes('provider_access_token_never_leak'));
+  assert.ok(!cbHtml.includes('provider_refresh_token_never_leak'));
+
+  // 4. Verify initiating window with only quackathon_sid cookie restores authenticated session from PostgreSQL
+  clearInMemoryOAuthStoresForTest();
+  const authSessRes = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Cookie: sidCookie },
+  });
+  const authSessData = await authSessRes.json();
+  assert.equal(authSessData.authenticated, true);
+  assert.equal(authSessData.user.uid, 'pesu_pesu_multi_inst_user');
+  assert.equal(authSessData.sessionToken, undefined);
+
+  // 5. Replaying the same state parameter a second time is rejected (one-time consumption)
+  const replayRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=auth_code_multi_1&state=${encodeURIComponent(
+      urlData.state
+    )}`
+  );
+  const replayHtml = await replayRes.text();
+  assert.equal(replayRes.status, 400);
+  assert.ok(replayHtml.includes('OAUTH_STATE_INVALID'));
+  assert.ok(replayHtml.includes('"status":"error"'));
+
+  // 6. Expired state parameter in PostgreSQL is rejected with 400 OAUTH_STATE_INVALID
+  const expiredState = `expired_state_${Date.now()}`;
+  await createOAuthTransactionRecord({
+    state: expiredState,
+    sessionId: 'sess_expired_test',
+    codeVerifier: 'verifier_expired_test_1234567890',
+    redirectUri: `${baseUrl}/auth/pesu/callback`,
+    clientOrigin: baseUrl,
+    scopes: ['openid', 'profile'],
+    issuer: 'https://oauth.pesu.mock',
+    authorizationEndpoint: 'https://oauth.pesu.mock/authorize',
+    tokenEndpoint: 'https://oauth.pesu.mock/token',
+    userinfoEndpoint: null,
+    expiresAt: new Date(Date.now() - 60_000), // Already expired 1 minute ago
+  });
+
+  const expRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=some_code&state=${encodeURIComponent(expiredState)}`
+  );
+  const expHtml = await expRes.text();
+  assert.equal(expRes.status, 400);
+  assert.ok(expHtml.includes('OAUTH_STATE_INVALID'));
+
+  // Cleanup
+  await db
+    .delete(oauthSessions)
+    .where(eq(oauthSessions.uid, 'pesu_pesu_multi_inst_user'));
+  await db.delete(profiles).where(eq(profiles.uid, 'pesu_pesu_multi_inst_user'));
+  await db.delete(users).where(eq(users.uid, 'pesu_pesu_multi_inst_user'));
+  await db.delete(oauthTransactions);
+});
+
+test('25. GitHub fetch paginates across multiple pages (> 100 repos), excludes forks by default, supports includeForks, and makes 0 upfront README calls', async () => {
+  let readmeCalls = 0;
+  const pageUrlsRequested: string[] = [];
+
+  // Create 100 repos on page 1 (95 original, 5 forks) and 35 repos on page 2 (30 original, 5 forks) = 135 total
+  const page1Repos = Array.from({ length: 100 }, (_, i) => ({
+    name: `repo-p1-${i + 1}`,
+    html_url: `https://github.com/manyrepos/repo-p1-${i + 1}`,
+    description: `Description for repo p1 ${i + 1}`,
+    language: i % 2 === 0 ? 'TypeScript' : 'Python',
+    topics: ['hackathon', 'pesu'],
+    stargazers_count: i,
+    fork: i >= 95, // 5 forks on page 1
+    updated_at: '2026-11-14T00:00:00Z',
+  }));
+
+  const page2Repos = Array.from({ length: 35 }, (_, i) => ({
+    name: `repo-p2-${i + 1}`,
+    html_url: `https://github.com/manyrepos/repo-p2-${i + 1}`,
+    description: `Description for repo p2 ${i + 1}`,
+    language: 'Rust',
+    topics: ['systems'],
+    stargazers_count: 10,
+    fork: i >= 30, // 5 forks on page 2
+    updated_at: '2026-11-14T00:00:00Z',
+  }));
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/readme')) {
+        readmeCalls++;
+        return new Response('Should not be called', { status: 500 });
+      }
+      if (url === 'https://api.github.com/users/manyrepos') {
+        return new Response(
+          JSON.stringify({
+            login: 'manyrepos',
+            name: 'Many Repos Builder',
+            bio: 'I have 135 public repositories',
+            public_repos: 135,
+            html_url: 'https://github.com/manyrepos',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/users/manyrepos/repos')) {
+        pageUrlsRequested.push(url);
+        const parsed = new URL(url);
+        const pageParam = parsed.searchParams.get('page');
+        if (pageParam === '1') {
+          return new Response(JSON.stringify(page1Repos), {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+              Link: '<https://api.github.com/user/1/repos?page=2>; rel="next"',
+            },
+          });
+        }
+        if (pageParam === '2') {
+          return new Response(JSON.stringify(page2Repos), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  // 1. Default fetch (includeForks = false): returns 125 original repos + allRepositories (135)
+  const resDefault = await fetch(`${baseUrl}/api/github/fetch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'manyrepos' }),
+  });
+  const dataDefault = await resDefault.json();
+  assert.equal(resDefault.status, 200);
+  assert.equal(dataDefault.ok, true);
+  assert.equal(readmeCalls, 0, 'Must make 0 upfront README calls during repository listing');
+  assert.equal(pageUrlsRequested.length, 2, 'Must paginate across both pages');
+  assert.equal(dataDefault.totalFetchedCount, 135);
+  assert.equal(dataDefault.originalCount, 125);
+  assert.equal(dataDefault.forkCount, 10);
+  assert.equal(dataDefault.repositories.length, 125);
+  assert.equal(dataDefault.allRepositories.length, 135);
+  assert.ok(dataDefault.repositories.every((r: { fork: boolean }) => !r.fork));
+
+  // 2. Fetch with includeForks = true: returns all 135 repos in repositories
+  const resWithForks = await fetch(`${baseUrl}/api/github/fetch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'manyrepos', includeForks: true }),
+  });
+  const dataWithForks = await resWithForks.json();
+  assert.equal(resWithForks.status, 200);
+  assert.equal(dataWithForks.repositories.length, 135);
+});
+
+test('26. Gemini profile extraction accepts selectedRepositories subset and returns polished summaries + suggestedBio', async () => {
+  process.env.GEMINI_API_KEY = 'mock_gemini_key_for_test';
+  let capturedPrompt = '';
+
+  setServerTestOverrides({
+    geminiGenerateFn: async ({ contents }) => {
+      capturedPrompt = String(contents);
+      return {
+        text: JSON.stringify({
+          suggestedSkills: [
+            {
+              name: 'TypeScript',
+              category: 'frontend',
+              confidence: 'high',
+              reason: 'Used in Quackathon',
+            },
+          ],
+          projectSummaries: [
+            {
+              title: 'Quackathon',
+              description:
+                'Full-stack hackathon team finder built with React, Express, and PostgreSQL.',
+              sourceUrl: 'https://github.com/Roshan2607/Quackathon',
+              tags: ['TypeScript', 'PostgreSQL'],
+            },
+          ],
+          suggestedBio:
+            'Full-stack builder focused on TypeScript and PostgreSQL systems.',
+          icebreaker: 'Want to pair on the API layer or frontend UX?',
+          warnings: [],
+        }),
+      };
+    },
+  });
+
+  const res = await fetch(`${baseUrl}/api/gemini/extract-profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      selectedRepositories: [
+        {
+          name: 'Quackathon',
+          url: 'https://github.com/Roshan2607/Quackathon',
+          description: 'Hackathon team finder',
+          language: 'TypeScript',
+          topics: ['react', 'postgresql'],
+        },
+      ],
+    }),
+  });
+  const data = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(data.ok, true);
+  assert.ok(capturedPrompt.includes('selectedRepositories'));
+  assert.equal(data.data.projectSummaries.length, 1);
+  assert.equal(data.data.projectSummaries[0].title, 'Quackathon');
+  assert.ok(data.data.suggestedBio.includes('TypeScript'));
+});
+
+test('27. OAuth transaction lifecycle: pending -> processing -> completed/failed/expired, concurrent duplicate callbacks, same-session idempotency, session mismatch guard, and failed token exchange non-reuse', async () => {
+  const { clearInMemoryOAuthStoresForTest } = await import('../server.ts');
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions, oauthTransactions } = await import(
+    '../src/db/schema.ts'
+  );
+  const { eq } = await import('drizzle-orm');
+
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_lifecycle_client';
+  process.env.PESU_OAUTH_CLIENT_SECRET = 'secret_lifecycle_key';
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  let tokenExchangeCallCount = 0;
+  let shouldFailTokenExchange = false;
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url === 'https://oauth.pesu.mock/token') {
+        tokenExchangeCallCount += 1;
+        // Simulate network latency so concurrent requests overlap while status='processing'
+        await new Promise((resolve) => setTimeout(resolve, 60));
+
+        if (shouldFailTokenExchange) {
+          return new Response(
+            JSON.stringify({
+              error: 'invalid_client',
+              error_description: 'Invalid client credentials',
+            }),
+            { status: 401, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const idToken = createBase64UrlJwt({
+          iss: 'https://oauth.pesu.mock',
+          aud: 'test_pesu_lifecycle_client',
+          sub: 'pesu_lifecycle_user',
+          name: 'Lifecycle Student',
+          email: 'lifecycle@pesu.pes.edu',
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        });
+        return new Response(
+          JSON.stringify({
+            access_token: 'provider_access_token_secret',
+            refresh_token: 'provider_refresh_token_secret',
+            token_type: 'Bearer',
+            expires_in: 3600,
+            scope: 'openid profile email',
+            id_token: idToken,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url === 'https://oauth.pesu.mock/userinfo') {
+        return new Response(
+          JSON.stringify({
+            sub: 'pesu_lifecycle_user',
+            name: 'Lifecycle Student',
+            email: 'lifecycle@pesu.pes.edu',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  // Scenario A (1, 2, 7, 9): Fresh authorization + concurrent duplicate callbacks across instances
+  const urlResA = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookieA = (urlResA.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlDataA = await urlResA.json();
+  assert.equal(urlResA.status, 200);
+  assert.ok(urlDataA.state);
+  assert.ok(sidCookieA.startsWith('quackathon_sid='));
+
+  // Simulate another backend instance handling callbacks
+  clearInMemoryOAuthStoresForTest();
+
+  const callbackUrlA = `${baseUrl}/auth/pesu/callback?code=concurrent_code_1&state=${encodeURIComponent(
+    urlDataA.state
+  )}`;
+
+  // Fire two concurrent callbacks with the exact same state & code
+  const [cbRes1, cbRes2] = await Promise.all([
+    fetch(callbackUrlA, { headers: { Cookie: sidCookieA } }),
+    fetch(callbackUrlA, { headers: { Cookie: sidCookieA } }),
+  ]);
+  const [cbHtml1, cbHtml2] = await Promise.all([cbRes1.text(), cbRes2.text()]);
+
+  assert.equal(cbRes1.status, 200, 'First concurrent callback should succeed');
+  assert.equal(cbRes2.status, 200, 'Second concurrent callback should join and succeed');
+  assert.equal(
+    tokenExchangeCallCount,
+    1,
+    'Provider /token endpoint must be called exactly ONCE for concurrent callbacks'
+  );
+  assert.ok(cbHtml1.includes('"type":"PESU_OAUTH_RESULT"'));
+  assert.ok(cbHtml1.includes('"status":"success"'));
+  assert.ok(cbHtml2.includes('"status":"success"'));
+  assert.ok(
+    cbHtml1.includes('"duplicateCallback":true') || cbHtml2.includes('"duplicateCallback":true'),
+    'One of the concurrent callbacks must be marked duplicateCallback: true'
+  );
+  assert.ok(cbHtml1.includes('BroadcastChannel'), 'Callback HTML should include BroadcastChannel delivery');
+  assert.ok(!cbHtml1.includes('provider_access_token_secret'));
+
+  // Scenario B (3): Callback after a successful login from the SAME authenticated session
+  const sameSessionDupRes = await fetch(callbackUrlA, {
+    headers: { Cookie: sidCookieA },
+  });
+  const sameSessionDupHtml = await sameSessionDupRes.text();
+  assert.equal(
+    sameSessionDupRes.status,
+    200,
+    'Duplicate callback from the same authenticated session should return 200 safely'
+  );
+  assert.ok(sameSessionDupHtml.includes('"status":"success"'));
+  assert.ok(sameSessionDupHtml.includes('"duplicateCallback":true'));
+  assert.ok(sameSessionDupHtml.includes('"callbackOutcome":"duplicate_completed_reused"'));
+  assert.equal(
+    tokenExchangeCallCount,
+    1,
+    'Same-session completed callback must not repeat token exchange'
+  );
+
+  // Scenario C (3): Unauthenticated replay OR replay with different code is rejected
+  const unauthReplayRes = await fetch(callbackUrlA); // No session cookie
+  const unauthReplayHtml = await unauthReplayRes.text();
+  assert.equal(unauthReplayRes.status, 400);
+  assert.ok(unauthReplayHtml.includes('OAUTH_STATE_INVALID'));
+
+  const differentCodeReplayRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=different_code_attack&state=${encodeURIComponent(
+      urlDataA.state
+    )}`,
+    { headers: { Cookie: sidCookieA } }
+  );
+  assert.equal(differentCodeReplayRes.status, 400);
+
+  // Scenario D (8): Session restoration after refresh
+  clearInMemoryOAuthStoresForTest();
+  const restoredAuthRes = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Cookie: sidCookieA },
+  });
+  const restoredAuthData = await restoredAuthRes.json();
+  assert.equal(restoredAuthData.authenticated, true);
+  assert.equal(restoredAuthData.user.uid, 'pesu_pesu_lifecycle_user');
+
+  // Scenario E (5): State belonging to another session is rejected WITHOUT consuming the owner's pending state
+  const urlResOwner = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookieOwner = (urlResOwner.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlDataOwner = await urlResOwner.json();
+
+  const urlResOther = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookieOther = (urlResOther.headers.get('set-cookie') ?? '').split(';')[0];
+
+  // Unrelated session (sidCookieOther) attempts to use urlDataOwner.state
+  const mismatchRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=owner_code_1&state=${encodeURIComponent(
+      urlDataOwner.state
+    )}`,
+    { headers: { Cookie: sidCookieOther } }
+  );
+  const mismatchHtml = await mismatchRes.text();
+  assert.equal(mismatchRes.status, 400);
+  assert.ok(mismatchHtml.includes('OAUTH_STATE_INVALID'));
+  assert.ok(mismatchHtml.includes('"callbackOutcome":"rejected_session_mismatch"'));
+
+  // Owner session (sidCookieOwner) can still complete login with urlDataOwner.state!
+  const ownerSuccessRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=owner_code_1&state=${encodeURIComponent(
+      urlDataOwner.state
+    )}`,
+    { headers: { Cookie: sidCookieOwner } }
+  );
+  assert.equal(ownerSuccessRes.status, 200);
+  assert.equal(tokenExchangeCallCount, 2);
+
+  // Scenario F (6): Failed token exchange marks transaction failed and rejects subsequent reuse
+  shouldFailTokenExchange = true;
+  const urlResFail = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookieFail = (urlResFail.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlDataFail = await urlResFail.json();
+
+  const failCbUrl = `${baseUrl}/auth/pesu/callback?code=fail_code_1&state=${encodeURIComponent(
+    urlDataFail.state
+  )}`;
+  const failRes1 = await fetch(failCbUrl, { headers: { Cookie: sidCookieFail } });
+  const failHtml1 = await failRes1.text();
+  assert.equal(failRes1.status, 502);
+  assert.ok(failHtml1.includes('OAUTH_TOKEN_EXCHANGE_FAILED'));
+  assert.ok(failHtml1.includes('Invalid client credentials'));
+  assert.equal(tokenExchangeCallCount, 3);
+
+  // Reusing the failed state/code is rejected with 400 and does NOT call /token again
+  const failRes2 = await fetch(failCbUrl, { headers: { Cookie: sidCookieFail } });
+  const failHtml2 = await failRes2.text();
+  assert.equal(failRes2.status, 400);
+  assert.ok(failHtml2.includes('OAUTH_STATE_INVALID'));
+  assert.ok(failHtml2.includes('"callbackOutcome":"rejected_failed_previously"'));
+  assert.equal(
+    tokenExchangeCallCount,
+    3,
+    'Failed transaction must not reuse the authorization code on retry'
+  );
+
+  // Cleanup
+  await db
+    .delete(oauthSessions)
+    .where(eq(oauthSessions.uid, 'pesu_pesu_lifecycle_user'));
+  await db.delete(profiles).where(eq(profiles.uid, 'pesu_pesu_lifecycle_user'));
+  await db.delete(users).where(eq(users.uid, 'pesu_pesu_lifecycle_user'));
+  await db.delete(oauthTransactions);
+});
+
+
 
 

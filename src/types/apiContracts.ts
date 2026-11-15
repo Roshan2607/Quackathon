@@ -54,6 +54,11 @@ export interface DeveloperDiagnosticTelemetry {
   retryAttempts: number;
   durationMs: number;
   requestId?: string | null;
+  timestamp?: string;
+  stateFingerprint?: string | null;
+  sessionFingerprint?: string | null;
+  transactionStatus?: string | null;
+  callbackOutcome?: string | null;
   extractionMethod?: ExtractionMethodUsed;
 }
 
@@ -247,7 +252,6 @@ export interface PesuOAuthSessionStatusResponse {
   ok: boolean;
   authenticated: boolean;
   sessionId?: string;
-  sessionToken?: string | null;
   stages: PesuOAuthStageStatuses;
   identity?: PesuVerifiedIdentity | null;
   user?: User | null;
@@ -258,18 +262,36 @@ export interface PesuOAuthSessionStatusResponse {
 
 /**
  * PostMessage payload sent from `/auth/pesu/callback` popup to the exact opener origin.
- * Never carries raw `access_token`, `refresh_token`, `client_secret`, or `code`.
+ * Never carries bearer session tokens, `access_token`, `refresh_token`, `client_secret`, or `code`.
  */
 export interface PesuOAuthCallbackPostMessage {
   type: 'PESU_OAUTH_RESULT';
+  status: 'success' | 'error';
   ok: boolean;
   state: string;
-  sessionToken?: string | null;
+  duplicateCallback?: boolean;
   stages: PesuOAuthStageStatuses;
   identity?: PesuVerifiedIdentity | null;
   user?: User | null;
-  profile?: Profile | null;
+  profile?: (Profile & { name?: string }) | null;
   userMessage: string;
+  error?: string;
   errorCategory?: IntegrationErrorCategory;
   diagnostics: DeveloperDiagnosticTelemetry;
 }
+
+export interface GitHubRepositoryItem {
+  id?: string;
+  fullName?: string;
+  name: string;
+  url?: string;
+  htmlUrl?: string;
+  description: string;
+  language: string | null;
+  topics?: string[];
+  stars?: number;
+  fork?: boolean;
+  updatedAt?: string;
+  readmeExcerpt?: string;
+}
+

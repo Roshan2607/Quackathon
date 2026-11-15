@@ -8,20 +8,26 @@ declare global {
 
 export const createPool = () => {
   if (!global._postgresPool) {
-    const port = Number(process.env.SQL_PORT || 5432);
-    const sslEnabled = /^(1|true|require)$/i.test(
-      (process.env.SQL_SSL || '').trim()
+    const host = process.env.SQL_HOST;
+    const isUnixSocket = Boolean(host && host.trim().startsWith('/'));
+    const isLocalHost = Boolean(
+      host && /^(127\.0\.0\.1|localhost|::1)$/i.test(host.trim())
     );
+    const port = Number(process.env.SQL_PORT || 5432);
+    const sslEnabled =
+      !isUnixSocket &&
+      !isLocalHost &&
+      /^(1|true|require)$/i.test((process.env.SQL_SSL || '').trim());
 
     global._postgresPool = new Pool({
-      host: process.env.SQL_HOST,
-      port,
+      host,
+      ...(isUnixSocket ? {} : { port }),
       user: process.env.SQL_USER,
       password: process.env.SQL_PASSWORD,
       database: process.env.SQL_DB_NAME,
       max: 10,
       connectionTimeoutMillis: 15000,
-      ...(sslEnabled ? { ssl: { rejectUnauthorized: false } } : {}),
+      ssl: sslEnabled ? { rejectUnauthorized: false } : false,
     });
 
     global._postgresPool.on('error', (err) => {
@@ -31,6 +37,6 @@ export const createPool = () => {
   return global._postgresPool;
 };
 
-const pool = createPool();
+export const pool = createPool();
 
 export const db = drizzle(pool, { schema });

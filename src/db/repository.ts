@@ -1,6 +1,11 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, lt, or } from 'drizzle-orm';
 import { db } from './index.ts';
 import * as schema from './schema.ts';
+import {
+  decryptTokenAtRest,
+  encryptTokenAtRest,
+  hashSessionToken,
+} from '../lib/crypto.ts';
 import {
   CampusType,
   CommitmentLevel,
@@ -345,34 +350,83 @@ export async function getUserAndProfileByUid(
 
 export async function updateUserProfileAndPrivacy(params: {
   uid: string;
-  profile: Profile;
-  privacyPreferences: User['privacyPreferences'];
+  profile: Partial<Profile>;
+  privacyPreferences?: Partial<User['privacyPreferences']>;
 }): Promise<{ user: User; profile: Profile }> {
   try {
     const now = new Date();
+    const existingRecord = await getUserAndProfileByUid(params.uid);
+    const existingUser = existingRecord?.user;
+    const existingP = existingRecord?.profile;
+
+    const mergedPrivacy: User['privacyPreferences'] = {
+      ...(existingUser?.privacyPreferences ?? DEFAULT_PRIVACY),
+      ...(params.privacyPreferences ?? {}),
+    };
+
     const [updatedUserRow] = await db
       .update(schema.users)
       .set({
-        privacyPreferencesJson: JSON.stringify(params.privacyPreferences),
+        privacyPreferencesJson: JSON.stringify(mergedPrivacy),
         updatedAt: now,
       })
       .where(eq(schema.users.uid, params.uid))
       .returning();
 
-    const p = params.profile as Partial<Profile> & Profile;
+    const p = params.profile;
 
-    // A client may omit the newer profile fields. In that case the stored
-    // value is preserved instead of being silently reset.
+    // A client may omit fields during partial profile updates. Preserve stored values.
     const existingProfileRows = await db
       .select()
       .from(schema.profiles)
       .where(eq(schema.profiles.uid, params.uid));
     const existing = existingProfileRows[0];
 
+    const headline =
+      typeof p.headline === 'string' && p.headline.trim()
+        ? p.headline.trim()
+        : existingP?.headline ?? 'PES University Builder';
+    const about =
+      typeof p.about === 'string' ? p.about : existingP?.about ?? '';
+    const skillTags = Array.isArray(p.skillTags)
+      ? p.skillTags
+      : existingP?.skillTags ?? [];
+    const interestTags = Array.isArray(p.interestTags)
+      ? p.interestTags
+      : existingP?.interestTags ?? ['Applied AI/ML', 'Developer Tools'];
+    const preferredRoles = Array.isArray(p.preferredRoles)
+      ? p.preferredRoles
+      : existingP?.preferredRoles ?? ['Generalist'];
+    const rolesWantToLearn = Array.isArray(p.rolesWantToLearn)
+      ? p.rolesWantToLearn
+      : existingP?.rolesWantToLearn ?? [];
+    const workingStyleTags = Array.isArray(p.workingStyleTags)
+      ? p.workingStyleTags
+      : existingP?.workingStyleTags ?? ['Fast prototyping'];
+    const featuredProjects = Array.isArray(p.featuredProjects)
+      ? p.featuredProjects
+      : existingP?.featuredProjects ?? [];
+    const githubUsername =
+      p.githubUsername !== undefined
+        ? p.githubUsername || null
+        : existing?.githubUsername ?? null;
+    const icebreakerPrompt =
+      p.icebreakerPrompt !== undefined
+        ? p.icebreakerPrompt || null
+        : existing?.icebreakerPrompt ?? null;
+    const isFirstTimeHacker =
+      p.isFirstTimeHacker !== undefined
+        ? Boolean(p.isFirstTimeHacker)
+        : Boolean(existing?.isFirstTimeHacker);
+    const visibility: Profile['visibility'] =
+      p.visibility === 'hidden' || p.visibility === 'public_verified_students'
+        ? p.visibility
+        : existingP?.visibility ?? 'public_verified_students';
+
     const projectDomainsJson = JSON.stringify(
       Array.isArray(p.projectDomains)
         ? p.projectDomains
-        : safeJsonParse<string[]>(existing?.projectDomainsJson, [])
+        : safeJsonParse<string[]>(existing?.projectDomainsJson, interestTags)
     );
     const topicsToExploreJson = JSON.stringify(
       Array.isArray(p.topicsToExplore)
@@ -397,43 +451,43 @@ export async function updateUserProfileAndPrivacy(params: {
       .insert(schema.profiles)
       .values({
         uid: params.uid,
-        headline: p.headline,
-        about: p.about,
-        skillTagsJson: JSON.stringify(p.skillTags),
-        interestTagsJson: JSON.stringify(p.interestTags),
+        headline,
+        about,
+        skillTagsJson: JSON.stringify(skillTags),
+        interestTagsJson: JSON.stringify(interestTags),
         projectDomainsJson,
         topicsToExploreJson,
         hackathonGoalsJson,
         portfolioLinksJson,
-        preferredRolesJson: JSON.stringify(p.preferredRoles),
-        rolesWantToLearnJson: JSON.stringify(p.rolesWantToLearn),
-        workingStyleTagsJson: JSON.stringify(p.workingStyleTags),
-        featuredProjectsJson: JSON.stringify(p.featuredProjects),
-        githubUsername: p.githubUsername ?? null,
-        icebreakerPrompt: p.icebreakerPrompt ?? null,
-        isFirstTimeHacker: Boolean(p.isFirstTimeHacker),
-        visibility: p.visibility,
+        preferredRolesJson: JSON.stringify(preferredRoles),
+        rolesWantToLearnJson: JSON.stringify(rolesWantToLearn),
+        workingStyleTagsJson: JSON.stringify(workingStyleTags),
+        featuredProjectsJson: JSON.stringify(featuredProjects),
+        githubUsername,
+        icebreakerPrompt,
+        isFirstTimeHacker,
+        visibility,
         updatedAt: now,
       })
       .onConflictDoUpdate({
         target: schema.profiles.uid,
         set: {
-          headline: p.headline,
-          about: p.about,
-          skillTagsJson: JSON.stringify(p.skillTags),
-          interestTagsJson: JSON.stringify(p.interestTags),
+          headline,
+          about,
+          skillTagsJson: JSON.stringify(skillTags),
+          interestTagsJson: JSON.stringify(interestTags),
           projectDomainsJson,
           topicsToExploreJson,
           hackathonGoalsJson,
           portfolioLinksJson,
-          preferredRolesJson: JSON.stringify(p.preferredRoles),
-          rolesWantToLearnJson: JSON.stringify(p.rolesWantToLearn),
-          workingStyleTagsJson: JSON.stringify(p.workingStyleTags),
-          featuredProjectsJson: JSON.stringify(p.featuredProjects),
-          githubUsername: p.githubUsername ?? null,
-          icebreakerPrompt: p.icebreakerPrompt ?? null,
-          isFirstTimeHacker: Boolean(p.isFirstTimeHacker),
-          visibility: p.visibility,
+          preferredRolesJson: JSON.stringify(preferredRoles),
+          rolesWantToLearnJson: JSON.stringify(rolesWantToLearn),
+          workingStyleTagsJson: JSON.stringify(workingStyleTags),
+          featuredProjectsJson: JSON.stringify(featuredProjects),
+          githubUsername,
+          icebreakerPrompt,
+          isFirstTimeHacker,
+          visibility,
           updatedAt: now,
         },
       })
@@ -449,8 +503,527 @@ export async function updateUserProfileAndPrivacy(params: {
   }
 }
 
+export type OAuthTransactionLifecycleStatus =
+  | 'pending'
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'expired';
+
+export interface ClaimedOAuthTransaction {
+  state: string;
+  stateHash: string;
+  codeHash: string | null;
+  initiatingSessionIdHash: string;
+  codeVerifier: string;
+  redirectUri: string;
+  clientOrigin: string | null;
+  scopes: string[];
+  issuer: string;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  userinfoEndpoint: string | null;
+  status: OAuthTransactionLifecycleStatus;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+export interface OAuthTransactionRecordedOutcome {
+  status: OAuthTransactionLifecycleStatus;
+  completedUid: string | null;
+  outcomeStatus: number;
+  outcomeErrorCategory: string;
+  outcomeMessage: string | null;
+  outcomeIdentity: Record<string, unknown> | null;
+}
+
+export async function createOAuthTransactionRecord(params: {
+  state: string;
+  sessionId?: string;
+  initiatingSessionId?: string;
+  codeVerifier: string;
+  redirectUri: string;
+  clientOrigin?: string | null;
+  scopes: string[];
+  issuer: string;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  userinfoEndpoint: string | null;
+  expiresAt: Date;
+}): Promise<void> {
+  try {
+    const stateHash = hashSessionToken(params.state);
+    const rawSid = params.initiatingSessionId ?? params.sessionId ?? '';
+    const initiatingSessionIdHash = hashSessionToken(rawSid);
+    const encryptedVerifier = encryptTokenAtRest(params.codeVerifier);
+    if (!encryptedVerifier) {
+      throw new Error('Failed to encrypt PKCE code_verifier.');
+    }
+
+    const now = new Date();
+    // Best-effort cleanup of old expired transactions (> 1 hour expired) and marking expired rows
+    await db
+      .delete(schema.oauthTransactions)
+      .where(
+        lt(schema.oauthTransactions.expiresAt, new Date(now.getTime() - 3600_000))
+      )
+      .catch(() => {});
+
+    await db
+      .update(schema.oauthTransactions)
+      .set({ status: 'expired', consumed: true })
+      .where(
+        and(
+          lt(schema.oauthTransactions.expiresAt, now),
+          eq(schema.oauthTransactions.status, 'pending')
+        )
+      )
+      .catch(() => {});
+
+    await db.insert(schema.oauthTransactions).values({
+      stateHash,
+      codeHash: null,
+      initiatingSessionIdHash,
+      encryptedCodeVerifier: encryptedVerifier,
+      redirectUri: params.redirectUri,
+      clientOrigin: params.clientOrigin ?? null,
+      scopesJson: JSON.stringify(params.scopes),
+      issuer: params.issuer,
+      authorizationEndpoint: params.authorizationEndpoint,
+      tokenEndpoint: params.tokenEndpoint,
+      userinfoEndpoint: params.userinfoEndpoint,
+      status: 'pending',
+      consumed: false,
+      expiresAt: params.expiresAt,
+    });
+  } catch (error) {
+    console.error('Database error in createOAuthTransactionRecord:', error);
+    throw new Error('Failed to persist OAuth authorization transaction.', {
+      cause: error,
+    });
+  }
+}
+
+export async function claimOrInspectOAuthTransactionRecord(params: {
+  state: string;
+  code?: string | null;
+  incomingSessionId?: string | null;
+  authenticatedUid?: string | null;
+}): Promise<{
+  status:
+    | 'claimed'
+    | 'processing'
+    | 'completed_same_session'
+    | 'failed_previously'
+    | 'session_mismatch'
+    | 'expired'
+    | 'replayed'
+    | 'invalid';
+  transactionStatus: OAuthTransactionLifecycleStatus | 'not_found';
+  transaction: ClaimedOAuthTransaction | null;
+  outcome?: OAuthTransactionRecordedOutcome;
+}> {
+  const rawState = params.state?.trim() ?? '';
+  if (!rawState) {
+    return {
+      status: 'invalid',
+      transactionStatus: 'not_found',
+      transaction: null,
+    };
+  }
+
+  try {
+    const stateHash = hashSessionToken(rawState);
+    const codeHash =
+      params.code && params.code.trim()
+        ? hashSessionToken(params.code.trim())
+        : null;
+    const incomingSidHash =
+      params.incomingSessionId && params.incomingSessionId.trim()
+        ? hashSessionToken(params.incomingSessionId.trim())
+        : null;
+    const now = new Date();
+
+    const existingRows = await db
+      .select()
+      .from(schema.oauthTransactions)
+      .where(eq(schema.oauthTransactions.stateHash, stateHash))
+      .limit(1);
+
+    let row = existingRows[0];
+    if (!row) {
+      return {
+        status: 'invalid',
+        transactionStatus: 'not_found',
+        transaction: null,
+      };
+    }
+
+    // 1. Check expiration before any state transition
+    if (row.expiresAt.getTime() <= now.getTime() || row.status === 'expired') {
+      if (row.status !== 'expired') {
+        await db
+          .update(schema.oauthTransactions)
+          .set({ status: 'expired', consumed: true })
+          .where(eq(schema.oauthTransactions.id, row.id))
+          .catch(() => {});
+      }
+      return {
+        status: 'expired',
+        transactionStatus: 'expired',
+        transaction: null,
+      };
+    }
+
+    // 2. Reject callbacks arriving from a different explicit browser session
+    if (
+      incomingSidHash &&
+      row.initiatingSessionIdHash &&
+      incomingSidHash !== row.initiatingSessionIdHash
+    ) {
+      return {
+        status: 'session_mismatch',
+        transactionStatus:
+          (row.status as OAuthTransactionLifecycleStatus) || 'pending',
+        transaction: null,
+      };
+    }
+
+    // 3. If pending, atomically claim: pending -> processing
+    if (row.status === 'pending' && !row.consumed) {
+      const claimedRows = await db
+        .update(schema.oauthTransactions)
+        .set({
+          status: 'processing',
+          consumed: true,
+          consumedAt: now,
+          codeHash,
+        })
+        .where(
+          and(
+            eq(schema.oauthTransactions.stateHash, stateHash),
+            eq(schema.oauthTransactions.status, 'pending'),
+            eq(schema.oauthTransactions.consumed, false)
+          )
+        )
+        .returning();
+
+      if (claimedRows[0]) {
+        const claimed = claimedRows[0];
+        const decryptedVerifier = decryptTokenAtRest(
+          claimed.encryptedCodeVerifier
+        );
+        if (!decryptedVerifier) {
+          await db
+            .update(schema.oauthTransactions)
+            .set({
+              status: 'failed',
+              completedAt: now,
+              outcomeStatus: 400,
+              outcomeErrorCategory: 'OAUTH_STATE_INVALID',
+              outcomeMessage: 'Failed to decrypt PKCE code verifier.',
+            })
+            .where(eq(schema.oauthTransactions.id, claimed.id))
+            .catch(() => {});
+          return {
+            status: 'invalid',
+            transactionStatus: 'failed',
+            transaction: null,
+          };
+        }
+
+        return {
+          status: 'claimed',
+          transactionStatus: 'processing',
+          transaction: {
+            state: rawState,
+            stateHash: claimed.stateHash,
+            codeHash: claimed.codeHash ?? null,
+            initiatingSessionIdHash: claimed.initiatingSessionIdHash,
+            codeVerifier: decryptedVerifier,
+            redirectUri: claimed.redirectUri,
+            clientOrigin: claimed.clientOrigin ?? null,
+            scopes: safeJsonParse<string[]>(claimed.scopesJson, []),
+            issuer: claimed.issuer,
+            authorizationEndpoint: claimed.authorizationEndpoint,
+            tokenEndpoint: claimed.tokenEndpoint,
+            userinfoEndpoint: claimed.userinfoEndpoint ?? null,
+            status: 'processing',
+            createdAt: claimed.createdAt,
+            expiresAt: claimed.expiresAt,
+          },
+        };
+      }
+
+      // Another concurrent request won the CAS; re-fetch current row state
+      const refreshedRows = await db
+        .select()
+        .from(schema.oauthTransactions)
+        .where(eq(schema.oauthTransactions.stateHash, stateHash))
+        .limit(1);
+      if (!refreshedRows[0]) {
+        return {
+          status: 'invalid',
+          transactionStatus: 'not_found',
+          transaction: null,
+        };
+      }
+      row = refreshedRows[0];
+    }
+
+    const baseTx: ClaimedOAuthTransaction = {
+      state: rawState,
+      stateHash: row.stateHash,
+      codeHash: row.codeHash ?? null,
+      initiatingSessionIdHash: row.initiatingSessionIdHash,
+      codeVerifier: '', // Never expose verifier on already-claimed rows
+      redirectUri: row.redirectUri,
+      clientOrigin: row.clientOrigin ?? null,
+      scopes: safeJsonParse<string[]>(row.scopesJson, []),
+      issuer: row.issuer,
+      authorizationEndpoint: row.authorizationEndpoint,
+      tokenEndpoint: row.tokenEndpoint,
+      userinfoEndpoint: row.userinfoEndpoint ?? null,
+      status: (row.status as OAuthTransactionLifecycleStatus) || 'processing',
+      createdAt: row.createdAt,
+      expiresAt: row.expiresAt,
+    };
+
+    // 4. If currently processing (concurrent duplicate callback with same code)
+    if (row.status === 'processing') {
+      if (codeHash && row.codeHash && codeHash !== row.codeHash) {
+        return {
+          status: 'replayed',
+          transactionStatus: 'processing',
+          transaction: null,
+        };
+      }
+      return {
+        status: 'processing',
+        transactionStatus: 'processing',
+        transaction: baseTx,
+      };
+    }
+
+    // 5. If already completed: check if duplicate callback is from the same authenticated session & same code
+    if (row.status === 'completed') {
+      const sameCode = !codeHash || !row.codeHash || codeHash === row.codeHash;
+      const sameInitiatingSession =
+        Boolean(incomingSidHash) &&
+        incomingSidHash === row.initiatingSessionIdHash;
+      const sameAuthenticatedUser =
+        Boolean(params.authenticatedUid) &&
+        Boolean(row.completedUid) &&
+        params.authenticatedUid === row.completedUid;
+
+      if (sameCode && (sameInitiatingSession || sameAuthenticatedUser)) {
+        // Also confirm the session has not been revoked in oauth_sessions
+        const activeSessionRows = await db
+          .select()
+          .from(schema.oauthSessions)
+          .where(
+            and(
+              eq(
+                schema.oauthSessions.initiatingSessionIdHash,
+                row.initiatingSessionIdHash
+              ),
+              eq(schema.oauthSessions.revoked, false)
+            )
+          )
+          .orderBy(desc(schema.oauthSessions.createdAt))
+          .limit(1);
+
+        const hasActiveSession =
+          sameAuthenticatedUser ||
+          Boolean(
+            activeSessionRows[0] &&
+              activeSessionRows[0].expiresAt.getTime() > now.getTime()
+          );
+
+        if (hasActiveSession) {
+          return {
+            status: 'completed_same_session',
+            transactionStatus: 'completed',
+            transaction: baseTx,
+            outcome: {
+              status: 'completed',
+              completedUid: row.completedUid ?? null,
+              outcomeStatus: row.outcomeStatus ?? 200,
+              outcomeErrorCategory: row.outcomeErrorCategory ?? 'NONE',
+              outcomeMessage: row.outcomeMessage ?? null,
+              outcomeIdentity: safeJsonParse<Record<string, unknown> | null>(
+                row.outcomeIdentityJson,
+                null
+              ),
+            },
+          };
+        }
+      }
+
+      return {
+        status: 'replayed',
+        transactionStatus: 'completed',
+        transaction: null,
+      };
+    }
+
+    // 6. If previous callback failed during token exchange or consent
+    if (row.status === 'failed') {
+      return {
+        status: 'failed_previously',
+        transactionStatus: 'failed',
+        transaction: baseTx,
+        outcome: {
+          status: 'failed',
+          completedUid: null,
+          outcomeStatus: row.outcomeStatus ?? 400,
+          outcomeErrorCategory:
+            row.outcomeErrorCategory ?? 'OAUTH_STATE_INVALID',
+          outcomeMessage: row.outcomeMessage ?? null,
+          outcomeIdentity: null,
+        },
+      };
+    }
+
+    return {
+      status: 'replayed',
+      transactionStatus:
+        (row.status as OAuthTransactionLifecycleStatus) || 'completed',
+      transaction: null,
+    };
+  } catch (error) {
+    console.error(
+      'Database error in claimOrInspectOAuthTransactionRecord:',
+      error
+    );
+    throw new Error('Failed to validate OAuth authorization state.', {
+      cause: error,
+    });
+  }
+}
+
+export async function completeOAuthTransactionRecord(params: {
+  state: string;
+  status: 'completed' | 'failed';
+  completedUid?: string | null;
+  outcomeStatus: number;
+  outcomeErrorCategory: string;
+  outcomeMessage: string;
+  outcomeIdentity?: unknown;
+}): Promise<void> {
+  const rawState = params.state?.trim() ?? '';
+  if (!rawState) return;
+  try {
+    const stateHash = hashSessionToken(rawState);
+    await db
+      .update(schema.oauthTransactions)
+      .set({
+        status: params.status,
+        consumed: true,
+        completedAt: new Date(),
+        completedUid: params.completedUid ?? null,
+        outcomeStatus: params.outcomeStatus,
+        outcomeErrorCategory: params.outcomeErrorCategory,
+        outcomeMessage: params.outcomeMessage,
+        outcomeIdentityJson: params.outcomeIdentity
+          ? JSON.stringify(params.outcomeIdentity)
+          : null,
+      })
+      .where(eq(schema.oauthTransactions.stateHash, stateHash));
+  } catch (error) {
+    console.error('Database error in completeOAuthTransactionRecord:', error);
+  }
+}
+
+export async function waitForOAuthTransactionCompletion(
+  rawState: string,
+  timeoutMs = 4500
+): Promise<OAuthTransactionRecordedOutcome | null> {
+  const trimmed = rawState?.trim() ?? '';
+  if (!trimmed) return null;
+  const stateHash = hashSessionToken(trimmed);
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 65));
+    try {
+      const rows = await db
+        .select()
+        .from(schema.oauthTransactions)
+        .where(eq(schema.oauthTransactions.stateHash, stateHash))
+        .limit(1);
+      const row = rows[0];
+      if (!row) return null;
+      if (row.status === 'completed' || row.status === 'failed') {
+        return {
+          status: row.status,
+          completedUid: row.completedUid ?? null,
+          outcomeStatus:
+            row.outcomeStatus ?? (row.status === 'completed' ? 200 : 502),
+          outcomeErrorCategory:
+            row.outcomeErrorCategory ??
+            (row.status === 'completed'
+              ? 'NONE'
+              : 'OAUTH_TOKEN_EXCHANGE_FAILED'),
+          outcomeMessage: row.outcomeMessage ?? null,
+          outcomeIdentity: safeJsonParse<Record<string, unknown> | null>(
+            row.outcomeIdentityJson,
+            null
+          ),
+        };
+      }
+    } catch {
+      // ignore transient poll error
+    }
+  }
+  return null;
+}
+
+export async function consumeOAuthTransactionRecord(rawState: string): Promise<{
+  status: 'valid' | 'expired' | 'replayed' | 'invalid';
+  transaction: {
+    state: string;
+    initiatingSessionIdHash: string;
+    codeVerifier: string;
+    redirectUri: string;
+    clientOrigin: string | null;
+    scopes: string[];
+    issuer: string;
+    authorizationEndpoint: string;
+    tokenEndpoint: string;
+    userinfoEndpoint: string | null;
+    createdAt: Date;
+    expiresAt: Date;
+  } | null;
+}> {
+  const result = await claimOrInspectOAuthTransactionRecord({
+    state: rawState,
+  });
+  if (result.status === 'claimed' && result.transaction) {
+    return {
+      status: 'valid',
+      transaction: result.transaction,
+    };
+  }
+  if (result.status === 'expired') {
+    return { status: 'expired', transaction: null };
+  }
+  if (
+    result.status === 'replayed' ||
+    result.status === 'processing' ||
+    result.status === 'completed_same_session' ||
+    result.status === 'failed_previously' ||
+    result.status === 'session_mismatch'
+  ) {
+    return { status: 'replayed', transaction: null };
+  }
+  return { status: 'invalid', transaction: null };
+}
+
 export async function createOAuthSessionRecord(params: {
   sessionToken: string;
+  initiatingSessionId?: string | null;
+  initiatingSessionIdHash?: string | null;
   uid: string;
   pesuSub: string;
   accessToken: string | null;
@@ -459,12 +1032,22 @@ export async function createOAuthSessionRecord(params: {
   expiresAt: Date;
 }): Promise<void> {
   try {
+    const tokenHash = hashSessionToken(params.sessionToken);
+    const sidHash =
+      params.initiatingSessionIdHash ??
+      (params.initiatingSessionId
+        ? hashSessionToken(params.initiatingSessionId)
+        : null);
+    const encryptedAccess = encryptTokenAtRest(params.accessToken);
+    const encryptedRefresh = encryptTokenAtRest(params.refreshToken);
+
     await db.insert(schema.oauthSessions).values({
-      sessionToken: params.sessionToken,
+      sessionToken: tokenHash,
+      initiatingSessionIdHash: sidHash,
       uid: params.uid,
       pesuSub: params.pesuSub,
-      accessToken: params.accessToken,
-      refreshToken: params.refreshToken,
+      accessToken: encryptedAccess,
+      refreshToken: encryptedRefresh,
       scopesJson: JSON.stringify(params.scopes),
       expiresAt: params.expiresAt,
       revoked: false,
@@ -479,28 +1062,40 @@ export async function getValidOAuthSessionRecord(sessionToken: string): Promise<
   uid: string;
   pesuSub: string;
   accessToken: string | null;
+  refreshToken: string | null;
   scopes: string[];
   expiresAt: Date;
 } | null> {
   try {
+    const tokenHash = hashSessionToken(sessionToken);
     const rows = await db
       .select()
       .from(schema.oauthSessions)
       .where(
         and(
-          eq(schema.oauthSessions.sessionToken, sessionToken),
+          or(
+            eq(schema.oauthSessions.sessionToken, tokenHash),
+            eq(schema.oauthSessions.sessionToken, sessionToken)
+          ),
           eq(schema.oauthSessions.revoked, false)
         )
-      );
+      )
+      .orderBy(desc(schema.oauthSessions.createdAt));
     const row = rows[0];
     if (!row) return null;
     if (row.expiresAt.getTime() <= Date.now()) {
+      await db
+        .update(schema.oauthSessions)
+        .set({ revoked: true })
+        .where(eq(schema.oauthSessions.id, row.id))
+        .catch(() => {});
       return null;
     }
     return {
       uid: row.uid,
       pesuSub: row.pesuSub,
-      accessToken: row.accessToken,
+      accessToken: decryptTokenAtRest(row.accessToken),
+      refreshToken: decryptTokenAtRest(row.refreshToken),
       scopes: safeJsonParse<string[]>(row.scopesJson, []),
       expiresAt: row.expiresAt,
     };
@@ -510,14 +1105,71 @@ export async function getValidOAuthSessionRecord(sessionToken: string): Promise<
   }
 }
 
+export async function getValidOAuthSessionByInitiatingSessionId(
+  initiatingSessionId: string
+): Promise<{
+  uid: string;
+  pesuSub: string;
+  accessToken: string | null;
+  refreshToken: string | null;
+  scopes: string[];
+  expiresAt: Date;
+} | null> {
+  if (!initiatingSessionId || !initiatingSessionId.trim()) return null;
+  try {
+    const sidHash = hashSessionToken(initiatingSessionId);
+    const rows = await db
+      .select()
+      .from(schema.oauthSessions)
+      .where(
+        and(
+          eq(schema.oauthSessions.initiatingSessionIdHash, sidHash),
+          eq(schema.oauthSessions.revoked, false)
+        )
+      )
+      .orderBy(desc(schema.oauthSessions.createdAt));
+    const row = rows[0];
+    if (!row) return null;
+    if (row.expiresAt.getTime() <= Date.now()) {
+      await db
+        .update(schema.oauthSessions)
+        .set({ revoked: true })
+        .where(eq(schema.oauthSessions.id, row.id))
+        .catch(() => {});
+      return null;
+    }
+    return {
+      uid: row.uid,
+      pesuSub: row.pesuSub,
+      accessToken: decryptTokenAtRest(row.accessToken),
+      refreshToken: decryptTokenAtRest(row.refreshToken),
+      scopes: safeJsonParse<string[]>(row.scopesJson, []),
+      expiresAt: row.expiresAt,
+    };
+  } catch (error) {
+    console.error(
+      'Database error in getValidOAuthSessionByInitiatingSessionId:',
+      error
+    );
+    return null;
+  }
+}
+
 export async function revokeOAuthSessionRecord(
-  sessionToken: string
+  sessionTokenOrSid: string
 ): Promise<void> {
   try {
+    const hashVal = hashSessionToken(sessionTokenOrSid);
     await db
       .update(schema.oauthSessions)
       .set({ revoked: true })
-      .where(eq(schema.oauthSessions.sessionToken, sessionToken));
+      .where(
+        or(
+          eq(schema.oauthSessions.sessionToken, hashVal),
+          eq(schema.oauthSessions.sessionToken, sessionTokenOrSid),
+          eq(schema.oauthSessions.initiatingSessionIdHash, hashVal)
+        )
+      );
   } catch (error) {
     console.error('Database error in revokeOAuthSessionRecord:', error);
     throw new Error('Failed to revoke OAuth session.', { cause: error });

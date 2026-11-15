@@ -224,6 +224,7 @@ export const messages = pgTable('messages', {
 export const oauthSessions = pgTable('oauth_sessions', {
   id: serial('id').primaryKey(),
   sessionToken: text('session_token').notNull().unique(),
+  initiatingSessionIdHash: text('initiating_session_id_hash'),
   uid: text('uid').notNull(),
   pesuSub: text('pesu_sub').notNull(),
   accessToken: text('access_token'),
@@ -232,6 +233,32 @@ export const oauthSessions = pgTable('oauth_sessions', {
   expiresAt: timestamp('expires_at').notNull(),
   revoked: boolean('revoked').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const oauthTransactions = pgTable('oauth_transactions', {
+  id: serial('id').primaryKey(),
+  stateHash: text('state_hash').notNull().unique(),
+  codeHash: text('code_hash'),
+  initiatingSessionIdHash: text('initiating_session_id_hash').notNull(),
+  encryptedCodeVerifier: text('encrypted_code_verifier').notNull(),
+  redirectUri: text('redirect_uri').notNull(),
+  clientOrigin: text('client_origin'),
+  scopesJson: text('scopes_json').notNull().default('[]'),
+  issuer: text('issuer').notNull(),
+  authorizationEndpoint: text('authorization_endpoint').notNull(),
+  tokenEndpoint: text('token_endpoint').notNull(),
+  userinfoEndpoint: text('userinfo_endpoint'),
+  status: text('status').notNull().default('pending'), // 'pending' | 'processing' | 'completed' | 'failed' | 'expired'
+  consumed: boolean('consumed').notNull().default(false),
+  consumedAt: timestamp('consumed_at'),
+  completedAt: timestamp('completed_at'),
+  completedUid: text('completed_uid'),
+  outcomeStatus: integer('outcome_status'),
+  outcomeErrorCategory: text('outcome_error_category'),
+  outcomeMessage: text('outcome_message'),
+  outcomeIdentityJson: text('outcome_identity_json'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  expiresAt: timestamp('expires_at').notNull(),
 });
 
 export const usersRelations = relations(users, ({ one }) => ({

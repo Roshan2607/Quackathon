@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -117,6 +117,30 @@ const DiagnosticTelemetryCard: React.FC<{
           {diagnostics.extractionMethod ? ` · method=${diagnostics.extractionMethod}` : ''}
         </span>
       </div>
+      {(diagnostics.stateFingerprint ||
+        diagnostics.transactionStatus ||
+        diagnostics.callbackOutcome) && (
+        <>
+          <div>
+            <span className="text-slate-400 block font-sans text-[10px] uppercase">
+              State Fingerprint
+            </span>
+            <span className="font-semibold">{diagnostics.stateFingerprint ?? 'n/a'}</span>
+          </div>
+          <div>
+            <span className="text-slate-400 block font-sans text-[10px] uppercase">
+              Tx Status
+            </span>
+            <span className="font-semibold">{diagnostics.transactionStatus ?? 'n/a'}</span>
+          </div>
+          <div className="col-span-2">
+            <span className="text-slate-400 block font-sans text-[10px] uppercase">
+              Callback Outcome
+            </span>
+            <span className="font-semibold">{diagnostics.callbackOutcome ?? 'n/a'}</span>
+          </div>
+        </>
+      )}
     </div>
   );
 };
@@ -247,6 +271,8 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
     tone: 'info' | 'success' | 'warning' | 'error';
     message: string;
   } | null>(null);
+  const handledOAuthStatesRef = useRef<Set<string>>(new Set());
+  const oauthPopupRef = useRef<Window | null>(null);
 
   // 5. File Processing (PDF Brochure / Poster Image) Test State + Preserved Retry Payload
   const [fileResult, setFileResult] = useState<IntegrationProbeState>({ status: 'idle' });
@@ -303,15 +329,16 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
       fetchServerStatus();
     }
 
-    const handleOAuthMessage = async (event: MessageEvent) => {
-      // Security requirement: validate exact trusted origin, never accept wildcard origins
-      if (event.origin !== window.location.origin) {
+    const processOAuthPayload = async (data: PesuOAuthCallbackPostMessage | undefined) => {
+      if (!data || data.type !== 'PESU_OAUTH_RESULT') {
         return;
       }
 
-      const data = event.data as PesuOAuthCallbackPostMessage | undefined;
-      if (!data || data.type !== 'PESU_OAUTH_RESULT') {
-        return;
+      if (data.state) {
+        if (handledOAuthStatesRef.current.has(data.state)) {
+          return;
+        }
+        handledOAuthStatesRef.current.add(data.state);
       }
 
       // State correlation check
@@ -337,7 +364,11 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
         setOauthStages(data.stages);
       }
 
-      if (data.ok && data.stages?.tokenExchange === 'succeeded') {
+      const isSuccess =
+        (data.status === 'success' || data.ok === true) &&
+        (!data.stages || data.stages.tokenExchange === 'succeeded');
+
+      if (isSuccess) {
         setOauthFlowNotice({
           tone: 'success',
           message:
@@ -346,15 +377,44 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
       } else {
         setOauthFlowNotice({
           tone: 'error',
-          message: `OAuth2 Error (${data.errorCategory || 'OAUTH_ERROR'}): ${data.userMessage}`,
+          message: `OAuth2 Error (${data.errorCategory || 'OAUTH_ERROR'}): ${data.userMessage || data.error || 'Authentication failed.'}`,
         });
       }
 
       await fetchServerStatus();
     };
 
+    const handleOAuthMessage = async (event: MessageEvent) => {
+      // Security requirement: validate exact trusted origin, never accept wildcard origins
+      if (event.origin !== window.location.origin) {
+        return;
+      }
+      await processOAuthPayload(event.data as PesuOAuthCallbackPostMessage | undefined);
+    };
+
+    let broadcastChannel: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        broadcastChannel = new BroadcastChannel('quackathon_pesu_oauth');
+        broadcastChannel.onmessage = (event: MessageEvent) => {
+          void processOAuthPayload(event.data as PesuOAuthCallbackPostMessage | undefined);
+        };
+      }
+    } catch {
+      // Ignore BroadcastChannel unavailability
+    }
+
     window.addEventListener('message', handleOAuthMessage);
-    return () => window.removeEventListener('message', handleOAuthMessage);
+    return () => {
+      window.removeEventListener('message', handleOAuthMessage);
+      if (broadcastChannel) {
+        try {
+          broadcastChannel.close();
+        } catch {
+          // ignore
+        }
+      }
+    };
   }, [activeOAuthState, fetchServerStatus]);
 
   // Test 1: GitHub REST API
@@ -653,6 +713,20 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
     deliveryMode: 'redirect' | 'popup',
     overrideScope?: string
   ) => {
+    if (
+      deliveryMode === 'popup' &&
+      oauthPopupRef.current &&
+      !oauthPopupRef.current.closed
+    ) {
+      oauthPopupRef.current.focus();
+      setOauthFlowNotice({
+        tone: 'info',
+        message:
+          'Focused existing PESU OAuth2 authorization popup. Please finish or close that window before starting a new flow.',
+      });
+      return;
+    }
+
     setOauthFlowNotice(null);
     const scopeToRequest = overrideScope ?? oauthScopes;
 
@@ -661,7 +735,9 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
         scope: scopeToRequest,
         mode: deliveryMode,
       });
-      const res = await fetch(`/api/pesu-oauth/url?${query.toString()}`);
+      const res = await fetch(`/api/pesu-oauth/url?${query.toString()}`, {
+        credentials: 'include',
+      });
       const data = (await res.json()) as PesuOAuthUrlResponse;
 
       if (data.stages) {
@@ -707,12 +783,14 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
 
       const popup = window.open(targetUrl, 'pesu_oauth_popup', 'width=560,height=680');
       if (!popup) {
+        oauthPopupRef.current = null;
         setOauthFlowNotice({
           tone: 'warning',
           message:
             'Popup was blocked by the browser or embedded preview frame. Use "Start Full-Page Redirect Flow" instead.',
         });
       } else {
+        oauthPopupRef.current = popup;
         // Problem D fix: never label authentication successful merely because a popup opened
         setOauthFlowNotice({
           tone: 'info',

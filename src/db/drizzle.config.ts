@@ -10,9 +10,14 @@ const sqlDbName = process.env.SQL_DB_NAME;
 // with a privileged role while the app itself connects with SQL_USER.
 const user = process.env.SQL_ADMIN_USER || process.env.SQL_USER;
 const password = process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD;
-const sslEnabled = /^(1|true|require)$/i.test(
-  (process.env.SQL_SSL || '').trim()
+const isUnixSocket = Boolean(sqlHost && sqlHost.trim().startsWith('/'));
+const isLocalHost = Boolean(
+  sqlHost && /^(127\.0\.0\.1|localhost|::1)$/i.test(sqlHost.trim())
 );
+const sslEnabled =
+  !isUnixSocket &&
+  !isLocalHost &&
+  /^(1|true|require)$/i.test((process.env.SQL_SSL || '').trim());
 
 if (!sqlHost) {
   throw new Error('SQL_HOST must be set in environment variables.');

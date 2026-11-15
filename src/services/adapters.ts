@@ -23,6 +23,7 @@ import {
   ExtractEventFileResponse,
   ExtractEventUrlResponse,
   ExtractionMethodUsed,
+  GitHubRepositoryItem,
   PesuOAuthUrlResponse,
   VerifyUrlResponse,
 } from '../types/apiContracts';
@@ -848,11 +849,16 @@ export function runBoundedGitHubEnrichmentDraft(params: {
   };
 }
 
-interface GitHubFetchResponsePayload {
+export interface GitHubFetchResponsePayload {
   ok: boolean;
-  live: boolean;
+  live?: boolean;
+  cached?: boolean;
   userMessage?: string;
   message?: string;
+  includeForks?: boolean;
+  totalFetchedCount?: number;
+  originalCount?: number;
+  forkCount?: number;
   rateLimit?: { remaining?: string | null; limit?: string | null };
   profile?: {
     login: string;
@@ -861,16 +867,8 @@ interface GitHubFetchResponsePayload {
     publicReposCount: number;
     htmlUrl: string;
   };
-  repositories?: Array<{
-    name: string;
-    url: string;
-    description: string;
-    language: string | null;
-    topics: string[];
-    stars: number;
-    updatedAt: string;
-    readmeExcerpt?: string;
-  }>;
+  repositories?: GitHubRepositoryItem[];
+  allRepositories?: GitHubRepositoryItem[];
   diagnostics?: DeveloperDiagnosticTelemetry;
 }
 
@@ -912,7 +910,7 @@ export function buildDeterministicGitHubDraft(params: {
       const cleanTopic = topic.trim();
       if (!cleanTopic) continue;
       const key = cleanTopic.toLowerCase();
-      if (!skillMap.has(key) && skillMap.size < 12) {
+      if (!skillMap.has(key) && skillMap.size < 16) {
         skillMap.set(key, {
           name: cleanTopic,
           category: 'topic',
@@ -938,7 +936,10 @@ export function buildDeterministicGitHubDraft(params: {
           : `Public repository by @${
               params.ghJson.profile?.login ?? params.githubUsername
             }`),
-      sourceUrl: repo.url,
+      sourceUrl:
+        repo.url ||
+        repo.htmlUrl ||
+        `https://github.com/${params.githubUsername}/${repo.name}`,
       tags,
       approved: false, // Strictly unapproved until user explicitly checks it
     };
@@ -982,24 +983,29 @@ export function buildDeterministicGitHubDraft(params: {
 }
 
 /**
- * Fast, zero-Gemini GitHub repository import (Requirement #7).
- * Fetches real public repositories from `/api/github/fetch` and extracts languages,
- * topics, and repository descriptions deterministically with all items starting `approved: false`.
+ * Fast, zero-Gemini GitHub repository import.
+ * Fetches all accessible public repositories from `/api/github/fetch` using GitHub REST API
+ * pagination and extracts languages, topics, and repository descriptions deterministically
+ * with all items starting `approved: false`.
  */
 export async function fetchLiveGitHubRepositoriesDeterministically(params: {
   uid: string;
   githubUsername: string;
+  includeForks?: boolean;
   forceRefresh?: boolean;
 }): Promise<{
   ok: boolean;
   isLiveApiResult: true;
   draft?: ProfileEvidenceDraft;
+  repositories?: GitHubRepositoryItem[];
+  allRepositories?: GitHubRepositoryItem[];
   rawGitHubPayload?: GitHubFetchResponsePayload;
   errorMessage?: string;
   githubRateLimit?: { remaining?: string | null; limit?: string | null };
   diagnostics?: DeveloperDiagnosticTelemetry;
 }> {
-  const key = `gh_det_fetch:${params.githubUsername.trim().toLowerCase()}`;
+  const includeForks = Boolean(params.includeForks);
+  const key = `gh_det_fetch:${params.githubUsername.trim().toLowerCase()}:forks=${includeForks}`;
   return withDedupeAndCache(
     key,
     async () => {
@@ -1007,8 +1013,12 @@ export async function fetchLiveGitHubRepositoriesDeterministically(params: {
         '/api/github/fetch',
         {
           method: 'POST',
-          body: JSON.stringify({ username: params.githubUsername }),
-          timeoutMs: 10000,
+          body: JSON.stringify({
+            username: params.githubUsername,
+            includeForks,
+            forceRefresh: Boolean(params.forceRefresh),
+          }),
+          timeoutMs: 15000,
         }
       );
 
@@ -1037,6 +1047,8 @@ export async function fetchLiveGitHubRepositoriesDeterministically(params: {
         ok: true,
         isLiveApiResult: true,
         draft,
+        repositories: ghJson.repositories ?? [],
+        allRepositories: ghJson.allRepositories ?? ghJson.repositories ?? [],
         rawGitHubPayload: ghJson,
         githubRateLimit: ghJson.rateLimit,
         diagnostics: ghJson.diagnostics,
@@ -1048,35 +1060,68 @@ export async function fetchLiveGitHubRepositoriesDeterministically(params: {
 }
 
 /**
- * Optional Gemini AI enhancement on top of already-fetched GitHub repository data (Requirement #7).
+ * Optional Gemini AI enhancement on top of selected projects or fetched GitHub repository data.
  * Uses a strict 12s timeout and keeps all suggested skills and projects unapproved (`approved: false`).
  */
 export async function runLiveGitHubAndGeminiEnrichment(params: {
   uid: string;
   githubUsername: string;
+  selectedRepositories?: GitHubRepositoryItem[];
   forceRefresh?: boolean;
   useGemini?: boolean;
 }): Promise<{
   ok: boolean;
   isLiveApiResult: true;
   draft?: ProfileEvidenceDraft;
+  suggestedBio?: string;
+  suggestedIcebreaker?: string;
   errorMessage?: string;
   githubRateLimit?: { remaining?: string | null; limit?: string | null };
   diagnostics?: DeveloperDiagnosticTelemetry;
 }> {
-  const detResult = await fetchLiveGitHubRepositoriesDeterministically({
-    uid: params.uid,
-    githubUsername: params.githubUsername,
-    forceRefresh: params.forceRefresh,
-  });
+  let baseDraft: ProfileEvidenceDraft | undefined;
+  let rawGitHubPayload: GitHubFetchResponsePayload | undefined;
+  let githubRateLimit: { remaining?: string | null; limit?: string | null } | undefined;
+  let baseDiagnostics: DeveloperDiagnosticTelemetry | undefined;
 
-  if (!detResult.ok || !detResult.draft || !detResult.rawGitHubPayload) {
-    return detResult;
-  }
+  if (params.selectedRepositories && params.selectedRepositories.length > 0) {
+    rawGitHubPayload = {
+      ok: true,
+      live: true,
+      profile: {
+        login: params.githubUsername || 'builder',
+        name: params.githubUsername || 'Builder',
+        bio: '',
+        publicReposCount: params.selectedRepositories.length,
+        htmlUrl: params.githubUsername
+          ? `https://github.com/${params.githubUsername}`
+          : 'https://github.com',
+      },
+      repositories: params.selectedRepositories,
+      allRepositories: params.selectedRepositories,
+    };
+    baseDraft = buildDeterministicGitHubDraft({
+      uid: params.uid,
+      githubUsername: params.githubUsername || 'builder',
+      ghJson: rawGitHubPayload,
+    });
+  } else {
+    const detResult = await fetchLiveGitHubRepositoriesDeterministically({
+      uid: params.uid,
+      githubUsername: params.githubUsername,
+      forceRefresh: params.forceRefresh,
+    });
 
-  // If Gemini enhancement was not explicitly requested, return the fast deterministic draft immediately
-  if (params.useGemini === false) {
-    return detResult;
+    if (!detResult.ok || !detResult.draft || !detResult.rawGitHubPayload) {
+      return detResult;
+    }
+    if (params.useGemini === false) {
+      return detResult;
+    }
+    baseDraft = detResult.draft;
+    rawGitHubPayload = detResult.rawGitHubPayload;
+    githubRateLimit = detResult.githubRateLimit;
+    baseDiagnostics = detResult.diagnostics;
   }
 
   const geminiRes = await apiFetch<{
@@ -1097,31 +1142,35 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
         sourceUrl?: string;
         tags?: string[];
       }>;
+      suggestedBio?: string;
+      icebreaker?: string;
       warnings?: string[];
     };
     diagnostics?: DeveloperDiagnosticTelemetry;
   }>('/api/gemini/extract-profile', {
     method: 'POST',
-    body: JSON.stringify({ githubData: detResult.rawGitHubPayload }),
+    body: JSON.stringify({
+      selectedRepositories: params.selectedRepositories,
+      githubData: rawGitHubPayload,
+    }),
     timeoutMs: 12000,
   });
 
   const geminiJson = geminiRes.data;
   if (!geminiRes.ok || !geminiJson || !geminiJson.ok) {
-    // Still return the real deterministic GitHub draft so the user's repos are immediately usable!
     return {
       ok: true,
       isLiveApiResult: true,
       draft: {
-        ...detResult.draft,
+        ...baseDraft,
         sanitizedWarnings: [
           geminiJson?.userMessage ??
             geminiRes.errorMessage ??
             'AI summary enhancement timed out or was unavailable; showing direct GitHub repository metadata.',
         ],
       },
-      githubRateLimit: detResult.githubRateLimit,
-      diagnostics: geminiJson?.diagnostics ?? detResult.diagnostics,
+      githubRateLimit,
+      diagnostics: geminiJson?.diagnostics ?? baseDiagnostics,
     };
   }
 
@@ -1134,14 +1183,14 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
           s.confidence === 'high' || s.confidence === 'medium'
             ? (s.confidence as 'high' | 'medium')
             : ('low' as const),
-        reason: s.reason || 'Extracted from public repository evidence',
-        approved: false, // Strictly unapproved by default (Requirement #7)
+        reason: s.reason || 'Extracted from selected project evidence',
+        approved: false, // Strictly unapproved by default
       }))
     : [];
 
   // Merge deterministic languages + AI skills without duplicates
   const mergedSkillMap = new Map<string, (typeof aiSkills)[number]>();
-  for (const s of detResult.draft.suggestedSkills) {
+  for (const s of baseDraft.suggestedSkills) {
     mergedSkillMap.set(s.name.toLowerCase(), { ...s, approved: false });
   }
   for (const s of aiSkills) {
@@ -1149,42 +1198,56 @@ export async function runLiveGitHubAndGeminiEnrichment(params: {
   }
 
   const fallbackProjectUrl =
-    detResult.rawGitHubPayload?.profile?.htmlUrl ??
+    rawGitHubPayload?.profile?.htmlUrl ??
     `https://github.com/${params.githubUsername}`;
 
   const aiProjects = Array.isArray(extracted.projectSummaries)
-    ? extracted.projectSummaries.map((p) => ({
-        title: p.title,
-        description: p.description,
-        sourceUrl: p.sourceUrl || fallbackProjectUrl,
-        tags: Array.isArray(p.tags) ? p.tags : [],
-        approved: false, // Strictly unapproved by default (Requirement #7)
-      }))
-    : (detResult.draft.suggestedProjects ?? []).map((p) => ({
+    ? extracted.projectSummaries.map((p) => {
+        const matchingBase = (baseDraft?.suggestedProjects ?? []).find(
+          (bp) => bp.title.toLowerCase() === p.title.toLowerCase()
+        );
+        return {
+          title: p.title,
+          description: p.description,
+          sourceUrl: p.sourceUrl || matchingBase?.sourceUrl || fallbackProjectUrl,
+          tags: Array.isArray(p.tags) ? p.tags : matchingBase?.tags ?? [],
+          approved: false, // Strictly unapproved by default
+        };
+      })
+    : (baseDraft.suggestedProjects ?? []).map((p) => ({
         title: p.title,
         description: p.description,
         sourceUrl: p.sourceUrl ?? fallbackProjectUrl,
         tags: Array.isArray(p.tags) ? p.tags : [],
-        approved: false, // Strictly unapproved by default (Requirement #7)
+        approved: false,
       }));
 
   const primaryProject =
     aiProjects[0] ?? {
-      ...detResult.draft.suggestedProject,
+      ...baseDraft.suggestedProject,
       approved: false,
     };
+
   return {
     ok: true,
     isLiveApiResult: true,
-    githubRateLimit: detResult.githubRateLimit,
+    githubRateLimit,
     diagnostics: geminiJson.diagnostics,
+    suggestedBio:
+      typeof extracted.suggestedBio === 'string' && extracted.suggestedBio.trim()
+        ? extracted.suggestedBio.trim()
+        : undefined,
+    suggestedIcebreaker:
+      typeof extracted.icebreaker === 'string' && extracted.icebreaker.trim()
+        ? extracted.icebreaker.trim()
+        : undefined,
     draft: {
-      ...detResult.draft,
-      rawEvidenceSummary: `Fetched ${
-        detResult.rawGitHubPayload.repositories?.length ?? 0
-      } public repositories from GitHub and enhanced summaries with Gemini (${
+      ...baseDraft,
+      rawEvidenceSummary: `Enhanced ${
+        aiProjects.length
+      } project description(s) and suggested skills with Gemini (${
         geminiJson.model ?? 'configured model'
-      }). All suggestions start unchecked—select the ones you want to include.`,
+      }). Review and edit before applying.`,
       suggestedSkills: Array.from(mergedSkillMap.values()),
       suggestedProjects: aiProjects,
       suggestedProject: primaryProject,

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ExecutionMode,
   FeaturedProject,
@@ -6,6 +6,7 @@ import {
   ProfileEvidenceDraft,
   User,
 } from '../types/domain';
+import { GitHubRepositoryItem } from '../types/apiContracts';
 import {
   INTEREST_TAXONOMY,
   ROLE_TAXONOMY,
@@ -20,6 +21,9 @@ import {
   ChevronDown,
   ChevronUp,
   Bookmark,
+  Search,
+  GitFork,
+  ExternalLink,
 } from 'lucide-react';
 import {
   fetchLiveGitHubRepositoriesDeterministically,
@@ -36,10 +40,6 @@ interface ChipListEditorProps {
   onChange: (values: string[]) => void;
 }
 
-/**
- * Compact chip editor used by the optional profile fields. Keeps the student
- * UX short: type, press Add, remove with the × on a chip.
- */
 const ChipListEditor: React.FC<ChipListEditorProps> = ({
   label,
   hint,
@@ -201,6 +201,24 @@ const PortfolioLinkEditor: React.FC<{
   );
 };
 
+function normalizeRepoIdentity(repo: {
+  url?: string;
+  htmlUrl?: string;
+  sourceUrl?: string;
+  name?: string;
+  title?: string;
+}, fallbackOwner?: string): string {
+  const rawUrl = (repo.url || repo.htmlUrl || repo.sourceUrl || '').trim();
+  if (rawUrl) {
+    return rawUrl.toLowerCase().replace(/\/+$/, '');
+  }
+  const repoName = (repo.name || repo.title || '').trim().toLowerCase();
+  const owner = (fallbackOwner || '').trim().toLowerCase();
+  return owner ? `https://github.com/${owner}/${repoName}` : repoName;
+}
+
+type RepoFilterTab = 'all' | 'original' | 'forks';
+
 interface OnboardingAndProfileModalProps {
   currentUser: User;
   profile: Profile;
@@ -239,8 +257,12 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
 
   const initial = loadInitialProfile();
 
-  // Essential fields shown initially
+  // Essential fields shown immediately
   const [headline, setHeadline] = useState(initial.headline);
+  const [about, setAbout] = useState(initial.about);
+  const [isFirstTimeHacker, setIsFirstTimeHacker] = useState(
+    Boolean(initial.isFirstTimeHacker)
+  );
   const [interestTags, setInterestTags] = useState<string[]>(initial.interestTags);
   const [customInterestInput, setCustomInterestInput] = useState('');
   const [skillTags, setSkillTags] = useState<string[]>(initial.skillTags);
@@ -258,23 +280,32 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
   const [newProjDesc, setNewProjDesc] = useState('');
   const [newProjTags, setNewProjTags] = useState('');
 
-  // Progressive disclosure expandable sections
-  const [showGitHubSection, setShowGitHubSection] = useState(false);
-  const [showPreferencesSection, setShowPreferencesSection] = useState(false);
-  const [showAdvancedSection, setShowAdvancedSection] = useState(false);
-
-  // GitHub & AI Suggestions state
+  // GitHub Import & "Choose your projects" modal state
   const [githubUsername, setGithubUsername] = useState(
     initial.githubUsername ?? ''
   );
+  const [isFetchingGitHub, setIsFetchingGitHub] = useState(false);
+  const [githubStatusError, setGithubStatusError] = useState<string | null>(null);
+  const [showRepoPickerModal, setShowRepoPickerModal] = useState(false);
+  const [fetchedRepos, setFetchedRepos] = useState<GitHubRepositoryItem[]>([]);
+  const [repoSearchQuery, setRepoSearchQuery] = useState('');
+  const [repoFilterTab, setRepoFilterTab] = useState<RepoFilterTab>('original');
+  const [selectedRepoKeys, setSelectedRepoKeys] = useState<Set<string>>(
+    new Set()
+  );
+
+  // Optional AI Enrichment state ("Make my project descriptions better ✨")
+  const [isEnhancingWithAI, setIsEnhancingWithAI] = useState(false);
   const [enrichmentDraft, setEnrichmentDraft] =
     useState<ProfileEvidenceDraft | null>(null);
-  const [isFetchingGitHub, setIsFetchingGitHub] = useState(false);
-  const [isEnhancingWithAI, setIsEnhancingWithAI] = useState(false);
-  const [githubStatusError, setGithubStatusError] = useState<string | null>(null);
+  const [suggestedBioDraft, setSuggestedBioDraft] = useState<string>('');
+  const [approveSuggestedBio, setApproveSuggestedBio] = useState(false);
 
-  // Collaboration Preferences & Advanced Options
-  const [about, setAbout] = useState(initial.about);
+  // Collapsed Advanced & Privacy sections
+  const [showPreferencesSection, setShowPreferencesSection] = useState(false);
+  const [showPrivacySection, setShowPrivacySection] = useState(false);
+
+  // Advanced Collaboration Preferences & Privacy Options
   const [rolesWantToLearn, setRolesWantToLearn] = useState<string[]>(
     initial.rolesWantToLearn
   );
@@ -284,17 +315,12 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
   const [icebreakerPrompt, setIcebreakerPrompt] = useState(
     initial.icebreakerPrompt ?? ''
   );
-  const [isFirstTimeHacker, setIsFirstTimeHacker] = useState(
-    Boolean(initial.isFirstTimeHacker)
-  );
   const [visibility, setVisibility] = useState<Profile['visibility']>(
     initial.visibility
   );
   const [privacyPreferences, setPrivacyPreferences] = useState<
     User['privacyPreferences']
   >(currentUser.privacyPreferences);
-
-  // Interest-first profile detail (persisted server-side)
   const [projectDomains, setProjectDomains] = useState<string[]>(
     initial.projectDomains ?? []
   );
@@ -310,16 +336,16 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
 
   useEffect(() => {
     setHeadline(profile.headline);
+    setAbout(profile.about);
+    setIsFirstTimeHacker(Boolean(profile.isFirstTimeHacker));
     setInterestTags(profile.interestTags);
     setSkillTags(profile.skillTags);
     setPreferredRoles(profile.preferredRoles);
     setFeaturedProjects(profile.featuredProjects);
     setGithubUsername(profile.githubUsername ?? '');
-    setAbout(profile.about);
     setRolesWantToLearn(profile.rolesWantToLearn);
     setWorkingStyleTags(profile.workingStyleTags);
     setIcebreakerPrompt(profile.icebreakerPrompt ?? '');
-    setIsFirstTimeHacker(Boolean(profile.isFirstTimeHacker));
     setVisibility(profile.visibility);
     setPrivacyPreferences(currentUser.privacyPreferences);
     setProjectDomains(profile.projectDomains ?? []);
@@ -375,9 +401,9 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     onNotify?.('Project added to profile.');
   };
 
-  // Requirement #7: Fast deterministic GitHub import WITHOUT Gemini initially
-  const handleRunDeterministicGitHubImport = async () => {
-    const username = githubUsername.trim();
+  // Opens "Choose your projects" modal with all public GitHub repositories (0 Gemini calls)
+  const handleImportFromGitHub = async () => {
+    const username = githubUsername.trim().replace(/^@/, '');
     if (!username) {
       setGithubStatusError('Enter your GitHub username first.');
       return;
@@ -389,14 +415,34 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
         const res = await fetchLiveGitHubRepositoriesDeterministically({
           uid: currentUser.uid,
           githubUsername: username,
+          includeForks: true,
         });
-        if (res.ok && res.draft) {
-          setEnrichmentDraft(res.draft);
-          onNotify?.(
-            `Fetched ${
-              res.rawGitHubPayload?.repositories?.length ?? 0
-            } public repositories from GitHub. Select items to include.`
+        if (res.ok) {
+          const allRepos =
+            res.allRepositories ??
+            res.repositories ??
+            res.rawGitHubPayload?.allRepositories ??
+            res.rawGitHubPayload?.repositories ??
+            [];
+          setFetchedRepos(allRepos);
+          setRepoSearchQuery('');
+          // Default to Original tab unless the user only has forks
+          const hasOriginal = allRepos.some((r) => !r.fork);
+          setRepoFilterTab(hasOriginal ? 'original' : 'all');
+
+          // Pre-check repositories that are already in featuredProjects by URL/identity
+          const existingKeys = new Set(
+            featuredProjects.map((fp) => normalizeRepoIdentity(fp, username))
           );
+          const initialSelected = new Set<string>();
+          for (const repo of allRepos) {
+            const key = normalizeRepoIdentity(repo, username);
+            if (existingKeys.has(key)) {
+              initialSelected.add(key);
+            }
+          }
+          setSelectedRepoKeys(initialSelected);
+          setShowRepoPickerModal(true);
           return;
         }
         setGithubStatusError(
@@ -409,39 +455,190 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
         uid: currentUser.uid,
         githubUsername: username,
       });
-      setEnrichmentDraft(demoDraft);
-      onNotify?.('Loaded sample repository suggestions. Check items to include.');
+      const sampleRepos: GitHubRepositoryItem[] = (
+        demoDraft.suggestedProjects ?? [demoDraft.suggestedProject]
+      ).map((p) => ({
+        name: p.title,
+        url: p.sourceUrl || `https://github.com/${username}/${p.title}`,
+        htmlUrl: p.sourceUrl || `https://github.com/${username}/${p.title}`,
+        description: p.description,
+        language: p.tags[0] ?? 'TypeScript',
+        topics: p.tags.slice(1),
+        stars: 1,
+        fork: false,
+      }));
+      setFetchedRepos(sampleRepos);
+      setRepoSearchQuery('');
+      setRepoFilterTab('original');
+      setSelectedRepoKeys(new Set());
+      setShowRepoPickerModal(true);
     } finally {
       setIsFetchingGitHub(false);
     }
   };
 
-  // Requirement #7: Optional Gemini enhancement with strict timeout & fallback
-  const handleEnhanceWithAI = async () => {
-    const username = githubUsername.trim();
-    if (!username) {
-      setGithubStatusError('Enter your GitHub username first.');
+  const countsByTab = useMemo(() => {
+    const total = fetchedRepos.length;
+    const forks = fetchedRepos.filter((r) => Boolean(r.fork)).length;
+    const original = total - forks;
+    return { total, original, forks };
+  }, [fetchedRepos]);
+
+  const visiblePickerRepos = useMemo(() => {
+    const cleanOwner = githubUsername.trim().replace(/^@/, '');
+    const q = repoSearchQuery.trim().toLowerCase();
+    return fetchedRepos.filter((repo) => {
+      if (repoFilterTab === 'original' && repo.fork) return false;
+      if (repoFilterTab === 'forks' && !repo.fork) return false;
+      if (!q) return true;
+      const hay = [
+        repo.name,
+        repo.description,
+        repo.language ?? '',
+        ...(repo.topics ?? []),
+        normalizeRepoIdentity(repo, cleanOwner),
+      ]
+        .join(' ')
+        .toLowerCase();
+      return hay.includes(q);
+    });
+  }, [fetchedRepos, githubUsername, repoFilterTab, repoSearchQuery]);
+
+  const toggleRepoSelection = (repo: GitHubRepositoryItem) => {
+    const cleanOwner = githubUsername.trim().replace(/^@/, '');
+    const key = normalizeRepoIdentity(repo, cleanOwner);
+    setSelectedRepoKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
+
+  const handleSelectAllVisibleRepos = () => {
+    const cleanOwner = githubUsername.trim().replace(/^@/, '');
+    setSelectedRepoKeys((prev) => {
+      const next = new Set(prev);
+      for (const repo of visiblePickerRepos) {
+        next.add(normalizeRepoIdentity(repo, cleanOwner));
+      }
+      return next;
+    });
+  };
+
+  const handleClearRepoSelection = () => {
+    setSelectedRepoKeys(new Set());
+  };
+
+  const handleAddSelectedProjectsFromModal = () => {
+    const cleanOwner = githubUsername.trim().replace(/^@/, '');
+    const selectedRepos = fetchedRepos.filter((repo) =>
+      selectedRepoKeys.has(normalizeRepoIdentity(repo, cleanOwner))
+    );
+
+    if (selectedRepos.length === 0) {
+      setShowRepoPickerModal(false);
       return;
     }
+
+    const existingByIdentity = new Map<string, FeaturedProject>();
+    for (const proj of featuredProjects) {
+      existingByIdentity.set(normalizeRepoIdentity(proj, cleanOwner), proj);
+    }
+
+    const updatedProjects = [...featuredProjects];
+    let addedCount = 0;
+
+    for (const repo of selectedRepos) {
+      const repoUrl =
+        repo.url ||
+        repo.htmlUrl ||
+        `https://github.com/${cleanOwner}/${repo.name}`;
+      const identityKey = normalizeRepoIdentity(
+        { url: repoUrl, name: repo.name },
+        cleanOwner
+      );
+
+      if (existingByIdentity.has(identityKey)) {
+        continue;
+      }
+
+      const tags = Array.from(
+        new Set([
+          ...(repo.language ? [repo.language] : []),
+          ...(repo.topics ?? []).slice(0, 4),
+        ])
+      );
+
+      const newProj: FeaturedProject = {
+        id: `gh_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        title: repo.name,
+        description:
+          repo.description?.trim() ||
+          `Public ${repo.language ? `${repo.language} ` : ''}repository on GitHub.`,
+        sourceUrl: repoUrl,
+        tags,
+      };
+      updatedProjects.push(newProj);
+      existingByIdentity.set(identityKey, newProj);
+      addedCount++;
+    }
+
+    setFeaturedProjects(updatedProjects);
+    setShowRepoPickerModal(false);
+    onNotify?.(
+      addedCount > 0
+        ? `Added ${addedCount} selected project${addedCount === 1 ? '' : 's'} to your profile.`
+        : 'Selected projects are already in your profile.'
+    );
+  };
+
+  // Optional Gemini enrichment strictly for the user's selected/featured projects
+  const handleImproveSelectedProjectsWithAI = async () => {
+    if (featuredProjects.length === 0) {
+      setGithubStatusError(
+        'Select or add at least one project first before improving descriptions.'
+      );
+      return;
+    }
+
+    const cleanOwner = githubUsername.trim().replace(/^@/, '') || 'builder';
+    const selectedReposForAI: GitHubRepositoryItem[] = featuredProjects.map(
+      (proj) => ({
+        name: proj.title,
+        url: proj.sourceUrl,
+        htmlUrl: proj.sourceUrl,
+        description: proj.description,
+        language: proj.tags[0] ?? null,
+        topics: proj.tags.slice(1),
+      })
+    );
+
     setIsEnhancingWithAI(true);
     setGithubStatusError(null);
     try {
       const res = await runLiveGitHubAndGeminiEnrichment({
         uid: currentUser.uid,
-        githubUsername: username,
+        githubUsername: cleanOwner,
+        selectedRepositories: selectedReposForAI,
         useGemini: true,
       });
+
       if (res.ok && res.draft) {
         setEnrichmentDraft(res.draft);
+        setSuggestedBioDraft(res.suggestedBio ?? '');
+        setApproveSuggestedBio(false);
         onNotify?.(
-          res.errorMessage
-            ? res.errorMessage
-            : 'Enhanced repository descriptions with AI. Review and approve items before adding.'
+          'Generated project description & skill suggestions. Review and approve what you want to keep.'
         );
         return;
       }
+
       setGithubStatusError(
-        res.errorMessage || 'AI enhancement is unavailable right now.'
+        res.errorMessage || 'AI description helper is unavailable right now.'
       );
     } finally {
       setIsEnhancingWithAI(false);
@@ -462,16 +659,16 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     setEnrichmentDraft({
       ...enrichmentDraft,
       suggestedProjects: next,
-      suggestedProject: next[0]
-        ? {
-            ...next[0],
-            sourceUrl:
-              next[0].sourceUrl ??
-              (githubUsername.trim()
-                ? `https://github.com/${githubUsername.trim()}`
-                : ''),
-          }
-        : enrichmentDraft.suggestedProject,
+    });
+  };
+
+  const updateSuggestedProjectDescription = (idx: number, newDesc: string) => {
+    if (!enrichmentDraft || !enrichmentDraft.suggestedProjects) return;
+    const next = [...enrichmentDraft.suggestedProjects];
+    next[idx] = { ...next[idx], description: newDesc };
+    setEnrichmentDraft({
+      ...enrichmentDraft,
+      suggestedProjects: next,
     });
   };
 
@@ -480,47 +677,58 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     const approvedSkills = enrichmentDraft.suggestedSkills
       .filter((s) => s.approved)
       .map((s) => s.name);
-    setSkillTags(Array.from(new Set([...skillTags, ...approvedSkills])));
+    if (approvedSkills.length > 0) {
+      setSkillTags(Array.from(new Set([...skillTags, ...approvedSkills])));
+    }
 
-    const newProjects: FeaturedProject[] = [];
+    const cleanOwner = githubUsername.trim().replace(/^@/, '');
+    let updatedProjectCount = 0;
+
     if (
       enrichmentDraft.suggestedProjects &&
       enrichmentDraft.suggestedProjects.length > 0
     ) {
+      const nextProjects = [...featuredProjects];
       for (const sp of enrichmentDraft.suggestedProjects) {
-        if (sp.approved) {
-          newProjects.push({
-            id: `gh_proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        if (!sp.approved) continue;
+        const spKey = normalizeRepoIdentity(sp, cleanOwner);
+        const existingIdx = nextProjects.findIndex(
+          (fp) =>
+            normalizeRepoIdentity(fp, cleanOwner) === spKey ||
+            fp.title.toLowerCase() === sp.title.toLowerCase()
+        );
+        if (existingIdx >= 0) {
+          nextProjects[existingIdx] = {
+            ...nextProjects[existingIdx],
+            description: sp.description,
+            tags:
+              sp.tags && sp.tags.length > 0
+                ? sp.tags
+                : nextProjects[existingIdx].tags,
+          };
+        } else {
+          nextProjects.push({
+            id: `gh_ai_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             title: sp.title,
             description: sp.description,
             sourceUrl: sp.sourceUrl,
             tags: sp.tags,
           });
         }
+        updatedProjectCount++;
       }
-    } else if (enrichmentDraft.suggestedProject?.approved) {
-      newProjects.push({
-        id: `gh_proj_${Date.now()}`,
-        title: enrichmentDraft.suggestedProject.title,
-        description: enrichmentDraft.suggestedProject.description,
-        sourceUrl: enrichmentDraft.suggestedProject.sourceUrl,
-        tags: enrichmentDraft.suggestedProject.tags,
-      });
+      setFeaturedProjects(nextProjects);
     }
 
-    if (newProjects.length > 0) {
-      const existingTitles = new Set(
-        featuredProjects.map((p) => p.title.toLowerCase())
-      );
-      const unique = newProjects.filter(
-        (p) => !existingTitles.has(p.title.toLowerCase())
-      );
-      setFeaturedProjects([...featuredProjects, ...unique]);
+    if (approveSuggestedBio && suggestedBioDraft.trim()) {
+      setAbout(suggestedBioDraft.trim());
     }
 
     setEnrichmentDraft(null);
+    setSuggestedBioDraft('');
+    setApproveSuggestedBio(false);
     onNotify?.(
-      `Applied ${approvedSkills.length} approved skill(s) and ${newProjects.length} project(s) to your profile.`
+      `Applied ${approvedSkills.length} skill(s) and ${updatedProjectCount} improved project description(s).`
     );
   };
 
@@ -530,8 +738,6 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     about: about.trim(),
     interestTags,
     skillTags,
-    // "What I like building" defaults to the selected interests so the
-    // matching engine always has a domain signal.
     projectDomains:
       projectDomains.length > 0 ? projectDomains : interestTags,
     topicsToExplore,
@@ -576,70 +782,98 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
 
   const formContent = (
     <div className="space-y-5">
-      {/* 1. Headline */}
-      <div>
-        <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
-          Headline
-        </label>
-        <input
-          type="text"
-          value={headline}
-          onChange={(e) => setHeadline(e.target.value)}
-          placeholder="e.g., First-year CSE exploring Frontend & Applied AI"
-          className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs sm:text-sm text-slate-900 dark:text-slate-100"
-        />
-      </div>
-
-      {/* 2. Interests */}
-      <div>
-        <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
-          Interests
-        </label>
-        <div className="flex flex-wrap gap-1.5 mb-2">
-          {INTEREST_TAXONOMY.map((interest) => {
-            const active = interestTags.includes(interest);
-            return (
-              <button
-                key={interest}
-                type="button"
-                onClick={() =>
-                  toggleItem(interest, interestTags, setInterestTags)
-                }
-                className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  active
-                    ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
-                    : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
-                }`}
-              >
-                {interest}
-              </button>
-            );
-          })}
-        </div>
-        <div className="flex gap-2">
+      {/* 1. About Me */}
+      <div className="space-y-3">
+        <div>
+          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+            Headline
+          </label>
           <input
             type="text"
-            value={customInterestInput}
-            onChange={(e) => setCustomInterestInput(e.target.value)}
-            onKeyDown={(e) =>
-              e.key === 'Enter' &&
-              (e.preventDefault(), handleAddCustomInterest())
-            }
-            placeholder="Add custom interest..."
-            className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+            value={headline}
+            onChange={(e) => setHeadline(e.target.value)}
+            placeholder="e.g., CSE builder into Backend APIs & Applied AI"
+            className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs sm:text-sm text-slate-900 dark:text-slate-100"
           />
-          <button
-            type="button"
-            onClick={handleAddCustomInterest}
-            className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            Add
-          </button>
+        </div>
+
+        <div>
+          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+            About Me
+          </label>
+          <textarea
+            rows={2}
+            value={about}
+            onChange={(e) => setAbout(e.target.value)}
+            placeholder="Backend developer. My APIs work better than my sleep schedule."
+            className="w-full px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs sm:text-sm text-slate-900 dark:text-slate-100"
+          />
+          <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={isFirstTimeHacker}
+                onChange={(e) => setIsFirstTimeHacker(e.target.checked)}
+                className="rounded border-slate-300"
+              />
+              First hackathon? No worries.
+            </label>
+            <span className="text-[11px] text-slate-400">
+              Try: &ldquo;I turn caffeine into Python scripts.&rdquo;
+            </span>
+          </div>
         </div>
       </div>
 
-      {/* 3. Skills & Preferred Roles */}
-      <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+      {/* 2. Interests, Skills & Roles */}
+      <div className="space-y-3.5 pt-3 border-t border-slate-100 dark:border-slate-800">
+        <div>
+          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+            Interests
+          </label>
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {INTEREST_TAXONOMY.map((interest) => {
+              const active = interestTags.includes(interest);
+              return (
+                <button
+                  key={interest}
+                  type="button"
+                  onClick={() =>
+                    toggleItem(interest, interestTags, setInterestTags)
+                  }
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    active
+                      ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
+                      : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  {interest}
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={customInterestInput}
+              onChange={(e) => setCustomInterestInput(e.target.value)}
+              onKeyDown={(e) =>
+                e.key === 'Enter' &&
+                (e.preventDefault(), handleAddCustomInterest())
+              }
+              placeholder="Add custom interest..."
+              className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+            />
+            <button
+              type="button"
+              onClick={handleAddCustomInterest}
+              className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+
         <div>
           <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
             Preferred Roles
@@ -671,26 +905,28 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
           <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
             Skills & Tools
           </label>
-          <div className="flex flex-wrap gap-1.5 mb-2">
-            {skillTags.map((skill) => (
-              <span
-                key={skill}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 text-xs font-medium"
-              >
-                {skill}
-                <button
-                  type="button"
-                  onClick={() =>
-                    setSkillTags(skillTags.filter((s) => s !== skill))
-                  }
-                  className="text-slate-400 hover:text-red-600 cursor-pointer"
-                  aria-label={`Remove ${skill}`}
+          {skillTags.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {skillTags.map((skill) => (
+                <span
+                  key={skill}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 text-xs font-medium"
                 >
-                  ×
-                </button>
-              </span>
-            ))}
-          </div>
+                  {skill}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSkillTags(skillTags.filter((s) => s !== skill))
+                    }
+                    className="text-slate-400 hover:text-red-600 cursor-pointer"
+                    aria-label={`Remove ${skill}`}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <div className="flex gap-2">
             <input
               type="text"
@@ -714,11 +950,11 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
         </div>
       </div>
 
-      {/* 4. Projects (Optional) */}
-      <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
-        <div className="flex items-center justify-between mb-2">
+      {/* 3. My Projects (GitHub Import Popup + Manual Add + Optional AI Polish) */}
+      <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-            Projects{' '}
+            My Projects{' '}
             <span className="text-slate-400 font-normal">(Optional)</span>
           </label>
           {!showAddProjectForm && (
@@ -728,21 +964,83 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
               className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Plus className="w-3.5 h-3.5" />
-              Add Project
+              Add Project Manually
             </button>
           )}
         </div>
 
+        {/* GitHub Username + Import Button */}
+        <div className="flex flex-col sm:flex-row gap-2">
+          <div className="relative flex-1">
+            <Github className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={githubUsername}
+              onChange={(e) => setGithubUsername(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleImportFromGitHub();
+                }
+              }}
+              placeholder="GitHub username (e.g., Roshan2607)"
+              className="w-full pl-8 pr-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
+            />
+          </div>
+          <button
+            type="button"
+            disabled={isFetchingGitHub}
+            onClick={handleImportFromGitHub}
+            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Github className="w-3.5 h-3.5" />
+            {isFetchingGitHub ? 'Loading Repos...' : 'Import'}
+          </button>
+          {featuredProjects.length > 0 && (
+            <button
+              type="button"
+              disabled={isEnhancingWithAI}
+              onClick={handleImproveSelectedProjectsWithAI}
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+              {isEnhancingWithAI
+                ? 'Polishing...'
+                : 'Make my project descriptions better ✨'}
+            </button>
+          )}
+        </div>
+
+        {githubStatusError && (
+          <p className="text-xs text-red-600 dark:text-red-400">
+            {githubStatusError}
+          </p>
+        )}
+
+        {/* Selected & Manually Added Projects */}
         {featuredProjects.length > 0 ? (
-          <div className="space-y-2 mb-2">
+          <div className="space-y-2">
             {featuredProjects.map((proj) => (
               <div
                 key={proj.id}
                 className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 flex items-start justify-between gap-2"
               >
                 <div className="min-w-0">
-                  <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                    {proj.title}
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                      {proj.title}
+                    </span>
+                    {proj.sourceUrl && (
+                      <a
+                        href={proj.sourceUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-slate-400 hover:text-blue-600 shrink-0"
+                        title="Open repository"
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    )}
                   </div>
                   <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5 line-clamp-2">
                     {proj.description}
@@ -771,13 +1069,13 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
         ) : (
           !showAddProjectForm && (
             <p className="text-xs text-slate-500">
-              No projects listed yet. Class projects or side builds are optional.
+              No projects selected yet. Import from GitHub or add a class/side project.
             </p>
           )
         )}
 
         {showAddProjectForm && (
-          <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2 mt-2">
+          <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <input
                 type="text"
@@ -819,158 +1117,134 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
             </div>
           </div>
         )}
-      </div>
 
-      {/* Expandable Section 1: GitHub Enrichment & Optional AI Suggestions */}
-      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
-        <button
-          type="button"
-          onClick={() => setShowGitHubSection(!showGitHubSection)}
-          className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
-        >
-          <span className="flex items-center gap-2">
-            <Github className="w-3.5 h-3.5" />
-            Import from GitHub & AI Suggestions (Optional)
-          </span>
-          {showGitHubSection ? (
-            <ChevronUp className="w-4 h-4 text-slate-400" />
-          ) : (
-            <ChevronDown className="w-4 h-4 text-slate-400" />
-          )}
-        </button>
-
-        {showGitHubSection && (
-          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800">
-            <div className="flex flex-col sm:flex-row gap-2">
-              <input
-                type="text"
-                value={githubUsername}
-                onChange={(e) => setGithubUsername(e.target.value)}
-                placeholder="GitHub username (e.g., Roshan2607)"
-                className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
-              />
-              <button
-                type="button"
-                disabled={isFetchingGitHub || isEnhancingWithAI}
-                onClick={handleRunDeterministicGitHubImport}
-                className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Github className="w-3.5 h-3.5" />
-                {isFetchingGitHub ? 'Fetching Repos...' : 'Import from GitHub (Fast)'}
-              </button>
-              <button
-                type="button"
-                disabled={isFetchingGitHub || isEnhancingWithAI}
-                onClick={handleEnhanceWithAI}
-                className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
-                title="Optional: Use Gemini to summarize repositories and suggest skills"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-                {isEnhancingWithAI ? 'Enhancing...' : 'Enhance with AI'}
-              </button>
+        {/* Editable AI Suggestions Review Box (Requires Explicit User Approval) */}
+        {enrichmentDraft && (
+          <div className="p-3.5 rounded-xl bg-blue-50/60 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 block">
+                  Review & Approve AI Suggestions
+                </span>
+                <span className="text-[11px] text-slate-500">
+                  Edit descriptions below and check the items you want to apply.
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setEnrichmentDraft(null)}
+                  className="px-2 py-1 rounded text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+                <button
+                  type="button"
+                  onClick={handleApplyApprovedSuggestions}
+                  className="px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Apply Selected
+                </button>
+              </div>
             </div>
 
-            {githubStatusError && (
-              <p className="text-xs text-red-600 dark:text-red-400">
-                {githubStatusError}
-              </p>
-            )}
-
-            {enrichmentDraft && (
-              <div className="p-3 rounded-lg bg-blue-50/60 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 space-y-3">
+            {suggestedBioDraft && (
+              <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 space-y-1.5">
                 <div className="flex items-center justify-between gap-2">
-                  <div>
-                    <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 block">
-                      Review & Approve Suggestions
-                    </span>
-                    <span className="text-[11px] text-slate-500">
-                      Nothing is added until you select items and click Add Selected.
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleApplyApprovedSuggestions}
-                    className="px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    Add Selected
-                  </button>
+                  <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                    Suggested Technical Intro
+                  </span>
+                  <label className="inline-flex items-center gap-1 text-[11px] font-medium cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={approveSuggestedBio}
+                      onChange={(e) => setApproveSuggestedBio(e.target.checked)}
+                    />
+                    Approve
+                  </label>
                 </div>
-
-                {enrichmentDraft.suggestedSkills.length > 0 && (
-                  <div>
-                    <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1">
-                      Suggested Languages & Topics
-                    </div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {enrichmentDraft.suggestedSkills.map((s, idx) => (
-                        <button
-                          key={s.name}
-                          type="button"
-                          onClick={() => toggleSuggestedSkill(idx)}
-                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium border cursor-pointer ${
-                            s.approved
-                              ? 'bg-emerald-600 text-white border-emerald-600'
-                              : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300'
-                          }`}
-                        >
-                          <Check className="w-3 h-3" />
-                          {s.name}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {enrichmentDraft.suggestedProjects &&
-                  enrichmentDraft.suggestedProjects.length > 0 && (
-                    <div className="space-y-2">
-                      <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">
-                        Public Repositories ({enrichmentDraft.suggestedProjects.length})
-                      </div>
-                      {enrichmentDraft.suggestedProjects.map((proj, idx) => (
-                        <div
-                          key={`${proj.title}_${idx}`}
-                          className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs space-y-1"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-semibold text-slate-900 dark:text-slate-100">
-                              {proj.title}
-                            </span>
-                            <label className="inline-flex items-center gap-1 text-[11px] font-medium cursor-pointer">
-                              <input
-                                type="checkbox"
-                                checked={proj.approved}
-                                onChange={() => toggleSuggestedProject(idx)}
-                              />
-                              Include
-                            </label>
-                          </div>
-                          <p className="text-slate-600 dark:text-slate-400">
-                            {proj.description}
-                          </p>
-                          {proj.tags.length > 0 && (
-                            <p className="text-[11px] text-slate-400">
-                              {proj.tags.join(' · ')}
-                            </p>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                <input
+                  type="text"
+                  value={suggestedBioDraft}
+                  onChange={(e) => setSuggestedBioDraft(e.target.value)}
+                  className="w-full px-2.5 py-1 rounded border border-slate-200 dark:border-slate-700 text-xs bg-slate-50 dark:bg-slate-950"
+                />
               </div>
             )}
+
+            {enrichmentDraft.suggestedSkills.length > 0 && (
+              <div>
+                <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1">
+                  Suggested Skills (click to approve)
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {enrichmentDraft.suggestedSkills.map((s, idx) => (
+                    <button
+                      key={s.name}
+                      type="button"
+                      onClick={() => toggleSuggestedSkill(idx)}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium border cursor-pointer ${
+                        s.approved
+                          ? 'bg-emerald-600 text-white border-emerald-600'
+                          : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300'
+                      }`}
+                    >
+                      <Check className="w-3 h-3" />
+                      {s.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {enrichmentDraft.suggestedProjects &&
+              enrichmentDraft.suggestedProjects.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">
+                    Polished Project Descriptions
+                  </div>
+                  {enrichmentDraft.suggestedProjects.map((proj, idx) => (
+                    <div
+                      key={`${proj.title}_${idx}`}
+                      className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs space-y-1.5"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-slate-900 dark:text-slate-100">
+                          {proj.title}
+                        </span>
+                        <label className="inline-flex items-center gap-1 text-[11px] font-medium cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={proj.approved}
+                            onChange={() => toggleSuggestedProject(idx)}
+                          />
+                          Approve
+                        </label>
+                      </div>
+                      <input
+                        type="text"
+                        value={proj.description}
+                        onChange={(e) =>
+                          updateSuggestedProjectDescription(idx, e.target.value)
+                        }
+                        className="w-full px-2.5 py-1 rounded border border-slate-200 dark:border-slate-700 text-xs bg-slate-50 dark:bg-slate-950 text-slate-700 dark:text-slate-200"
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
           </div>
         )}
       </div>
 
-      {/* Expandable Section 2: Collaboration Preferences */}
+      {/* Collapsed Section 1: More Preferences (Optional) */}
       <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
         <button
           type="button"
           onClick={() => setShowPreferencesSection(!showPreferencesSection)}
           className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
         >
-          <span>Collaboration Style & Roles to Explore</span>
+          <span>More Preferences & Collaboration Style (Optional)</span>
           {showPreferencesSection ? (
             <ChevronUp className="w-4 h-4 text-slate-400" />
           ) : (
@@ -979,9 +1253,9 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
         </button>
 
         {showPreferencesSection && (
-          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800">
+          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800 text-xs">
             <div>
-              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
                 Working Style
               </label>
               <div className="flex flex-wrap gap-1.5">
@@ -1012,8 +1286,8 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
-                Roles You Want to Learn
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                Roles You Want to Explore
               </label>
               <div className="flex flex-wrap gap-1.5">
                 {ROLE_TAXONOMY.map((role) => {
@@ -1040,47 +1314,6 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
                   );
                 })}
               </div>
-            </div>
-
-            <label className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300 cursor-pointer pt-1">
-              <input
-                type="checkbox"
-                checked={isFirstTimeHacker}
-                onChange={(e) => setIsFirstTimeHacker(e.target.checked)}
-              />
-              I am a first-time hacker (show beginner-friendly badge)
-            </label>
-          </div>
-        )}
-      </div>
-
-      {/* Expandable Section 3: Advanced & Privacy Settings */}
-      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
-        <button
-          type="button"
-          onClick={() => setShowAdvancedSection(!showAdvancedSection)}
-          className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
-        >
-          <span>Bio, Icebreaker & Privacy Options</span>
-          {showAdvancedSection ? (
-            <ChevronUp className="w-4 h-4 text-slate-400" />
-          ) : (
-            <ChevronDown className="w-4 h-4 text-slate-400" />
-          )}
-        </button>
-
-        {showAdvancedSection && (
-          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800 text-xs">
-            <div>
-              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                Short Bio
-              </label>
-              <textarea
-                rows={2}
-                value={about}
-                onChange={(e) => setAbout(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-              />
             </div>
 
             <div>
@@ -1124,8 +1357,28 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
               links={portfolioLinks}
               onChange={setPortfolioLinks}
             />
+          </div>
+        )}
+      </div>
 
-            <div className="flex items-center justify-between pt-1">
+      {/* Collapsed Section 2: Privacy & Settings */}
+      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setShowPrivacySection(!showPrivacySection)}
+          className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
+        >
+          <span>Privacy & Settings</span>
+          {showPrivacySection ? (
+            <ChevronUp className="w-4 h-4 text-slate-400" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-slate-400" />
+          )}
+        </button>
+
+        {showPrivacySection && (
+          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800 text-xs">
+            <div className="flex items-center justify-between">
               <span className="font-semibold text-slate-700 dark:text-slate-300">
                 Profile Visibility
               </span>
@@ -1182,30 +1435,199 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
     </div>
   );
 
+  // "Choose your projects" GitHub Repository Selection Popup Modal
+  const repoPickerModal = showRepoPickerModal ? (
+    <Modal
+      title="Choose your projects"
+      subtitle={`@${githubUsername.trim().replace(/^@/, '')} · ${countsByTab.total} public repositories found`}
+      onClose={() => setShowRepoPickerModal(false)}
+      maxWidthClass="max-w-lg"
+    >
+      <div className="space-y-3">
+        {/* Search Bar */}
+        <div className="relative">
+          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <input
+            type="text"
+            value={repoSearchQuery}
+            onChange={(e) => setRepoSearchQuery(e.target.value)}
+            placeholder="Search repositories by name, language, or description..."
+            className="w-full pl-8 pr-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs text-slate-900 dark:text-slate-100"
+          />
+        </div>
+
+        {/* Filter Tabs (All / Original / Forks) + Selection Controls */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-800 p-0.5 bg-slate-50 dark:bg-slate-900">
+            <button
+              type="button"
+              onClick={() => setRepoFilterTab('all')}
+              className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
+                repoFilterTab === 'all'
+                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              All ({countsByTab.total})
+            </button>
+            <button
+              type="button"
+              onClick={() => setRepoFilterTab('original')}
+              className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
+                repoFilterTab === 'original'
+                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              Original ({countsByTab.original})
+            </button>
+            <button
+              type="button"
+              onClick={() => setRepoFilterTab('forks')}
+              className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
+                repoFilterTab === 'forks'
+                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              Forks ({countsByTab.forks})
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 text-[11px]">
+            <button
+              type="button"
+              onClick={handleSelectAllVisibleRepos}
+              className="text-blue-600 dark:text-blue-400 hover:underline font-medium cursor-pointer"
+            >
+              Select all visible
+            </button>
+            <span className="text-slate-300 dark:text-slate-700">·</span>
+            <button
+              type="button"
+              onClick={handleClearRepoSelection}
+              className="text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 cursor-pointer"
+            >
+              Clear selection
+            </button>
+          </div>
+        </div>
+
+        {/* Scrollable Repository List */}
+        <div className="max-h-72 overflow-y-auto space-y-1.5 pr-1">
+          {visiblePickerRepos.length > 0 ? (
+            visiblePickerRepos.map((repo) => {
+              const cleanOwner = githubUsername.trim().replace(/^@/, '');
+              const repoKey = normalizeRepoIdentity(repo, cleanOwner);
+              const isSelected = selectedRepoKeys.has(repoKey);
+              return (
+                <label
+                  key={repoKey}
+                  className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer ${
+                    isSelected
+                      ? 'border-blue-500 bg-blue-50/40 dark:bg-blue-950/30'
+                      : 'border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/50'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onChange={() => toggleRepoSelection(repo)}
+                    className="mt-0.5 rounded border-slate-300"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center flex-wrap gap-1.5">
+                      <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                        {repo.name}
+                      </span>
+                      {repo.language && (
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-[10px] font-medium text-slate-600 dark:text-slate-300">
+                          {repo.language}
+                        </span>
+                      )}
+                      {repo.fork && (
+                        <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-950/40 text-[10px] font-medium text-amber-700 dark:text-amber-300">
+                          <GitFork className="w-2.5 h-2.5" />
+                          Fork
+                        </span>
+                      )}
+                    </div>
+                    {repo.description ? (
+                      <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5 line-clamp-2">
+                        {repo.description}
+                      </p>
+                    ) : (
+                      <p className="text-[11px] text-slate-400 italic mt-0.5">
+                        No description provided
+                      </p>
+                    )}
+                  </div>
+                </label>
+              );
+            })
+          ) : (
+            <div className="py-8 text-center text-xs text-slate-500">
+              No repositories match your filter.
+            </div>
+          )}
+        </div>
+
+        {/* Footer with Selected Counter & Primary Action */}
+        <div className="pt-2.5 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
+          <span className="text-xs font-medium text-slate-600 dark:text-slate-400">
+            {selectedRepoKeys.size} project{selectedRepoKeys.size === 1 ? '' : 's'} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowRepoPickerModal(false)}
+              className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleAddSelectedProjectsFromModal}
+              className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer"
+            >
+              Add Selected Projects
+            </button>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  ) : null;
+
   if (isInline) {
     return (
-      <div className="max-w-2xl mx-auto bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-5">
-        <div className="border-b border-slate-100 dark:border-slate-800 pb-3">
-          <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-            Builder Profile
-          </h2>
-          <p className="text-xs text-slate-500 mt-0.5">
-            {currentUser.displayName} · {currentUser.campus} · {currentUser.program}
-          </p>
+      <>
+        <div className="max-w-2xl mx-auto bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-5">
+          <div className="border-b border-slate-100 dark:border-slate-800 pb-3">
+            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
+              Builder Profile
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              {currentUser.displayName} · {currentUser.campus} · {currentUser.program}
+            </p>
+          </div>
+          {formContent}
         </div>
-        {formContent}
-      </div>
+        {repoPickerModal}
+      </>
     );
   }
 
   return (
-    <Modal
-      title="Edit Builder Profile"
-      subtitle={`${currentUser.displayName} · ${currentUser.campus}`}
-      onClose={onClose}
-      maxWidthClass="max-w-xl"
-    >
-      {formContent}
-    </Modal>
+    <>
+      <Modal
+        title="Edit Builder Profile"
+        subtitle={`${currentUser.displayName} · ${currentUser.campus}`}
+        onClose={onClose}
+        maxWidthClass="max-w-xl"
+      >
+        {formContent}
+      </Modal>
+      {repoPickerModal}
+    </>
   );
 };
