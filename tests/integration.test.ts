@@ -625,7 +625,7 @@ test('15. PESU OIDC discovery gracefully handles unexpected HTML response withou
 });
 
 test('16. PESU OIDC discovery detects and normalizes PESU_OAUTH_ISSUER_URL misconfigured as callback URL', async () => {
-  process.env.PESU_OAUTH_ISSUER_URL = 'https://ais-dev-br3lg427hqulcvidjuf6bn-148109744684.asia-east1.run.app/auth/pesu/callback';
+  process.env.PESU_OAUTH_ISSUER_URL = `${baseUrl}/auth/pesu/callback`;
   let capturedDiscoveryUrl = '';
 
   setServerTestOverrides({
@@ -652,9 +652,7 @@ test('16. PESU OIDC discovery detects and normalizes PESU_OAUTH_ISSUER_URL misco
   assert.equal(data.oidcDiscoveryAvailable, true);
   assert.equal(data.issuer, 'https://pesu-oauth2.onrender.com');
   assert.ok(data.configWarning.includes('PESU_OAUTH_ISSUER_URL'));
-  assert.ok(
-    data.allowedRedirectUris.includes('https://ais-dev-br3lg427hqulcvidjuf6bn-148109744684.asia-east1.run.app/auth/pesu/callback')
-  );
+  assert.deepEqual(data.allowedRedirectUris, [`${baseUrl}/auth/pesu/callback`]);
   process.env.PESU_OAUTH_ISSUER_URL = 'https://pesu-oauth2.onrender.com';
 });
 
@@ -1497,11 +1495,12 @@ test('24. OAuth state persists in PostgreSQL across server restarts / multi-inst
   // 2. Simulate server restart / callback arriving on Instance 2 with empty in-memory maps
   clearInMemoryOAuthStoresForTest();
 
-  // 3. Callback still succeeds because transaction is stored in PostgreSQL
+  // 3. Callback still succeeds because transaction is stored in PostgreSQL and session cookie matches
   const cbRes = await fetch(
     `${baseUrl}/auth/pesu/callback?code=auth_code_multi_1&state=${encodeURIComponent(
       urlData.state
-    )}`
+    )}`,
+    { headers: { Cookie: sidCookie } }
   );
   const cbHtml = await cbRes.text();
   assert.equal(cbRes.status, 200);
@@ -1952,6 +1951,1257 @@ test('27. OAuth transaction lifecycle: pending -> processing -> completed/failed
   await db.delete(users).where(eq(users.uid, 'pesu_pesu_lifecycle_user'));
   await db.delete(oauthTransactions);
 });
+
+test('28. OAuth browser session & origin consistency: top-level continuity, cross-origin preview rejection, missing/invalid/mismatched cookie diagnostics, and unpartitioned cookie flags', async () => {
+  const { clearInMemoryOAuthStoresForTest } = await import('../server.ts');
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions, oauthTransactions } = await import(
+    '../src/db/schema.ts'
+  );
+  const { eq } = await import('drizzle-orm');
+
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_session_consistency';
+  process.env.PESU_OAUTH_CLIENT_SECRET = 'secret_session_consistency_key';
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  let capturedTokenAuthHeader = '';
+  let capturedCodeVerifier = '';
+
+  setServerTestOverrides({
+    fetchFn: async (input, init) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url === 'https://oauth.pesu.mock/token') {
+        const hdrs = (init?.headers ?? {}) as Record<string, string>;
+        capturedTokenAuthHeader = hdrs.Authorization || '';
+        const bodyParams = new URLSearchParams(String(init?.body ?? ''));
+        capturedCodeVerifier = bodyParams.get('code_verifier') ?? '';
+
+        const idToken = createBase64UrlJwt({
+          iss: 'https://oauth.pesu.mock',
+          aud: 'test_pesu_session_consistency',
+          sub: 'pesu_session_verified_student',
+          name: 'Session Verified Student',
+          email: 'session.student@pesu.pes.edu',
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        });
+        return new Response(
+          JSON.stringify({
+            access_token: 'provider_access_token_session_test',
+            refresh_token: 'provider_refresh_token_session_test',
+            token_type: 'Bearer',
+            expires_in: 3600,
+            scope: 'openid profile email',
+            id_token: idToken,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url === 'https://oauth.pesu.mock/userinfo') {
+        return new Response(
+          JSON.stringify({
+            sub: 'pesu_session_verified_student',
+            name: 'Session Verified Student',
+            email: 'session.student@pesu.pes.edu',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  // 1. Fresh top-level browser tab initializes session cookie via /api/auth/session
+  const initSessRes = await fetch(`${baseUrl}/api/auth/session`);
+  const initSetCookie = initSessRes.headers.get('set-cookie') ?? '';
+  assert.ok(
+    !initSetCookie.includes('Partitioned'),
+    'Session cookie must not include Partitioned attribute that splits iframe and popup cookie jars'
+  );
+  const topLevelSidCookie = initSetCookie.split(';')[0];
+  assert.ok(topLevelSidCookie.startsWith('quackathon_sid='));
+
+  // 2. OAuth initiation with existing session cookie reports initiationCookieStatus = 'existing' and matching origins
+  const urlRes = await fetch(
+    `${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email&mode=redirect`,
+    {
+      headers: {
+        Cookie: topLevelSidCookie,
+        'X-Client-Origin': baseUrl,
+      },
+    }
+  );
+  const urlData = await urlRes.json();
+  assert.equal(urlRes.status, 200);
+  assert.equal(urlData.ok, true);
+  assert.equal(urlData.initiationCookieStatus, 'existing');
+  assert.equal(urlData.initiatingOrigin, baseUrl);
+  assert.equal(urlData.configuredCallbackOrigin, baseUrl);
+  assert.equal(urlData.diagnostics.initiationCookieStatus, 'existing');
+  assert.equal(urlData.diagnostics.initiatingOrigin, baseUrl);
+  assert.equal(urlData.diagnostics.configuredCallbackOrigin, baseUrl);
+
+  // 3. Cross-origin preview initiation (e.g. from another preview hostname) is rejected with 400 OAUTH_REDIRECT_URI_MISMATCH
+  const crossOriginRes = await fetch(
+    `${baseUrl}/api/pesu-oauth/url?scope=openid%20profile`,
+    {
+      headers: {
+        Cookie: topLevelSidCookie,
+        'X-Client-Origin': 'https://mismatch-preview.example.run.app',
+      },
+    }
+  );
+  const crossOriginData = await crossOriginRes.json();
+  assert.equal(crossOriginRes.status, 400);
+  assert.equal(crossOriginData.ok, false);
+  assert.equal(crossOriginData.errorCategory, 'OAUTH_REDIRECT_URI_MISMATCH');
+  assert.equal(
+    crossOriginData.diagnostics.callbackOutcome,
+    'rejected_origin_mismatch'
+  );
+  assert.equal(
+    crossOriginData.diagnostics.initiatingOrigin,
+    'https://mismatch-preview.example.run.app'
+  );
+  assert.equal(crossOriginData.diagnostics.configuredCallbackOrigin, baseUrl);
+
+  // 4. Reject callback when session cookie is missing (without consuming transaction or minting a new cookie)
+  const missingCookieCbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=valid_code_session_1&state=${encodeURIComponent(
+      urlData.state
+    )}`
+  );
+  const missingCookieHtml = await missingCookieCbRes.text();
+  assert.equal(missingCookieCbRes.status, 400);
+  assert.equal(
+    missingCookieCbRes.headers.get('set-cookie'),
+    null,
+    'Rejected callback must not mint a new quackathon_sid cookie'
+  );
+  assert.ok(missingCookieHtml.includes('"callbackCookieStatus":"missing"'));
+  assert.ok(
+    missingCookieHtml.includes(
+      '"callbackOutcome":"rejected_missing_session_cookie"'
+    )
+  );
+  assert.ok(missingCookieHtml.includes('"sessionBindingMatched":false'));
+
+  // 5. Reject callback when session cookie signature is invalid
+  const invalidSigCbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=valid_code_session_1&state=${encodeURIComponent(
+      urlData.state
+    )}`,
+    {
+      headers: {
+        Cookie: 'quackathon_sid=tampered_session_id.invalid_hmac_signature',
+      },
+    }
+  );
+  const invalidSigHtml = await invalidSigCbRes.text();
+  assert.equal(invalidSigCbRes.status, 400);
+  assert.ok(
+    invalidSigHtml.includes('"callbackCookieStatus":"invalid_signature"')
+  );
+  assert.ok(
+    invalidSigHtml.includes(
+      '"callbackOutcome":"rejected_invalid_session_cookie"'
+    )
+  );
+  assert.ok(invalidSigHtml.includes('"sessionBindingMatched":false'));
+
+  // 6. Reject callback when session cookie belongs to a different browser session
+  const otherTabUrlRes = await fetch(
+    `${baseUrl}/api/pesu-oauth/url?scope=openid%20profile`
+  );
+  const otherTabCookie = (otherTabUrlRes.headers.get('set-cookie') ?? '').split(
+    ';'
+  )[0];
+  const mismatchCbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=valid_code_session_1&state=${encodeURIComponent(
+      urlData.state
+    )}`,
+    {
+      headers: { Cookie: otherTabCookie },
+    }
+  );
+  const mismatchCbHtml = await mismatchCbRes.text();
+  assert.equal(mismatchCbRes.status, 400);
+  assert.ok(mismatchCbHtml.includes('"callbackCookieStatus":"valid"'));
+  assert.ok(
+    mismatchCbHtml.includes('"callbackOutcome":"rejected_session_mismatch"')
+  );
+  assert.ok(mismatchCbHtml.includes('"sessionBindingMatched":false'));
+
+  // 7. Simulate callback reaching another backend instance (clearInMemoryOAuthStoresForTest)
+  // and verify multi-cookie header resilience (legacy cookie + valid initiating cookie)
+  clearInMemoryOAuthStoresForTest();
+  const validCbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=valid_code_session_1&state=${encodeURIComponent(
+      urlData.state
+    )}`,
+    {
+      headers: {
+        Cookie: `${otherTabCookie}; ${topLevelSidCookie}`,
+      },
+    }
+  );
+  const validCbHtml = await validCbRes.text();
+  assert.equal(validCbRes.status, 200);
+  assert.ok(validCbHtml.includes('"status":"success"'));
+  assert.ok(validCbHtml.includes('"callbackCookieStatus":"valid"'));
+  assert.ok(validCbHtml.includes('"sessionBindingMatched":true'));
+  assert.ok(validCbHtml.includes('"handledByDifferentInstance":true'));
+  assert.ok(capturedTokenAuthHeader.startsWith('Basic '));
+  assert.ok(capturedCodeVerifier.length >= 32);
+
+  // 8. Verify PostgreSQL user persistence & session restoration after refresh
+  clearInMemoryOAuthStoresForTest();
+  const restoredRes = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Cookie: topLevelSidCookie },
+  });
+  const restoredData = await restoredRes.json();
+  assert.equal(restoredRes.status, 200);
+  assert.equal(restoredData.authenticated, true);
+  assert.equal(
+    restoredData.user.uid,
+    'pesu_pesu_session_verified_student'
+  );
+  assert.equal(restoredData.user.verificationStatus, 'verified_pesu_oidc');
+
+  // Cleanup
+  await db
+    .delete(oauthSessions)
+    .where(eq(oauthSessions.uid, 'pesu_pesu_session_verified_student'));
+  await db
+    .delete(profiles)
+    .where(eq(profiles.uid, 'pesu_pesu_session_verified_student'));
+  await db
+    .delete(users)
+    .where(eq(users.uid, 'pesu_pesu_session_verified_student'));
+  await db.delete(oauthTransactions);
+});
+
+test('29. PESU Academy announcements: { resource, data, fetched_at } normalization, empty feed, missing announcements:read scope, delegated consent_required, expired token, malformed fields, and strict privacy isolation', async () => {
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions } = await import(
+    '../src/db/schema.ts'
+  );
+  const { createOAuthSessionRecord, upsertUserAndProfile, updateUserProfileAndPrivacy } =
+    await import('../src/db/repository.ts');
+  const { signSessionId } = await import('../src/lib/crypto.ts');
+  const { eq } = await import('drizzle-orm');
+
+  const testUid = 'pesu_ann_test_student_1';
+  const otherUid = 'pesu_ann_other_student_2';
+
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, testUid));
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, otherUid));
+  await db.delete(profiles).where(eq(profiles.uid, testUid));
+  await db.delete(users).where(eq(users.uid, testUid));
+  await db.delete(profiles).where(eq(profiles.uid, otherUid));
+  await db.delete(users).where(eq(users.uid, otherUid));
+
+  const { profile } = await upsertUserAndProfile({
+    uid: testUid,
+    email: 'ann.student@pesu.pes.edu',
+    displayName: 'Announcement Student',
+    campus: 'RR Campus',
+    verified: true,
+    verificationStatus: 'verified_pesu_oidc',
+  });
+
+  await upsertUserAndProfile({
+    uid: otherUid,
+    email: 'other.student@pesu.pes.edu',
+    displayName: 'Other Student',
+    campus: 'EC Campus',
+    verified: true,
+    verificationStatus: 'verified_pesu_oidc',
+  });
+
+  // 1. Opt-in disabled by default -> 403 OPT_IN_REQUIRED (never "0 announcements")
+  const sessionNoOptIn = await createOAuthSessionRecord({
+    sessionToken: `raw_session_token_ann_1_${Date.now()}`,
+    uid: testUid,
+    pesuSub: 'sub_ann_1',
+    scopes: ['openid', 'profile', 'email'],
+    accessToken: 'provider_token_identity_only',
+    refreshToken: null,
+    expiresAt: new Date(Date.now() + 3600_000),
+    initiatingSessionId: 'browser_sid_ann_1',
+  });
+  void sessionNoOptIn;
+
+  const cookieAnn1 = `quackathon_sid=${encodeURIComponent(
+    signSessionId('browser_sid_ann_1')
+  )}`;
+
+  const resOptInOff = await fetch(`${baseUrl}/api/pesu/announcements`, {
+    headers: { Cookie: cookieAnn1 },
+  });
+  const dataOptInOff = await resOptInOff.json();
+  assert.equal(resOptInOff.status, 403);
+  assert.equal(dataOptInOff.ok, false);
+  assert.equal(dataOptInOff.errorCode, 'OPT_IN_REQUIRED');
+  assert.equal(dataOptInOff.requiresOptIn, true);
+  assert.equal(dataOptInOff.announcements, undefined);
+
+  // Enable explicit student opt-in
+  await updateUserProfileAndPrivacy({
+    uid: testUid,
+    profile,
+    privacyPreferences: {
+      profileVisible: true,
+      githubConsent: false,
+      aiEnrichmentConsent: false,
+      academyAnnouncementsOptIn: true,
+      academyTimetableOptIn: false,
+    },
+  });
+
+  // 2. Missing `announcements:read` scope -> 403 MISSING_ANNOUNCEMENTS_SCOPE (never reported as 0 announcements)
+  const resMissingScope = await fetch(`${baseUrl}/api/pesu/announcements`, {
+    headers: { Cookie: cookieAnn1 },
+  });
+  const dataMissingScope = await resMissingScope.json();
+  assert.equal(resMissingScope.status, 403);
+  assert.equal(dataMissingScope.ok, false);
+  assert.equal(dataMissingScope.errorCode, 'MISSING_ANNOUNCEMENTS_SCOPE');
+  assert.equal(dataMissingScope.requiresScopeGrant, true);
+  assert.deepEqual(dataMissingScope.grantedScopes, [
+    'openid',
+    'profile',
+    'email',
+  ]);
+
+  // 3. Upgrade session to include `announcements:read`
+  await createOAuthSessionRecord({
+    sessionToken: `raw_session_token_ann_with_scope_${Date.now()}`,
+    uid: testUid,
+    pesuSub: 'sub_ann_1',
+    scopes: ['openid', 'profile', 'email', 'announcements:read'],
+    accessToken: 'provider_token_with_announcements_read',
+    refreshToken: null,
+    expiresAt: new Date(Date.now() + 3600_000),
+    initiatingSessionId: 'browser_sid_ann_scoped',
+  });
+  const cookieScoped = `quackathon_sid=${encodeURIComponent(
+    signSessionId('browser_sid_ann_scoped')
+  )}`;
+
+  // 4. Test valid `{ resource: "announcements", data: [...], fetched_at }` payload + malformed record resilience
+  let mockScenario:
+    | 'valid_envelope'
+    | 'empty_envelope'
+    | 'expired_token'
+    | 'consent_required'
+    | 'malformed_envelope' = 'valid_envelope';
+
+  setServerTestOverrides({
+    fetchFn: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/v1/announcements')) {
+        const authHdr =
+          ((init?.headers as Record<string, string>) ?? {}).Authorization || '';
+        assert.equal(
+          authHdr,
+          'Bearer provider_token_with_announcements_read'
+        );
+
+        if (mockScenario === 'expired_token') {
+          return new Response(
+            JSON.stringify({
+              error: 'invalid_token',
+              error_description: 'Access token has expired',
+            }),
+            { status: 401, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        if (mockScenario === 'consent_required') {
+          return new Response(
+            JSON.stringify({
+              error: 'consent_required',
+              error_description:
+                'Stored PESU Academy credentials are missing; ask the student to sign in again',
+            }),
+            { status: 403, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        if (mockScenario === 'malformed_envelope') {
+          return new Response(
+            JSON.stringify({
+              unexpected_key: 'not_an_array',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        if (mockScenario === 'empty_envelope') {
+          return new Response(
+            JSON.stringify({
+              resource: 'announcements',
+              data: [],
+              fetched_at: '2026-11-15T10:00:00.000Z',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            resource: 'announcements',
+            data: [
+              {
+                id: 901,
+                title: '<b>HackPES 2026: 24-Hour AI &amp; Systems Hackathon</b>',
+                date: '2026-11-10',
+                description:
+                  '<p>Hosted by Department of CSE at MRD Auditorium, RR Campus. Event dates: 07 Nov 2026 – 08 Nov 2026. Teams of 2 to 4 students. Register at https://events.pes.edu/11629/ before deadline: 05 Nov 2026.</p>',
+                image: 'https://events.pes.edu/static/hackpes.png',
+                attachments: 2,
+              },
+              {
+                id: '902',
+                title: 'Malformed Date & Attachment Announcement',
+                date: 'not-a-valid-date',
+                description: null,
+                image: 'javascript:alert(1)',
+                attachments: ['file1.pdf', 'file2.pdf', 'file3.pdf'],
+              },
+              null,
+              { id: 903, title: '', description: '' }, // Empty record skipped gracefully
+            ],
+            fetched_at: '2026-11-15T11:30:00.000Z',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  const resValid = await fetch(`${baseUrl}/api/pesu/announcements?refresh=true`, {
+    headers: { Cookie: cookieScoped },
+  });
+  const dataValid = await resValid.json();
+  assert.equal(resValid.status, 200);
+  assert.equal(dataValid.ok, true);
+  assert.equal(dataValid.resource, 'announcements');
+  assert.equal(dataValid.fetchedAt, '2026-11-15T11:30:00.000Z');
+  assert.equal(dataValid.announcements.length, 2);
+
+  // Verify announcement 1 fields
+  const ann1 = dataValid.announcements[0];
+  assert.equal(ann1.id, '901');
+  assert.equal(ann1.title, 'HackPES 2026: 24-Hour AI & Systems Hackathon');
+  assert.equal(
+    ann1.date,
+    '2026-11-10',
+    'Must preserve original announcement publication date'
+  );
+  assert.ok(ann1.description.includes('MRD Auditorium'));
+  assert.equal(ann1.image, 'https://events.pes.edu/static/hackpes.png');
+  assert.equal(ann1.attachments, 2);
+
+  // Verify announcement 2 graceful handling of malformed date, unsafe image scheme, and array attachments
+  const ann2 = dataValid.announcements[1];
+  assert.equal(ann2.id, '902');
+  assert.equal(
+    ann2.date,
+    null,
+    'Malformed publication date must become null, never today'
+  );
+  assert.equal(ann2.description, '');
+  assert.equal(ann2.image, null, 'Unsafe image URL scheme must be rejected');
+  assert.equal(ann2.attachments, 3);
+
+  // Never leaks provider access token in response
+  assert.ok(!JSON.stringify(dataValid).includes('provider_token_with_announcements_read'));
+
+  // 5. Empty PESU announcements response
+  mockScenario = 'empty_envelope';
+  const resEmpty = await fetch(`${baseUrl}/api/pesu/announcements?refresh=true`, {
+    headers: { Cookie: cookieScoped },
+  });
+  const dataEmpty = await resEmpty.json();
+  assert.equal(resEmpty.status, 200);
+  assert.equal(dataEmpty.ok, true);
+  assert.deepEqual(dataEmpty.announcements, []);
+
+  // 6. Expired or invalid OAuth token -> 401 TOKEN_EXPIRED_OR_REVOKED (not "0 announcements")
+  mockScenario = 'expired_token';
+  const resExpired = await fetch(
+    `${baseUrl}/api/pesu/announcements?refresh=true`,
+    {
+      headers: { Cookie: cookieScoped },
+    }
+  );
+  const dataExpired = await resExpired.json();
+  assert.equal(resExpired.status, 401);
+  assert.equal(dataExpired.ok, false);
+  assert.equal(dataExpired.errorCode, 'TOKEN_EXPIRED_OR_REVOKED');
+  assert.equal(dataExpired.requiresReauth, true);
+
+  // 7. Delegated PESU Academy credentials missing on provider -> 403 DELEGATED_CREDENTIALS_REQUIRED
+  mockScenario = 'consent_required';
+  const resConsentReq = await fetch(
+    `${baseUrl}/api/pesu/announcements?refresh=true`,
+    {
+      headers: { Cookie: cookieScoped },
+    }
+  );
+  const dataConsentReq = await resConsentReq.json();
+  assert.equal(resConsentReq.status, 403);
+  assert.equal(dataConsentReq.ok, false);
+  assert.equal(dataConsentReq.errorCode, 'DELEGATED_CREDENTIALS_REQUIRED');
+  assert.equal(dataConsentReq.requiresScopeGrant, true);
+
+  // 8. Malformed provider envelope -> 502 MALFORMED_PROVIDER_PAYLOAD
+  mockScenario = 'malformed_envelope';
+  const resMalformed = await fetch(
+    `${baseUrl}/api/pesu/announcements?refresh=true`,
+    {
+      headers: { Cookie: cookieScoped },
+    }
+  );
+  const dataMalformed = await resMalformed.json();
+  assert.equal(resMalformed.status, 502);
+  assert.equal(dataMalformed.ok, false);
+  assert.equal(dataMalformed.errorCode, 'MALFORMED_PROVIDER_PAYLOAD');
+
+  // Cleanup
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, testUid));
+  await db.delete(profiles).where(eq(profiles.uid, testUid));
+  await db.delete(users).where(eq(users.uid, testUid));
+  await db.delete(profiles).where(eq(profiles.uid, otherUid));
+  await db.delete(users).where(eq(users.uid, otherUid));
+});
+
+test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction, workshop/talk vs hackathon classification, and graceful handling of unreachable pages', async () => {
+  const { db } = await import('../src/db/index.ts');
+  const { hackathons, eventCandidates } = await import('../src/db/schema.ts');
+  const { eq } = await import('drizzle-orm');
+
+  const mockBrowseHackathonHtml = `
+    <div class="tickets-grid">
+      <div class="ticket grid-ticket" data-href="/11629/">
+        <div class="ticket-status status-upcoming">Upcoming</div>
+        <div class="ticket-tags"><span>#Hackathon</span><span>#Technical</span></div>
+        <h3>Kodikon 5.0 — 24-Hour National Hackathon</h3>
+        <p>Annual 24-hour national level hackathon at PES University RR Campus.</p>
+        <div class="ticket-facts"><span><b>Sat, 07 Nov 2026</b></span></div>
+      </div>
+      <div class="ticket grid-ticket" data-href="/11632/">
+        <div class="ticket-status status-upcoming">Upcoming</div>
+        <div class="ticket-tags"><span>#Talks</span><span>#InfoSession</span></div>
+        <h3>Expert Talk on Quantum Cryptography &amp; Career Pathways</h3>
+        <p>Guest lecture and speaker session for undergraduate students.</p>
+        <div class="ticket-facts"><span><b>Tue, 10 Nov 2026</b></span></div>
+      </div>
+    </div>
+  `;
+
+  const mockDetail11629Html = `
+    <html>
+      <head>
+        <title>Kodikon 5.0 — 24-Hour National Hackathon | PES Events</title>
+        <link rel="canonical" href="https://events.pes.edu/11629/" />
+      </head>
+      <body>
+        <h1 class="bt-title">Kodikon 5.0 — 24-Hour National Hackathon</h1>
+        <div class="bt-campus-name">PESU RR Campus</div>
+        <div class="bt-fact-label">Date</div>
+        <div class="bt-fact-value">Sat, 07 Nov 2026 – 08 Nov 2026</div>
+        <div class="bt-fact-label">Venue</div>
+        <div class="bt-fact-value">MRD Auditorium</div>
+        <div class="bt-fact-label">Hosted by</div>
+        <div class="bt-fact-value">Embrione &amp; Department of CSE</div>
+        <div id="eventBody">
+          <div class="rich-text">
+            Join Kodikon 5.0 for a 24-hour build sprint! Teams of 3 to 4 students are eligible.
+            Registration deadline: 04 Nov 2026.
+            <a href="https://unstop.com/hackathons/kodikon-5-pes-university">Register Here</a>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+
+  const mockDetail11632Html = `
+    <html>
+      <head><title>Expert Talk on Quantum Cryptography | PES Events</title></head>
+      <body>
+        <h1 class="bt-title">Expert Talk on Quantum Cryptography &amp; Career Pathways</h1>
+        <div class="bt-campus-name">PESU EC Campus</div>
+        <div class="bt-fact-label">Date</div>
+        <div class="bt-fact-value">Tue, 10 Nov 2026</div>
+        <div class="bt-fact-label">Venue</div>
+        <div class="bt-fact-value">Seminar Hall 1</div>
+        <div class="bt-fact-label">Hosted by</div>
+        <div class="bt-fact-value">Department of ECE</div>
+        <div id="eventBody">
+          <div class="rich-text">
+            An interactive speaker session and guest lecture on post-quantum cryptography.
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+
+  let simulateUnreachable = false;
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (simulateUnreachable) {
+        return new Response('Bad Gateway', { status: 502 });
+      }
+      if (url.startsWith('https://events.pes.edu/browse/')) {
+        return new Response(mockBrowseHackathonHtml, {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      if (url === 'https://events.pes.edu/11629/') {
+        return new Response(mockDetail11629Html, {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      if (url === 'https://events.pes.edu/11632/') {
+        return new Response(mockDetail11632Html, {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      return new Response('Not Found', { status: 404 });
+    },
+  });
+
+  // 1. Test direct URL extraction on events.pes.edu/11629/
+  const extractRes = await fetch(`${baseUrl}/api/events/extract-url`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: 'https://events.pes.edu/11629/' }),
+  });
+  const extractData = await extractRes.json();
+  assert.equal(extractRes.status, 200);
+  assert.equal(extractData.ok, true);
+  assert.equal(
+    extractData.data.title,
+    'Kodikon 5.0 — 24-Hour National Hackathon'
+  );
+  assert.equal(extractData.data.organizer, 'Embrione & Department of CSE');
+  assert.equal(extractData.data.eventType, 'hackathon');
+  assert.equal(extractData.data.startAt, '2026-11-07');
+  assert.equal(extractData.data.endAt, '2026-11-08');
+  assert.equal(extractData.data.registrationDeadline, '2026-11-04');
+  assert.equal(extractData.data.venueName, 'MRD Auditorium');
+  assert.equal(extractData.data.campus, 'RR Campus');
+  assert.equal(extractData.data.minTeamSize, 3);
+  assert.equal(extractData.data.maxTeamSize, 4);
+  assert.equal(
+    extractData.data.registrationUrl,
+    'https://unstop.com/hackathons/kodikon-5-pes-university'
+  );
+
+  // 2. Test sync-pesu-public endpoint
+  const syncRes = await fetch(`${baseUrl}/api/events/sync-pesu-public`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ forceRefresh: true }),
+  });
+  const syncData = await syncRes.json();
+  assert.equal(syncRes.status, 200);
+  assert.equal(syncData.ok, true);
+  assert.equal(syncData.discoveredCount, 2);
+  assert.equal(syncData.publishedOrUpdatedCount, 2);
+
+  const syncedKodikon = syncData.hackathons.find(
+    (h: { id: string }) => h.id === 'pes_event_11629'
+  );
+  const syncedTalk = syncData.hackathons.find(
+    (h: { id: string }) => h.id === 'pes_event_11632'
+  );
+
+  assert.ok(syncedKodikon, 'Kodikon hackathon should be published');
+  assert.equal(syncedKodikon.sourceType, 'pes_public_events');
+  assert.equal(syncedKodikon.eventType, 'hackathon');
+  assert.equal(syncedKodikon.matchable, true);
+  assert.equal(syncedKodikon.startAt, '2026-11-07');
+  assert.equal(syncedKodikon.endAt, '2026-11-08');
+
+  assert.ok(syncedTalk, 'Expert Talk should be recorded with accurate classification');
+  assert.equal(syncedTalk.sourceType, 'pes_public_events');
+  assert.equal(
+    syncedTalk.eventType,
+    'tech_talk',
+    'Expert Talk with #Talks/#InfoSession must NEVER be classified as a hackathon'
+  );
+  assert.equal(
+    syncedTalk.matchable,
+    false,
+    'Talks must have matchable = false'
+  );
+
+  // 3. Test unreachable events.pes.edu handling (never fabricates fake events)
+  simulateUnreachable = true;
+  const unreachableRes = await fetch(`${baseUrl}/api/events/sync-pesu-public`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ forceRefresh: true }),
+  });
+  const unreachableData = await unreachableRes.json();
+  assert.equal(unreachableRes.status, 502);
+  assert.equal(unreachableData.ok, false);
+  assert.equal(unreachableData.reachablePagesCount, 0);
+  assert.equal(unreachableData.discoveredCount, 0);
+
+  // Cleanup
+  await db
+    .delete(hackathons)
+    .where(eq(hackathons.slug, 'pes_event_11629'));
+  await db
+    .delete(hackathons)
+    .where(eq(hackathons.slug, 'pes_event_11632'));
+  await db
+    .delete(eventCandidates)
+    .where(eq(eventCandidates.candidateUid, 'cand_pes_public_11629'));
+  await db
+    .delete(eventCandidates)
+    .where(eq(eventCandidates.candidateUid, 'cand_pes_public_11632'));
+});
+
+test('31. Cross-source duplicate & update detection + announcement-to-candidate privacy sanitization & admin approval workflow', async () => {
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, hackathons, eventCandidates, oauthSessions } =
+    await import('../src/db/schema.ts');
+  const { createOAuthSessionRecord, upsertUserAndProfile } = await import(
+    '../src/db/repository.ts'
+  );
+  const {
+    detectTechnicalEventFromAnnouncement,
+    buildSanitizedCandidateDraftFromAnnouncement,
+  } = await import('../src/lib/eventsAndAnnouncements.ts');
+  const { eq } = await import('drizzle-orm');
+
+  await upsertUserAndProfile({
+    uid: 'student_submitter_dup_test',
+    email: 'submitter@pesu.pes.edu',
+    displayName: 'Submitter Student',
+    campus: 'RR Campus',
+    verified: true,
+    verificationStatus: 'verified_pesu_oidc',
+  });
+
+  await upsertUserAndProfile({
+    uid: 'admin_reviewer_dup_test',
+    email: 'admin.dup@pes.edu',
+    displayName: 'Moderator Admin',
+    campus: 'RR Campus',
+    verified: true,
+    verificationStatus: 'verified_pesu_oidc',
+    isAdmin: true,
+  });
+
+  await createOAuthSessionRecord({
+    sessionToken: 'pesu_tok_student_submitter',
+    uid: 'student_submitter_dup_test',
+    pesuSub: 'sub_student_dup',
+    accessToken: 'acc_student_dup',
+    refreshToken: null,
+    scopes: ['openid', 'profile', 'email'],
+    expiresAt: new Date(Date.now() + 3600_000),
+  });
+
+  await createOAuthSessionRecord({
+    sessionToken: 'pesu_tok_admin_reviewer',
+    uid: 'admin_reviewer_dup_test',
+    pesuSub: 'sub_admin_dup',
+    accessToken: 'acc_admin_dup',
+    refreshToken: null,
+    scopes: ['openid', 'profile', 'email'],
+    expiresAt: new Date(Date.now() + 3600_000),
+  });
+
+  setServerTestOverrides({
+    fetchFn: async () => new Response('OK', { status: 200 }),
+  });
+
+  // 1. Detect technical event from a PESU Academy announcement containing personal student info
+  //    and verify publication date (2026-10-01) is NEVER mistaken for event startAt!
+  const privateAnnouncement = {
+    id: 'ann_priv_501',
+    title: 'Aegis Cyber CTF & Security Hackathon 2026',
+    date: '2026-10-01', // Announcement publication date
+    description:
+      'Dear PES1UG23CS999 (student.private@pesu.pes.edu, +91 9876543210), register for Aegis Cyber CTF & Security Hackathon 2026 organized by CyberSec Club PESU. Event dates: 21 Nov 2026 – 22 Nov 2026. Teams of 2 to 4 students.',
+    image: null,
+    attachments: 1,
+  };
+
+  const detected = detectTechnicalEventFromAnnouncement(privateAnnouncement);
+  assert.ok(detected, 'Should detect CTF/Hackathon from announcement');
+  assert.equal(
+    detected!.startAt,
+    '2026-11-21',
+    'Must extract stated event start date (2026-11-21) and NEVER copy announcement publication date (2026-10-01)'
+  );
+  assert.equal(detected!.endAt, '2026-11-22');
+  assert.equal(detected!.minTeamSize, 2);
+  assert.equal(detected!.maxTeamSize, 4);
+
+  // Also test announcement where no event date is mentioned -> startAt must be null ("Date TBA"), NEVER publication date!
+  const undatedAnnouncement = {
+    id: 'ann_priv_502',
+    title: 'PESU Open Source Buildathon — Registrations Opening Soon',
+    date: '2026-10-05', // Publication date
+    description:
+      'Get ready for the annual PESU Open Source Buildathon! Venue and exact dates will be announced next week.',
+    image: null,
+    attachments: 0,
+  };
+  const detectedUndated =
+    detectTechnicalEventFromAnnouncement(undatedAnnouncement);
+  assert.ok(detectedUndated);
+  assert.equal(
+    detectedUndated!.startAt,
+    null,
+    'When announcement does not state an event date, startAt must be null ("Date TBA"), never the publication date'
+  );
+
+  // 2. Sanitize candidate draft from announcement (strips SRN, email, phone, and raw private prose)
+  const draft = buildSanitizedCandidateDraftFromAnnouncement({
+    announcement: privateAnnouncement,
+    detected: detected!,
+    includeSanitizedSummary: false,
+  });
+  assert.ok(!JSON.stringify(draft).includes('PES1UG23CS999'));
+  assert.ok(!JSON.stringify(draft).includes('student.private@pesu.pes.edu'));
+  assert.ok(!JSON.stringify(draft).includes('9876543210'));
+
+  // 3. Submit Source 1 (Announcement Hint) -> Staged for review, NOT in public hackathons list
+  const resCand1 = await fetch(`${baseUrl}/api/hackathons/candidates`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer pesu_tok_student_submitter',
+    },
+    body: JSON.stringify({
+      candidate: {
+        ...draft,
+        id: 'cand_src1_ann_aegis',
+        externalFingerprint: 'fp_aegis_src1',
+        title: 'Aegis Cyber CTF & Security Hackathon 2026',
+        organizer: 'CyberSec Club PESU',
+      },
+    }),
+  });
+  const dataCand1 = await resCand1.json();
+  assert.equal(resCand1.status, 201);
+  assert.equal(dataCand1.ok, true);
+
+  // Verify unreviewed candidate is NOT visible in public `/api/bootstrap` hackathons
+  const bootUnauth = await (await fetch(`${baseUrl}/api/bootstrap`)).json();
+  assert.ok(
+    !bootUnauth.hackathons.some((h: { name: string }) =>
+      h.name.includes('Aegis Cyber CTF')
+    ),
+    'Unreviewed candidate must never appear in public event list before admin approval'
+  );
+
+  // 4. Submit Source 2 (Student Public URL submission for the SAME event with newly discovered venue & link)
+  //    Should consolidate with the existing pending candidate instead of creating a 2nd candidate card!
+  const resCand2 = await fetch(`${baseUrl}/api/hackathons/candidates`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer pesu_tok_student_submitter',
+    },
+    body: JSON.stringify({
+      candidate: {
+        id: 'cand_src2_url_aegis',
+        source: 'submitted_public_url',
+        sourceUrl: 'https://events.pes.edu/99901/',
+        originalSubmissionUrl: 'https://events.pes.edu/99901/',
+        verifiedCanonicalUrl: 'https://events.pes.edu/99901/',
+        sourceUrlStatus: 'verified',
+        externalFingerprint: 'fp_aegis_src2',
+        title: 'Aegis Cyber CTF & Security Hackathon 2026',
+        organizer: 'CyberSec Club PESU',
+        eventType: 'ctf',
+        matchable: true,
+        themes: ['Cybersecurity'],
+        description: 'Official public page for Aegis Cyber CTF.',
+        startAt: '2026-11-21',
+        endAt: '2026-11-22',
+        registrationDeadline: '2026-11-19',
+        timezone: 'Asia/Kolkata',
+        venue: { campus: 'RR Campus', name: 'GJBC Seminar Hall 2' },
+        format: 'onsite',
+        teamSize: { min: 2, max: 4 },
+        registrationUrl: 'https://events.pes.edu/99901/',
+        fieldEvidence: {},
+        classification: {
+          ruleGatePassed: true,
+          mlScore: 1,
+          reason: 'Verified CTF.',
+        },
+        reviewStatus: 'new',
+      },
+    }),
+  });
+  const dataCand2 = await resCand2.json();
+  assert.equal(resCand2.status, 201);
+  assert.equal(
+    dataCand2.candidate.id,
+    dataCand1.candidate.id,
+    'Same event from second source must consolidate into the existing pending candidate'
+  );
+  assert.equal(dataCand2.candidate.venue.name, 'GJBC Seminar Hall 2');
+
+  // 5. Admin approves the candidate -> Published as 1 Hackathon card
+  const approveRes = await fetch(
+    `${baseUrl}/api/admin/candidates/${dataCand1.candidate.id}/approve`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer pesu_tok_admin_reviewer',
+      },
+      body: JSON.stringify({}),
+    }
+  );
+  const approveData = await approveRes.json();
+  assert.equal(approveRes.status, 200);
+  assert.equal(approveData.ok, true);
+  const publishedSlug = approveData.hackathon.id;
+
+  // 6. Submit Source 3 (Updated registration deadline from organizer for the already-published event)
+  //    Should detect `updatesExistingHackathonId = publishedSlug` with `proposedDiffs`!
+  const resCand3 = await fetch(`${baseUrl}/api/hackathons/candidates`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer pesu_tok_student_submitter',
+    },
+    body: JSON.stringify({
+      candidate: {
+        id: 'cand_src3_update_aegis',
+        source: 'approved_organizer',
+        sourceUrl: 'https://events.pes.edu/99901/',
+        originalSubmissionUrl: 'https://events.pes.edu/99901/',
+        verifiedCanonicalUrl: 'https://events.pes.edu/99901/',
+        sourceUrlStatus: 'verified',
+        externalFingerprint: 'fp_aegis_src3',
+        title: 'Aegis Cyber CTF & Security Hackathon 2026',
+        organizer: 'CyberSec Club PESU',
+        eventType: 'ctf',
+        matchable: true,
+        themes: ['Cybersecurity'],
+        description: 'Extended deadline for Aegis Cyber CTF.',
+        startAt: '2026-11-21',
+        endAt: '2026-11-22',
+        registrationDeadline: '2026-11-20', // Extended from 2026-11-19 to 2026-11-20
+        timezone: 'Asia/Kolkata',
+        venue: { campus: 'RR Campus', name: 'MRD Main Auditorium' }, // Updated venue
+        format: 'onsite',
+        teamSize: { min: 2, max: 4 },
+        registrationUrl: 'https://events.pes.edu/99901/',
+        fieldEvidence: {},
+        classification: {
+          ruleGatePassed: true,
+          mlScore: 1,
+          reason: 'Verified CTF.',
+        },
+        reviewStatus: 'needs_confirmation',
+      },
+    }),
+  });
+  const dataCand3 = await resCand3.json();
+  assert.equal(resCand3.status, 201);
+  assert.equal(
+    dataCand3.candidate.updatesExistingHackathonId,
+    publishedSlug,
+    'Third source with updated fields must link to existing published hackathon via updatesExistingHackathonId'
+  );
+  assert.ok(
+    Array.isArray(dataCand3.candidate.proposedDiffs) &&
+      dataCand3.candidate.proposedDiffs.length >= 1,
+    'Must record proposedDiffs for registrationDeadline and venue'
+  );
+
+  // Admin approves Source 3 update -> Updates the existing hackathon in-place without creating a duplicate card!
+  const approveUpdateRes = await fetch(
+    `${baseUrl}/api/admin/candidates/${dataCand3.candidate.id}/approve`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer pesu_tok_admin_reviewer',
+      },
+      body: JSON.stringify({}),
+    }
+  );
+  const approveUpdateData = await approveUpdateRes.json();
+  assert.equal(approveUpdateRes.status, 200);
+  assert.equal(
+    approveUpdateData.hackathon.id,
+    publishedSlug,
+    'Approving an update candidate must update the existing hackathon rather than creating a duplicate card'
+  );
+  assert.equal(approveUpdateData.hackathon.venue.name, 'MRD Main Auditorium');
+  assert.equal(
+    approveUpdateData.hackathon.registrationDeadline,
+    '2026-11-20'
+  );
+
+  const bootAfter = await (await fetch(`${baseUrl}/api/bootstrap`)).json();
+  const aegisCards = bootAfter.hackathons.filter((h: { name: string }) =>
+    h.name.includes('Aegis Cyber CTF')
+  );
+  assert.equal(
+    aegisCards.length,
+    1,
+    'Same event from 3 sources must result in exactly 1 published card'
+  );
+
+  // Cleanup
+  await db.delete(hackathons).where(eq(hackathons.slug, publishedSlug));
+  await db
+    .delete(eventCandidates)
+    .where(eq(eventCandidates.candidateUid, dataCand1.candidate.id));
+  await db
+    .delete(eventCandidates)
+    .where(eq(eventCandidates.candidateUid, dataCand3.candidate.id));
+  await db
+    .delete(oauthSessions)
+    .where(eq(oauthSessions.uid, 'student_submitter_dup_test'));
+  await db
+    .delete(oauthSessions)
+    .where(eq(oauthSessions.uid, 'admin_reviewer_dup_test'));
+  await db
+    .delete(profiles)
+    .where(eq(profiles.uid, 'student_submitter_dup_test'));
+  await db.delete(users).where(eq(users.uid, 'student_submitter_dup_test'));
+  await db
+    .delete(profiles)
+    .where(eq(profiles.uid, 'admin_reviewer_dup_test'));
+  await db.delete(users).where(eq(users.uid, 'admin_reviewer_dup_test'));
+});
+
+test('32. IST (Asia/Kolkata) Date & Time Filtering: Upcoming vs Past, chronological sorting, multi-day overlap with This Week / This Month / Custom Range, and undated Date TBA preservation', async () => {
+  const {
+    filterAndSortEventsByTime,
+    filterAnnouncementsByPublicationDate,
+    formatEventDateDisplayIST,
+    getWeekBoundsIST,
+    getMonthBoundsIST,
+  } = await import('../src/lib/eventsAndAnnouncements.ts');
+
+  // Reference date: Wednesday, 18 Nov 2026 in Asia/Kolkata (IST)
+  // Week bounds (Mon–Sun): 2026-11-16 to 2026-11-22
+  // Month bounds: 2026-11-01 to 2026-11-30
+  const referenceDate = new Date('2026-11-18T10:00:00+05:30');
+  const weekBounds = getWeekBoundsIST('2026-11-18');
+  assert.equal(weekBounds.weekStart, '2026-11-16');
+  assert.equal(weekBounds.weekEnd, '2026-11-22');
+
+  const monthBounds = getMonthBoundsIST('2026-11-18');
+  assert.equal(monthBounds.monthStart, '2026-11-01');
+  assert.equal(monthBounds.monthEnd, '2026-11-30');
+
+  const sampleEvents = [
+    {
+      id: 'ev_past_oct',
+      title: 'October Legacy Hackathon',
+      startAt: '2026-10-10',
+      endAt: '2026-10-11',
+      registrationDeadline: '2026-10-08',
+    },
+    {
+      id: 'ev_past_early_nov',
+      title: 'Early November Sprint',
+      startAt: '2026-11-05',
+      endAt: '2026-11-06',
+      registrationDeadline: '2026-11-03',
+    },
+    {
+      id: 'ev_multiday_spanning_week_start',
+      title: 'Multi-Day Buildathon Overlapping Week Start',
+      startAt: '2026-11-14', // Started Saturday last week
+      endAt: '2026-11-17', // Ends Tuesday this week (overlaps This Week!)
+      registrationDeadline: '2026-11-12',
+    },
+    {
+      id: 'ev_ongoing_today',
+      title: 'Ongoing Mid-Week Hackathon',
+      startAt: '2026-11-17',
+      endAt: '2026-11-19', // Ongoing on 2026-11-18
+      registrationDeadline: '2026-11-16',
+    },
+    {
+      id: 'ev_this_weekend',
+      title: 'Weekend AI Ideathon',
+      startAt: '2026-11-21',
+      endAt: '2026-11-22',
+      registrationDeadline: '2026-11-20',
+    },
+    {
+      id: 'ev_late_nov_this_month',
+      title: 'Late November Systems Jam',
+      startAt: '2026-11-28',
+      endAt: '2026-11-29',
+      registrationDeadline: '2026-11-25',
+    },
+    {
+      id: 'ev_dec_future',
+      title: 'December Winter Championship',
+      startAt: '2026-12-12',
+      endAt: '2026-12-13',
+      registrationDeadline: '2026-12-05',
+    },
+    {
+      id: 'ev_undated_tba',
+      title: 'Undated Mystery Hackathon (Date TBA)',
+      startAt: null,
+      endAt: null,
+      registrationDeadline: null,
+    },
+  ];
+
+  // 1. UPCOMING (default): includes ongoing (endAt >= 2026-11-18) and future events, sorted nearest startAt first
+  const upcoming = filterAndSortEventsByTime(sampleEvents, {
+    preset: 'UPCOMING',
+    referenceDate,
+  });
+  assert.deepEqual(
+    upcoming.map((e) => e.id),
+    [
+      'ev_ongoing_today',
+      'ev_this_weekend',
+      'ev_late_nov_this_month',
+      'ev_dec_future',
+    ],
+    'UPCOMING must include ongoing and future events sorted chronologically nearest first, and exclude past and undated events'
+  );
+
+  // 2. THIS_WEEK (2026-11-16 to 2026-11-22): must include multi-day event starting 2026-11-14 and ending 2026-11-17!
+  const thisWeek = filterAndSortEventsByTime(sampleEvents, {
+    preset: 'THIS_WEEK',
+    referenceDate,
+  });
+  assert.deepEqual(
+    thisWeek.map((e) => e.id),
+    [
+      'ev_multiday_spanning_week_start',
+      'ev_ongoing_today',
+      'ev_this_weekend',
+    ],
+    'THIS_WEEK must include multi-day events whose date range overlaps [weekStart, weekEnd]'
+  );
+
+  // 3. THIS_MONTH (2026-11-01 to 2026-11-30)
+  const thisMonth = filterAndSortEventsByTime(sampleEvents, {
+    preset: 'THIS_MONTH',
+    referenceDate,
+  });
+  assert.deepEqual(
+    thisMonth.map((e) => e.id),
+    [
+      'ev_past_early_nov',
+      'ev_multiday_spanning_week_start',
+      'ev_ongoing_today',
+      'ev_this_weekend',
+      'ev_late_nov_this_month',
+    ]
+  );
+
+  // 4. PAST: events with endAt < 2026-11-18, sorted most recent first
+  const past = filterAndSortEventsByTime(sampleEvents, {
+    preset: 'PAST',
+    referenceDate,
+  });
+  assert.deepEqual(
+    past.map((e) => e.id),
+    [
+      'ev_multiday_spanning_week_start',
+      'ev_past_early_nov',
+      'ev_past_oct',
+    ],
+    'PAST must sort most recently ended events first'
+  );
+
+  // 5. ALL: includes undated "Date TBA" events without fabricating fallback dates
+  const allEvents = filterAndSortEventsByTime(sampleEvents, {
+    preset: 'ALL',
+    referenceDate,
+  });
+  assert.equal(allEvents.length, sampleEvents.length);
+  const tbaEvent = allEvents.find((e) => e.id === 'ev_undated_tba')!;
+  assert.equal(tbaEvent.startAt, null);
+  assert.equal(formatEventDateDisplayIST(tbaEvent), 'Date TBA');
+
+  // 6. CUSTOM range overlap (2026-11-25 to 2026-12-15)
+  const customRange = filterAndSortEventsByTime(sampleEvents, {
+    preset: 'CUSTOM',
+    customStart: '2026-11-25',
+    customEnd: '2026-12-15',
+    referenceDate,
+  });
+  assert.deepEqual(
+    customRange.map((e) => e.id),
+    ['ev_late_nov_this_month', 'ev_dec_future']
+  );
+
+  // 7. Announcements filtered strictly by publication date
+  const sampleAnns = [
+    {
+      id: 'a1',
+      title: 'Published This Week',
+      date: '2026-11-17',
+      description: 'Event is in December 2026-12-20',
+      image: null,
+      attachments: 0,
+    },
+    {
+      id: 'a2',
+      title: 'Published Last Month',
+      date: '2026-10-15',
+      description: 'Event is this week 2026-11-19',
+      image: null,
+      attachments: 0,
+    },
+  ];
+  const annsThisWeek = filterAnnouncementsByPublicationDate(sampleAnns, {
+    preset: 'THIS_WEEK',
+    referenceDate,
+  });
+  assert.deepEqual(
+    annsThisWeek.map((a) => a.id),
+    ['a1'],
+    'Announcements must be filtered strictly by their publication date, never by dates mentioned in description'
+  );
+});
+
+
 
 
 

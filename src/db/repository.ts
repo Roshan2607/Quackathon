@@ -30,6 +30,10 @@ import {
   Team,
   User,
 } from '../types/domain.ts';
+import {
+  areEventsSameRealWorldEvent,
+  computeProposedEventDiffs,
+} from '../lib/eventsAndAnnouncements.ts';
 
 function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
   if (!raw) return fallback;
@@ -113,6 +117,25 @@ export function mapDbProfileToDomain(
 export function mapDbHackathonToDomain(
   row: typeof schema.hackathons.$inferSelect
 ): Hackathon {
+  const parsedProv = safeJsonParse<Record<string, any>>(
+    row.fieldProvenanceJson,
+    {}
+  );
+  const metaSource = parsedProv?._meta?.sourceType as EventSourceType | undefined;
+  const combinedUrls = [
+    row.verifiedCanonicalUrl,
+    row.originalSubmissionUrl,
+    row.registrationUrl,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  const resolvedSourceType: EventSourceType =
+    metaSource ||
+    (combinedUrls.includes('events.pes.edu')
+      ? 'pes_public_events'
+      : 'submitted_public_url');
+
   return {
     id: row.slug,
     name: row.name,
@@ -144,8 +167,9 @@ export function mapDbHackathonToDomain(
     minTeamSize: row.minTeamSize ?? null,
     maxTeamSize: row.maxTeamSize ?? null,
     eligibilityNotes: row.eligibilityNotes ?? null,
+    sourceType: resolvedSourceType,
     sourceIds: [row.slug],
-    fieldProvenance: safeJsonParse(row.fieldProvenanceJson, {}),
+    fieldProvenance: parsedProv,
     suggestedByCount: 1,
     classification: {
       category: (row.eventType as EventType) || 'hackathon',
@@ -153,7 +177,10 @@ export function mapDbHackathonToDomain(
       mlConfidenceScore: row.ruleGatePassed ? 1 : 0,
       reason: row.classificationReason || 'Verified event entry.',
     },
-    lastVerifiedAt: row.createdAt.toISOString(),
+    lastVerifiedAt:
+      parsedProv?._meta?.verifiedAt ?? row.createdAt.toISOString(),
+    extractedAt:
+      parsedProv?._meta?.extractedAt ?? row.createdAt.toISOString(),
     verificationStatus:
       row.verificationStatus === 'unconfirmed_constraints'
         ? 'unconfirmed_constraints'
@@ -166,6 +193,21 @@ export function mapDbHackathonToDomain(
 export function mapDbCandidateToDomain(
   row: typeof schema.eventCandidates.$inferSelect
 ): EventCandidate {
+  const parsedEvidence = safeJsonParse<Record<string, any>>(
+    row.fieldEvidenceJson,
+    {}
+  );
+  const storedDiffs = Array.isArray(parsedEvidence?._proposedDiffs)
+    ? parsedEvidence._proposedDiffs
+    : undefined;
+  const cleanEvidence: Record<string, { sourceUrl: string; excerpt: string }[]> =
+    {};
+  for (const [k, v] of Object.entries(parsedEvidence || {})) {
+    if (k !== '_proposedDiffs' && Array.isArray(v)) {
+      cleanEvidence[k] = v;
+    }
+  }
+
   return {
     id: row.candidateUid,
     source: (row.source as EventSourceType) || 'submitted_public_url',
@@ -179,6 +221,7 @@ export function mapDbCandidateToDomain(
     externalFingerprint: row.externalFingerprint,
     duplicateOfHackathonId: row.duplicateOfHackathonSlug ?? undefined,
     updatesExistingHackathonId: row.updatesExistingHackathonSlug ?? undefined,
+    proposedDiffs: storedDiffs,
     title: row.title,
     organizer: row.organizer,
     eventType: (row.eventType as EventType) || 'unknown',
@@ -201,7 +244,7 @@ export function mapDbCandidateToDomain(
     },
     registrationUrl: row.registrationUrl ?? null,
     eligibilityNotes: row.eligibilityNotes ?? null,
-    fieldEvidence: safeJsonParse(row.fieldEvidenceJson, {}),
+    fieldEvidence: cleanEvidence,
     classification: {
       ruleGatePassed: row.ruleGatePassed,
       mlScore: row.ruleGatePassed ? 1 : 0,
@@ -608,6 +651,8 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
   state: string;
   code?: string | null;
   incomingSessionId?: string | null;
+  candidateSessionIds?: string[];
+  callbackCookieStatus?: 'valid' | 'missing' | 'invalid_signature';
   authenticatedUid?: string | null;
 }): Promise<{
   status:
@@ -615,11 +660,20 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
     | 'processing'
     | 'completed_same_session'
     | 'failed_previously'
+    | 'session_missing'
+    | 'session_invalid'
     | 'session_mismatch'
     | 'expired'
     | 'replayed'
     | 'invalid';
   transactionStatus: OAuthTransactionLifecycleStatus | 'not_found';
+  sessionBindingMatched: boolean;
+  matchedSessionId: string | null;
+  transactionMeta: {
+    clientOrigin: string | null;
+    redirectUri: string;
+    initiatingSessionIdHash: string;
+  } | null;
   transaction: ClaimedOAuthTransaction | null;
   outcome?: OAuthTransactionRecordedOutcome;
 }> {
@@ -628,6 +682,9 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
     return {
       status: 'invalid',
       transactionStatus: 'not_found',
+      sessionBindingMatched: false,
+      matchedSessionId: null,
+      transactionMeta: null,
       transaction: null,
     };
   }
@@ -638,10 +695,18 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
       params.code && params.code.trim()
         ? hashSessionToken(params.code.trim())
         : null;
-    const incomingSidHash =
-      params.incomingSessionId && params.incomingSessionId.trim()
-        ? hashSessionToken(params.incomingSessionId.trim())
-        : null;
+
+    const candidateSids = Array.from(
+      new Set(
+        [
+          ...(params.candidateSessionIds ?? []),
+          params.incomingSessionId ?? '',
+        ]
+          .map((s) => s.trim())
+          .filter(Boolean)
+      )
+    );
+
     const now = new Date();
 
     const existingRows = await db
@@ -655,9 +720,18 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
       return {
         status: 'invalid',
         transactionStatus: 'not_found',
+        sessionBindingMatched: false,
+        matchedSessionId: null,
+        transactionMeta: null,
         transaction: null,
       };
     }
+
+    const transactionMeta = {
+      clientOrigin: row.clientOrigin ?? null,
+      redirectUri: row.redirectUri,
+      initiatingSessionIdHash: row.initiatingSessionIdHash,
+    };
 
     // 1. Check expiration before any state transition
     if (row.expiresAt.getTime() <= now.getTime() || row.status === 'expired') {
@@ -671,25 +745,161 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
       return {
         status: 'expired',
         transactionStatus: 'expired',
+        sessionBindingMatched: false,
+        matchedSessionId: null,
+        transactionMeta,
         transaction: null,
       };
     }
 
-    // 2. Reject callbacks arriving from a different explicit browser session
-    if (
-      incomingSidHash &&
-      row.initiatingSessionIdHash &&
-      incomingSidHash !== row.initiatingSessionIdHash
-    ) {
+    // Check whether any verified session cookie sent by the browser matches the initiating session hash
+    const matchedSessionId =
+      candidateSids.find(
+        (sid) => hashSessionToken(sid) === row.initiatingSessionIdHash
+      ) ?? null;
+    const sessionBindingMatched = Boolean(matchedSessionId);
+
+    const baseTx: ClaimedOAuthTransaction = {
+      state: rawState,
+      stateHash: row.stateHash,
+      codeHash: row.codeHash ?? null,
+      initiatingSessionIdHash: row.initiatingSessionIdHash,
+      codeVerifier: '', // Never expose verifier on already-claimed rows
+      redirectUri: row.redirectUri,
+      clientOrigin: row.clientOrigin ?? null,
+      scopes: safeJsonParse<string[]>(row.scopesJson, []),
+      issuer: row.issuer,
+      authorizationEndpoint: row.authorizationEndpoint,
+      tokenEndpoint: row.tokenEndpoint,
+      userinfoEndpoint: row.userinfoEndpoint ?? null,
+      status: (row.status as OAuthTransactionLifecycleStatus) || 'processing',
+      createdAt: row.createdAt,
+      expiresAt: row.expiresAt,
+    };
+
+    // 2. If already completed: check if duplicate callback is from the same authenticated session & same code
+    if (row.status === 'completed') {
+      const sameCode = !codeHash || !row.codeHash || codeHash === row.codeHash;
+      const sameAuthenticatedUser =
+        Boolean(params.authenticatedUid) &&
+        Boolean(row.completedUid) &&
+        params.authenticatedUid === row.completedUid;
+
+      if (sameCode && (sessionBindingMatched || sameAuthenticatedUser)) {
+        const activeSessionRows = await db
+          .select()
+          .from(schema.oauthSessions)
+          .where(
+            and(
+              eq(
+                schema.oauthSessions.initiatingSessionIdHash,
+                row.initiatingSessionIdHash
+              ),
+              eq(schema.oauthSessions.revoked, false)
+            )
+          )
+          .orderBy(desc(schema.oauthSessions.createdAt))
+          .limit(1);
+
+        const hasActiveSession =
+          sameAuthenticatedUser ||
+          Boolean(
+            activeSessionRows[0] &&
+              activeSessionRows[0].expiresAt.getTime() > now.getTime()
+          );
+
+        if (hasActiveSession) {
+          return {
+            status: 'completed_same_session',
+            transactionStatus: 'completed',
+            sessionBindingMatched: true,
+            matchedSessionId,
+            transactionMeta,
+            transaction: baseTx,
+            outcome: {
+              status: 'completed',
+              completedUid: row.completedUid ?? null,
+              outcomeStatus: row.outcomeStatus ?? 200,
+              outcomeErrorCategory: row.outcomeErrorCategory ?? 'NONE',
+              outcomeMessage: row.outcomeMessage ?? null,
+              outcomeIdentity: safeJsonParse<Record<string, unknown> | null>(
+                row.outcomeIdentityJson,
+                null
+              ),
+            },
+          };
+        }
+      }
+
+      return {
+        status: 'replayed',
+        transactionStatus: 'completed',
+        sessionBindingMatched,
+        matchedSessionId,
+        transactionMeta,
+        transaction: null,
+      };
+    }
+
+    // 3. If previous callback failed during token exchange or consent
+    if (row.status === 'failed') {
+      return {
+        status: 'failed_previously',
+        transactionStatus: 'failed',
+        sessionBindingMatched,
+        matchedSessionId,
+        transactionMeta,
+        transaction: baseTx,
+        outcome: {
+          status: 'failed',
+          completedUid: null,
+          outcomeStatus: row.outcomeStatus ?? 400,
+          outcomeErrorCategory:
+            row.outcomeErrorCategory ?? 'OAUTH_STATE_INVALID',
+          outcomeMessage: row.outcomeMessage ?? null,
+          outcomeIdentity: null,
+        },
+      };
+    }
+
+    // 4. Enforce strict browser-session binding for pending/processing transactions
+    if (row.initiatingSessionIdHash && !sessionBindingMatched) {
+      const currentLifecycle =
+        (row.status as OAuthTransactionLifecycleStatus) || 'pending';
+      if (params.callbackCookieStatus === 'invalid_signature') {
+        return {
+          status: 'session_invalid',
+          transactionStatus: currentLifecycle,
+          sessionBindingMatched: false,
+          matchedSessionId: null,
+          transactionMeta,
+          transaction: null,
+        };
+      }
+      if (
+        params.callbackCookieStatus === 'missing' ||
+        candidateSids.length === 0
+      ) {
+        return {
+          status: 'session_missing',
+          transactionStatus: currentLifecycle,
+          sessionBindingMatched: false,
+          matchedSessionId: null,
+          transactionMeta,
+          transaction: null,
+        };
+      }
       return {
         status: 'session_mismatch',
-        transactionStatus:
-          (row.status as OAuthTransactionLifecycleStatus) || 'pending',
+        transactionStatus: currentLifecycle,
+        sessionBindingMatched: false,
+        matchedSessionId: null,
+        transactionMeta,
         transaction: null,
       };
     }
 
-    // 3. If pending, atomically claim: pending -> processing
+    // 5. If pending, atomically claim: pending -> processing
     if (row.status === 'pending' && !row.consumed) {
       const claimedRows = await db
         .update(schema.oauthTransactions)
@@ -728,6 +938,9 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
           return {
             status: 'invalid',
             transactionStatus: 'failed',
+            sessionBindingMatched: true,
+            matchedSessionId,
+            transactionMeta,
             transaction: null,
           };
         }
@@ -735,6 +948,9 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
         return {
           status: 'claimed',
           transactionStatus: 'processing',
+          sessionBindingMatched: true,
+          matchedSessionId,
+          transactionMeta,
           transaction: {
             state: rawState,
             stateHash: claimed.stateHash,
@@ -765,122 +981,37 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
         return {
           status: 'invalid',
           transactionStatus: 'not_found',
+          sessionBindingMatched: false,
+          matchedSessionId: null,
+          transactionMeta,
           transaction: null,
         };
       }
       row = refreshedRows[0];
     }
 
-    const baseTx: ClaimedOAuthTransaction = {
-      state: rawState,
-      stateHash: row.stateHash,
-      codeHash: row.codeHash ?? null,
-      initiatingSessionIdHash: row.initiatingSessionIdHash,
-      codeVerifier: '', // Never expose verifier on already-claimed rows
-      redirectUri: row.redirectUri,
-      clientOrigin: row.clientOrigin ?? null,
-      scopes: safeJsonParse<string[]>(row.scopesJson, []),
-      issuer: row.issuer,
-      authorizationEndpoint: row.authorizationEndpoint,
-      tokenEndpoint: row.tokenEndpoint,
-      userinfoEndpoint: row.userinfoEndpoint ?? null,
-      status: (row.status as OAuthTransactionLifecycleStatus) || 'processing',
-      createdAt: row.createdAt,
-      expiresAt: row.expiresAt,
-    };
-
-    // 4. If currently processing (concurrent duplicate callback with same code)
+    // 6. If currently processing (concurrent duplicate callback with same code)
     if (row.status === 'processing') {
       if (codeHash && row.codeHash && codeHash !== row.codeHash) {
         return {
           status: 'replayed',
           transactionStatus: 'processing',
+          sessionBindingMatched: true,
+          matchedSessionId,
+          transactionMeta,
           transaction: null,
         };
       }
       return {
         status: 'processing',
         transactionStatus: 'processing',
-        transaction: baseTx,
-      };
-    }
-
-    // 5. If already completed: check if duplicate callback is from the same authenticated session & same code
-    if (row.status === 'completed') {
-      const sameCode = !codeHash || !row.codeHash || codeHash === row.codeHash;
-      const sameInitiatingSession =
-        Boolean(incomingSidHash) &&
-        incomingSidHash === row.initiatingSessionIdHash;
-      const sameAuthenticatedUser =
-        Boolean(params.authenticatedUid) &&
-        Boolean(row.completedUid) &&
-        params.authenticatedUid === row.completedUid;
-
-      if (sameCode && (sameInitiatingSession || sameAuthenticatedUser)) {
-        // Also confirm the session has not been revoked in oauth_sessions
-        const activeSessionRows = await db
-          .select()
-          .from(schema.oauthSessions)
-          .where(
-            and(
-              eq(
-                schema.oauthSessions.initiatingSessionIdHash,
-                row.initiatingSessionIdHash
-              ),
-              eq(schema.oauthSessions.revoked, false)
-            )
-          )
-          .orderBy(desc(schema.oauthSessions.createdAt))
-          .limit(1);
-
-        const hasActiveSession =
-          sameAuthenticatedUser ||
-          Boolean(
-            activeSessionRows[0] &&
-              activeSessionRows[0].expiresAt.getTime() > now.getTime()
-          );
-
-        if (hasActiveSession) {
-          return {
-            status: 'completed_same_session',
-            transactionStatus: 'completed',
-            transaction: baseTx,
-            outcome: {
-              status: 'completed',
-              completedUid: row.completedUid ?? null,
-              outcomeStatus: row.outcomeStatus ?? 200,
-              outcomeErrorCategory: row.outcomeErrorCategory ?? 'NONE',
-              outcomeMessage: row.outcomeMessage ?? null,
-              outcomeIdentity: safeJsonParse<Record<string, unknown> | null>(
-                row.outcomeIdentityJson,
-                null
-              ),
-            },
-          };
-        }
-      }
-
-      return {
-        status: 'replayed',
-        transactionStatus: 'completed',
-        transaction: null,
-      };
-    }
-
-    // 6. If previous callback failed during token exchange or consent
-    if (row.status === 'failed') {
-      return {
-        status: 'failed_previously',
-        transactionStatus: 'failed',
-        transaction: baseTx,
-        outcome: {
-          status: 'failed',
-          completedUid: null,
-          outcomeStatus: row.outcomeStatus ?? 400,
-          outcomeErrorCategory:
-            row.outcomeErrorCategory ?? 'OAUTH_STATE_INVALID',
-          outcomeMessage: row.outcomeMessage ?? null,
-          outcomeIdentity: null,
+        sessionBindingMatched: true,
+        matchedSessionId,
+        transactionMeta,
+        transaction: {
+          ...baseTx,
+          codeHash: row.codeHash ?? null,
+          status: 'processing',
         },
       };
     }
@@ -889,6 +1020,9 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
       status: 'replayed',
       transactionStatus:
         (row.status as OAuthTransactionLifecycleStatus) || 'completed',
+      sessionBindingMatched,
+      matchedSessionId,
+      transactionMeta,
       transaction: null,
     };
   } catch (error) {
@@ -1431,71 +1565,201 @@ export async function createEventCandidateRecord(
   candidate: EventCandidate
 ): Promise<EventCandidate> {
   try {
-    // Check duplicate fingerprint against published hackathons or pending candidates
-    const existingCandidates = await db
-      .select()
-      .from(schema.eventCandidates)
-      .where(
-        eq(
-          schema.eventCandidates.externalFingerprint,
-          candidate.externalFingerprint
-        )
-      );
-
+    // 1. Check against all existing published hackathons for cross-source duplicate or update detection
+    const allPublishedRows = await db.select().from(schema.hackathons);
     let duplicateSlug = candidate.duplicateOfHackathonId ?? null;
-    if (!duplicateSlug && candidate.verifiedCanonicalUrl) {
-      const matchingHack = await db
-        .select()
-        .from(schema.hackathons)
-        .where(
-          eq(
-            schema.hackathons.verifiedCanonicalUrl,
-            candidate.verifiedCanonicalUrl
-          )
-        );
-      if (matchingHack[0]) {
-        duplicateSlug = matchingHack[0].slug;
+    let updatesSlug = candidate.updatesExistingHackathonId ?? null;
+    let computedDiffs = candidate.proposedDiffs ?? [];
+
+    for (const hRow of allPublishedRows) {
+      const hDomain = mapDbHackathonToDomain(hRow);
+      if (
+        areEventsSameRealWorldEvent(
+          {
+            title: hRow.name,
+            startAt: hRow.startAt,
+            organizer: hRow.organizer,
+            verifiedCanonicalUrl: hRow.verifiedCanonicalUrl,
+            originalSubmissionUrl: hRow.originalSubmissionUrl,
+            registrationUrl: hRow.registrationUrl,
+          },
+          {
+            title: candidate.title,
+            startAt: candidate.startAt,
+            organizer: candidate.organizer,
+            verifiedCanonicalUrl: candidate.verifiedCanonicalUrl,
+            originalSubmissionUrl:
+              candidate.originalSubmissionUrl ?? candidate.sourceUrl,
+            registrationUrl: candidate.registrationUrl,
+          }
+        )
+      ) {
+        const diffs = computeProposedEventDiffs(hDomain, {
+          startAt: candidate.startAt,
+          endAt: candidate.endAt,
+          registrationDeadline: candidate.registrationDeadline,
+          venue: candidate.venue,
+          registrationUrl: candidate.registrationUrl,
+          verifiedCanonicalUrl: candidate.verifiedCanonicalUrl,
+          teamSize: candidate.teamSize,
+          organizer: candidate.organizer,
+        });
+
+        if (diffs.length > 0 && !updatesSlug) {
+          updatesSlug = hRow.slug;
+          computedDiffs = diffs.map((d) => ({
+            field: d.field,
+            previousVerifiedValue: d.oldValue,
+            newProposedValue: d.newValue,
+            evidenceExcerpt: `Updated via ${candidate.source} (${candidate.verifiedCanonicalUrl ?? candidate.originalSubmissionUrl ?? candidate.sourceUrl ?? 'verified submission'})`,
+          }));
+        } else if (!duplicateSlug && !updatesSlug) {
+          duplicateSlug = hRow.slug;
+        }
+        break;
       }
     }
 
+    // 2. Check existing pending candidates across all sources so the same event from 3 sources
+    //    consolidates into a single candidate entry instead of creating 3 separate cards
+    const allCandidates = await db.select().from(schema.eventCandidates);
+    let matchedExistingCandidate:
+      | typeof schema.eventCandidates.$inferSelect
+      | undefined = allCandidates.find(
+      (c) => c.externalFingerprint === candidate.externalFingerprint
+    );
+
+    if (!matchedExistingCandidate) {
+      matchedExistingCandidate = allCandidates.find(
+        (c) =>
+          (c.reviewStatus === 'new' ||
+            c.reviewStatus === 'needs_confirmation') &&
+          areEventsSameRealWorldEvent(
+            {
+              title: c.title,
+              startAt: c.startAt,
+              organizer: c.organizer,
+              verifiedCanonicalUrl: c.verifiedCanonicalUrl,
+              originalSubmissionUrl: c.originalSubmissionUrl ?? c.sourceUrl,
+              registrationUrl: c.registrationUrl,
+            },
+            {
+              title: candidate.title,
+              startAt: candidate.startAt,
+              organizer: candidate.organizer,
+              verifiedCanonicalUrl: candidate.verifiedCanonicalUrl,
+              originalSubmissionUrl:
+                candidate.originalSubmissionUrl ?? candidate.sourceUrl,
+              registrationUrl: candidate.registrationUrl,
+            }
+          )
+      );
+    }
+
     const candidateUid =
-      existingCandidates[0]?.candidateUid ??
+      matchedExistingCandidate?.candidateUid ??
       (candidate.id || `cand_${Date.now()}`);
+
+    // Merge grounded fields if consolidating with an existing pending candidate
+    const mergedStartAt =
+      candidate.startAt ?? matchedExistingCandidate?.startAt ?? null;
+    const mergedEndAt =
+      candidate.endAt ?? matchedExistingCandidate?.endAt ?? null;
+    const mergedDeadline =
+      candidate.registrationDeadline ??
+      matchedExistingCandidate?.registrationDeadline ??
+      null;
+    const mergedCampus =
+      candidate.venue?.campus ??
+      (matchedExistingCandidate?.campus as CampusType | null) ??
+      null;
+    const mergedVenueName =
+      candidate.venue?.name ?? matchedExistingCandidate?.venueName ?? null;
+    const mergedMinTeam =
+      candidate.teamSize?.min ?? matchedExistingCandidate?.minTeamSize ?? null;
+    const mergedMaxTeam =
+      candidate.teamSize?.max ?? matchedExistingCandidate?.maxTeamSize ?? null;
+    const mergedRegUrl =
+      candidate.registrationUrl ??
+      matchedExistingCandidate?.registrationUrl ??
+      null;
+    const mergedVerifiedCanonical =
+      candidate.verifiedCanonicalUrl ??
+      matchedExistingCandidate?.verifiedCanonicalUrl ??
+      null;
+
+    // Combine field evidence and store `_proposedDiffs` inside `fieldEvidenceJson`
+    const existingEvidence = matchedExistingCandidate
+      ? safeJsonParse<Record<string, any>>(
+          matchedExistingCandidate.fieldEvidenceJson,
+          {}
+        )
+      : {};
+    const combinedEvidence: Record<string, any> = {
+      ...existingEvidence,
+      ...(candidate.fieldEvidence ?? {}),
+    };
+    if (computedDiffs && computedDiffs.length > 0) {
+      combinedEvidence._proposedDiffs = computedDiffs;
+    }
 
     const [row] = await db
       .insert(schema.eventCandidates)
       .values({
         candidateUid,
         source: candidate.source,
-        sourceUrl: candidate.sourceUrl ?? null,
-        originalSubmissionUrl: candidate.originalSubmissionUrl ?? null,
-        verifiedCanonicalUrl: candidate.verifiedCanonicalUrl ?? null,
-        sourceUrlStatus: candidate.sourceUrlStatus ?? 'unverified',
+        sourceUrl:
+          candidate.sourceUrl ?? matchedExistingCandidate?.sourceUrl ?? null,
+        originalSubmissionUrl:
+          candidate.originalSubmissionUrl ??
+          matchedExistingCandidate?.originalSubmissionUrl ??
+          null,
+        verifiedCanonicalUrl: mergedVerifiedCanonical,
+        sourceUrlStatus:
+          candidate.sourceUrlStatus ??
+          (matchedExistingCandidate?.sourceUrlStatus as SourceUrlVerificationStatus) ??
+          'unverified',
         uploadedAttachmentJson: candidate.uploadedAttachment
           ? JSON.stringify(candidate.uploadedAttachment)
-          : null,
-        submittedByUid: candidate.submittedByUid ?? null,
-        externalFingerprint: candidate.externalFingerprint,
+          : (matchedExistingCandidate?.uploadedAttachmentJson ?? null),
+        submittedByUid:
+          candidate.submittedByUid ??
+          matchedExistingCandidate?.submittedByUid ??
+          null,
+        externalFingerprint:
+          matchedExistingCandidate?.externalFingerprint ??
+          candidate.externalFingerprint,
         duplicateOfHackathonSlug: duplicateSlug,
-        updatesExistingHackathonSlug:
-          candidate.updatesExistingHackathonId ?? null,
-        title: candidate.title,
-        organizer: candidate.organizer,
+        updatesExistingHackathonSlug: updatesSlug,
+        title: candidate.title || matchedExistingCandidate?.title || '',
+        organizer:
+          candidate.organizer || matchedExistingCandidate?.organizer || '',
         eventType: candidate.eventType,
         matchable: candidate.matchable,
         themesJson: JSON.stringify(candidate.themes ?? []),
-        description: candidate.description,
-        startAt: candidate.startAt ?? null,
-        endAt: candidate.endAt ?? null,
-        registrationDeadline: candidate.registrationDeadline ?? null,
-        campus: candidate.venue?.campus ?? null,
-        venueName: candidate.venue?.name ?? null,
-        format: candidate.format ?? 'unknown',
-        minTeamSize: candidate.teamSize?.min ?? null,
-        maxTeamSize: candidate.teamSize?.max ?? null,
-        registrationUrl: candidate.registrationUrl ?? null,
-        eligibilityNotes: candidate.eligibilityNotes ?? null,
-        fieldEvidenceJson: JSON.stringify(candidate.fieldEvidence ?? {}),
+        description:
+          candidate.description || matchedExistingCandidate?.description || '',
+        startAt: mergedStartAt,
+        endAt: mergedEndAt,
+        registrationDeadline: mergedDeadline,
+        campus: mergedCampus,
+        venueName: mergedVenueName,
+        format:
+          candidate.format && candidate.format !== 'unknown'
+            ? candidate.format
+            : ((matchedExistingCandidate?.format as
+                | 'onsite'
+                | 'online'
+                | 'hybrid'
+                | 'unknown') ?? 'unknown'),
+        minTeamSize: mergedMinTeam,
+        maxTeamSize: mergedMaxTeam,
+        registrationUrl: mergedRegUrl,
+        eligibilityNotes:
+          candidate.eligibilityNotes ??
+          matchedExistingCandidate?.eligibilityNotes ??
+          null,
+        fieldEvidenceJson: JSON.stringify(combinedEvidence),
         ruleGatePassed: candidate.classification.ruleGatePassed,
         classificationReason: candidate.classification.reason,
         reviewStatus: candidate.reviewStatus ?? 'needs_confirmation',
@@ -1504,16 +1768,25 @@ export async function createEventCandidateRecord(
       .onConflictDoUpdate({
         target: schema.eventCandidates.candidateUid,
         set: {
-          title: candidate.title,
-          organizer: candidate.organizer,
+          title: candidate.title || matchedExistingCandidate?.title || '',
+          organizer:
+            candidate.organizer || matchedExistingCandidate?.organizer || '',
           eventType: candidate.eventType,
           matchable: candidate.matchable,
-          description: candidate.description,
-          startAt: candidate.startAt ?? null,
-          endAt: candidate.endAt ?? null,
-          registrationDeadline: candidate.registrationDeadline ?? null,
-          minTeamSize: candidate.teamSize?.min ?? null,
-          maxTeamSize: candidate.teamSize?.max ?? null,
+          description:
+            candidate.description || matchedExistingCandidate?.description || '',
+          startAt: mergedStartAt,
+          endAt: mergedEndAt,
+          registrationDeadline: mergedDeadline,
+          campus: mergedCampus,
+          venueName: mergedVenueName,
+          minTeamSize: mergedMinTeam,
+          maxTeamSize: mergedMaxTeam,
+          registrationUrl: mergedRegUrl,
+          verifiedCanonicalUrl: mergedVerifiedCanonical,
+          duplicateOfHackathonSlug: duplicateSlug,
+          updatesExistingHackathonSlug: updatesSlug,
+          fieldEvidenceJson: JSON.stringify(combinedEvidence),
           reviewStatus: candidate.reviewStatus ?? 'needs_confirmation',
         },
       })
@@ -1548,9 +1821,6 @@ export async function approveEventCandidateRecord(params: {
       throw new Error('Event candidate not found.');
     }
 
-    // Overrides are applied per field: an omitted field keeps the candidate's
-    // submitted value, while an explicit `null` is honoured (e.g. "team size
-    // unknown" -> unconfirmed constraints).
     const hasOverride = (key: string) =>
       params.overrides !== undefined && key in params.overrides;
 
@@ -1567,47 +1837,144 @@ export async function approveEventCandidateRecord(params: {
       ? (params.overrides!.campus ?? null)
       : ((cand.campus as CampusType | null) ?? null);
 
-    const slugBase = cand.title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .slice(0, 36);
-    const slug = `hack_${slugBase}_${Date.now().toString(36)}`;
+    const parsedEvidence = safeJsonParse<Record<string, any>>(
+      cand.fieldEvidenceJson,
+      {}
+    );
+    const provenanceWithMeta = {
+      ...parsedEvidence,
+      _meta: {
+        sourceType: cand.source,
+        sourceUrl:
+          cand.verifiedCanonicalUrl ??
+          cand.originalSubmissionUrl ??
+          cand.sourceUrl ??
+          'manual',
+        extractedAt: cand.createdAt.toISOString(),
+        verifiedBy: params.actorUid,
+        verifiedAt: new Date().toISOString(),
+      },
+    };
 
-    const [hackRow] = await db
-      .insert(schema.hackathons)
-      .values({
-        slug,
-        name: cand.title,
-        organizer: cand.organizer,
-        description: cand.description,
-        eventType: finalType,
-        matchable: finalMatchable,
-        themesJson: cand.themesJson,
-        campus: finalCampus ?? null,
-        venueName: cand.venueName ?? null,
-        format: cand.format,
-        startAt: cand.startAt,
-        endAt: cand.endAt,
-        registrationDeadline: cand.registrationDeadline,
-        originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
-        verifiedCanonicalUrl: cand.verifiedCanonicalUrl,
-        registrationUrl: cand.registrationUrl,
-        sourceUrlStatus: cand.sourceUrlStatus,
-        minTeamSize: finalMin,
-        maxTeamSize: finalMax,
-        eligibilityNotes: cand.eligibilityNotes,
-        fieldProvenanceJson: cand.fieldEvidenceJson,
-        ruleGatePassed: cand.ruleGatePassed,
-        classificationReason: cand.classificationReason,
-        verificationStatus:
-          finalMin !== null && finalMax !== null
-            ? 'verified'
-            : 'unconfirmed_constraints',
-        status: 'published',
-        createdByUid: params.actorUid,
-      })
-      .returning();
+    // Check if this candidate updates or duplicates an already-published hackathon
+    let existingTargetSlug =
+      cand.updatesExistingHackathonSlug ?? cand.duplicateOfHackathonSlug ?? null;
+
+    if (!existingTargetSlug) {
+      const allHacks = await db.select().from(schema.hackathons);
+      const matchedHack = allHacks.find((h) =>
+        areEventsSameRealWorldEvent(
+          {
+            title: h.name,
+            startAt: h.startAt,
+            organizer: h.organizer,
+            verifiedCanonicalUrl: h.verifiedCanonicalUrl,
+            originalSubmissionUrl: h.originalSubmissionUrl,
+            registrationUrl: h.registrationUrl,
+          },
+          {
+            title: cand.title,
+            startAt: cand.startAt,
+            organizer: cand.organizer,
+            verifiedCanonicalUrl: cand.verifiedCanonicalUrl,
+            originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
+            registrationUrl: cand.registrationUrl,
+          }
+        )
+      );
+      if (matchedHack) {
+        existingTargetSlug = matchedHack.slug;
+      }
+    }
+
+    let hackRow: typeof schema.hackathons.$inferSelect;
+
+    if (existingTargetSlug) {
+      const existingRows = await db
+        .select()
+        .from(schema.hackathons)
+        .where(eq(schema.hackathons.slug, existingTargetSlug));
+      const ex = existingRows[0];
+
+      if (ex) {
+        const [updatedHack] = await db
+          .update(schema.hackathons)
+          .set({
+            name: cand.title || ex.name,
+            organizer: cand.organizer || ex.organizer,
+            description: cand.description || ex.description,
+            eventType: finalType,
+            matchable: finalMatchable,
+            campus: finalCampus ?? ex.campus,
+            venueName: cand.venueName ?? ex.venueName,
+            startAt: cand.startAt ?? ex.startAt,
+            endAt: cand.endAt ?? ex.endAt,
+            registrationDeadline:
+              cand.registrationDeadline ?? ex.registrationDeadline,
+            verifiedCanonicalUrl:
+              cand.verifiedCanonicalUrl ?? ex.verifiedCanonicalUrl,
+            registrationUrl: cand.registrationUrl ?? ex.registrationUrl,
+            minTeamSize: finalMin ?? ex.minTeamSize,
+            maxTeamSize: finalMax ?? ex.maxTeamSize,
+            fieldProvenanceJson: JSON.stringify(provenanceWithMeta),
+            verificationStatus:
+              (finalMin ?? ex.minTeamSize) !== null &&
+              (finalMax ?? ex.maxTeamSize) !== null
+                ? 'verified'
+                : 'unconfirmed_constraints',
+          })
+          .where(eq(schema.hackathons.slug, ex.slug))
+          .returning();
+        hackRow = updatedHack;
+      } else {
+        existingTargetSlug = null;
+      }
+    }
+
+    if (!existingTargetSlug) {
+      const slugBase = cand.title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 36);
+      const slug = `hack_${slugBase}_${Date.now().toString(36)}`;
+
+      const [insertedHack] = await db
+        .insert(schema.hackathons)
+        .values({
+          slug,
+          name: cand.title,
+          organizer: cand.organizer,
+          description: cand.description,
+          eventType: finalType,
+          matchable: finalMatchable,
+          themesJson: cand.themesJson,
+          campus: finalCampus ?? null,
+          venueName: cand.venueName ?? null,
+          format: cand.format,
+          startAt: cand.startAt,
+          endAt: cand.endAt,
+          registrationDeadline: cand.registrationDeadline,
+          originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
+          verifiedCanonicalUrl: cand.verifiedCanonicalUrl,
+          registrationUrl: cand.registrationUrl,
+          sourceUrlStatus: cand.sourceUrlStatus,
+          minTeamSize: finalMin,
+          maxTeamSize: finalMax,
+          eligibilityNotes: cand.eligibilityNotes,
+          fieldProvenanceJson: JSON.stringify(provenanceWithMeta),
+          ruleGatePassed: cand.ruleGatePassed,
+          classificationReason: cand.classificationReason,
+          verificationStatus:
+            finalMin !== null && finalMax !== null
+              ? 'verified'
+              : 'unconfirmed_constraints',
+          status: 'published',
+          createdByUid: params.actorUid,
+        })
+        .returning();
+      hackRow = insertedHack;
+    }
 
     const [updatedCand] = await db
       .update(schema.eventCandidates)
@@ -1616,7 +1983,7 @@ export async function approveEventCandidateRecord(params: {
       .returning();
 
     return {
-      hackathon: mapDbHackathonToDomain(hackRow),
+      hackathon: mapDbHackathonToDomain(hackRow!),
       candidate: mapDbCandidateToDomain(updatedCand),
     };
   } catch (error) {
@@ -1665,15 +2032,59 @@ export async function createPublishedHackathonDirect(params: {
   registrationUrl: string | null;
   verifiedCanonicalUrl: string | null;
   sourceUrlStatus: SourceUrlVerificationStatus;
+  sourceType?: EventSourceType;
+  extractedAt?: string;
   createdByUid: string;
 }): Promise<Hackathon> {
   try {
+    // Check if an existing published hackathon already represents this event
+    const allPublished = await db.select().from(schema.hackathons);
+    const matchingExisting = allPublished.find(
+      (h) =>
+        (params.slug && h.slug === params.slug) ||
+        areEventsSameRealWorldEvent(
+          {
+            title: h.name,
+            startAt: h.startAt,
+            organizer: h.organizer,
+            verifiedCanonicalUrl: h.verifiedCanonicalUrl,
+            originalSubmissionUrl: h.originalSubmissionUrl,
+            registrationUrl: h.registrationUrl,
+          },
+          {
+            title: params.name,
+            startAt: params.startAt,
+            organizer: params.organizer,
+            verifiedCanonicalUrl: params.verifiedCanonicalUrl,
+            originalSubmissionUrl: params.registrationUrl,
+            registrationUrl: params.registrationUrl,
+          }
+        )
+    );
+
     const slug =
+      matchingExisting?.slug ||
       params.slug ||
       `hack_${params.name
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')
         .slice(0, 32)}_${Date.now().toString(36)}`;
+
+    const nowIso = new Date().toISOString();
+    const provenanceJson = JSON.stringify({
+      _meta: {
+        sourceType:
+          params.sourceType ??
+          (params.verifiedCanonicalUrl?.includes('events.pes.edu')
+            ? 'pes_public_events'
+            : 'submitted_public_url'),
+        sourceUrl:
+          params.verifiedCanonicalUrl ?? params.registrationUrl ?? 'manual',
+        extractedAt: params.extractedAt ?? nowIso,
+        verifiedBy: params.createdByUid,
+        verifiedAt: nowIso,
+      },
+    });
 
     const [row] = await db
       .insert(schema.hackathons)
@@ -1697,6 +2108,7 @@ export async function createPublishedHackathonDirect(params: {
         sourceUrlStatus: params.sourceUrlStatus,
         minTeamSize: params.minTeamSize,
         maxTeamSize: params.maxTeamSize,
+        fieldProvenanceJson: provenanceJson,
         ruleGatePassed: params.matchable,
         classificationReason: 'Published verified event.',
         verificationStatus:
@@ -1712,8 +2124,18 @@ export async function createPublishedHackathonDirect(params: {
           name: params.name,
           organizer: params.organizer,
           description: params.description,
+          eventType: params.eventType,
+          matchable: params.matchable,
+          campus: params.campus,
+          venueName: params.venueName,
+          startAt: params.startAt,
+          endAt: params.endAt,
+          registrationDeadline: params.registrationDeadline,
+          verifiedCanonicalUrl: params.verifiedCanonicalUrl,
+          registrationUrl: params.registrationUrl,
           minTeamSize: params.minTeamSize,
           maxTeamSize: params.maxTeamSize,
+          fieldProvenanceJson: provenanceJson,
         },
       })
       .returning();

@@ -8,6 +8,7 @@ import {
 } from '../db/repository.ts';
 import {
   SESSION_COOKIE_NAME,
+  inspectSessionCookieHeader,
   verifySignedSessionCookie,
 } from '../lib/crypto.ts';
 
@@ -41,7 +42,9 @@ function parseCookieHeader(cookieHeader: string | undefined): Record<string, str
     if (idx > 0) {
       const k = part.slice(0, idx).trim();
       const v = decodeURIComponent(part.slice(idx + 1).trim());
-      out[k] = v;
+      if (!(k in out)) {
+        out[k] = v;
+      }
     }
   }
   return out;
@@ -50,7 +53,7 @@ function parseCookieHeader(cookieHeader: string | undefined): Record<string, str
 /**
  * Resolves the authenticated user from either:
  * 1. `Authorization: Bearer pesu_<session_token>`, `quackathon_oauth_token` cookie,
- *    or signed `quackathon_oauth_sid` cookie correlated with a persistent PESU OAuth2 session
+ *    or signed `quackathon_sid` cookie correlated with a persistent PESU OAuth2 session
  * 2. `Authorization: Bearer <firebase_id_token>` (Firebase Auth Google Sign-In)
  */
 export async function resolveOptionalUser(
@@ -69,15 +72,29 @@ export async function resolveOptionalUser(
       ? rawBearer
       : cookies['quackathon_oauth_token'] || '';
 
-  const signedSid = verifySignedSessionCookie(cookies[SESSION_COOKIE_NAME]);
+  const cookieInspection = inspectSessionCookieHeader(
+    req.headers.cookie,
+    SESSION_COOKIE_NAME
+  );
+  const signedSid =
+    cookieInspection.primarySessionId ??
+    verifySignedSessionCookie(cookies[SESSION_COOKIE_NAME]);
 
-  if (pesuToken || signedSid) {
+  if (pesuToken || cookieInspection.verifiedSessionIds.length > 0) {
     try {
-      const oauthSess = pesuToken
+      let oauthSess = pesuToken
         ? await getValidOAuthSessionRecord(pesuToken)
-        : signedSid
-        ? await getValidOAuthSessionByInitiatingSessionId(signedSid)
         : null;
+      let matchedSid = signedSid;
+      if (!oauthSess) {
+        for (const candidateSid of cookieInspection.verifiedSessionIds) {
+          oauthSess = await getValidOAuthSessionByInitiatingSessionId(candidateSid);
+          if (oauthSess) {
+            matchedSid = candidateSid;
+            break;
+          }
+        }
+      }
       if (oauthSess) {
         const record = await getUserAndProfileByUid(oauthSess.uid);
         if (record) {
@@ -88,7 +105,7 @@ export async function resolveOptionalUser(
             verificationStatus: record.user.verificationStatus,
             isAdmin: Boolean(record.user.isAdmin),
             authSource: 'pesu_oauth',
-            pesuSessionToken: pesuToken || signedSid || undefined,
+            pesuSessionToken: pesuToken || matchedSid || undefined,
           };
           req.user = authUser;
           return authUser;

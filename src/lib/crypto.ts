@@ -48,6 +48,79 @@ export function verifySignedSessionCookie(
     : null;
 }
 
+export interface SessionCookieInspection {
+  rawCount: number;
+  verifiedSessionIds: string[];
+  primarySessionId: string | null;
+  cookieStatus: 'valid' | 'missing' | 'invalid_signature';
+}
+
+/**
+ * Inspects all occurrences of `quackathon_sid` in a Cookie header without logging raw values.
+ * Distinguishes missing cookies, invalid HMAC signatures, and valid signed session IDs.
+ */
+export function inspectSessionCookieHeader(
+  cookieHeader: string | undefined,
+  cookieName = SESSION_COOKIE_NAME
+): SessionCookieInspection {
+  if (!cookieHeader || !cookieHeader.trim()) {
+    return {
+      rawCount: 0,
+      verifiedSessionIds: [],
+      primarySessionId: null,
+      cookieStatus: 'missing',
+    };
+  }
+
+  let rawCount = 0;
+  const verifiedSessionIds: string[] = [];
+
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    if (key !== cookieName) continue;
+    const rawVal = part.slice(idx + 1).trim();
+    if (!rawVal) continue;
+    rawCount += 1;
+    let decoded = rawVal;
+    try {
+      decoded = decodeURIComponent(rawVal);
+    } catch {
+      // use rawVal if decodeURIComponent fails
+    }
+    const verified = verifySignedSessionCookie(decoded);
+    if (verified && !verifiedSessionIds.includes(verified)) {
+      verifiedSessionIds.push(verified);
+    }
+  }
+
+  if (rawCount === 0) {
+    return {
+      rawCount: 0,
+      verifiedSessionIds: [],
+      primarySessionId: null,
+      cookieStatus: 'missing',
+    };
+  }
+
+  if (verifiedSessionIds.length === 0) {
+    return {
+      rawCount,
+      verifiedSessionIds: [],
+      primarySessionId: null,
+      cookieStatus: 'invalid_signature',
+    };
+  }
+
+  return {
+    rawCount,
+    verifiedSessionIds,
+    primarySessionId: verifiedSessionIds[0],
+    cookieStatus: 'valid',
+  };
+}
+
 /**
  * Hashes an opaque session lookup token using SHA-256 so plaintext lookup tokens
  * are never stored in the database.

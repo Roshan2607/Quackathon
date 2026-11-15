@@ -11,6 +11,7 @@ import {
   Calendar,
   ChevronDown,
   Compass,
+  ExternalLink,
   Lock,
   LogIn,
   LogOut,
@@ -162,6 +163,23 @@ export function App() {
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [unregisteredRedirectInfo, setUnregisteredRedirectInfo] = useState<{
+    redirectUri: string;
+    clientId: string;
+    portalUrl: string;
+  } | null>(null);
+  const [copiedRedirectUri, setCopiedRedirectUri] = useState(false);
+  const [canonicalAppOrigin, setCanonicalAppOrigin] = useState<string>(() =>
+    typeof window !== 'undefined' ? window.location.origin : ''
+  );
+  const isEmbeddedPreview = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return window.self !== window.top;
+    } catch {
+      return true;
+    }
+  }, []);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const pesuPopupRef = useRef<Window | null>(null);
   const pesuPopupPollRef = useRef<number | null>(null);
@@ -231,6 +249,16 @@ export function App() {
       profile: Profile | null;
     }>('/api/auth/session');
 
+    // Also fetch canonical callback origin from /api/pesu-oauth/session
+    void apiFetch<{
+      ok: boolean;
+      canonicalAppOrigin?: string;
+    }>('/api/pesu-oauth/session').then((oauthSess) => {
+      if (oauthSess.ok && oauthSess.data?.canonicalAppOrigin) {
+        setCanonicalAppOrigin(oauthSess.data.canonicalAppOrigin);
+      }
+    });
+
     if (res.ok && res.data?.authenticated && res.data.user) {
       setAuthenticatedUser(res.data.user);
       if (res.data.profile) {
@@ -245,8 +273,46 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void restoreAuthSession().then(() => refreshBootstrap());
-  }, [restoreAuthSession, refreshBootstrap]);
+    const params = new URLSearchParams(window.location.search);
+    const shouldAutoRedirect = params.get('start_pesu_oauth') === 'redirect';
+    const wantAnnouncementsScope = params.get('pesu_scope') === 'announcements';
+    if (shouldAutoRedirect) {
+      params.delete('start_pesu_oauth');
+      params.delete('pesu_scope');
+      const remaining = params.toString();
+      const cleanUrl =
+        window.location.pathname +
+        (remaining ? `?${remaining}` : '') +
+        window.location.hash;
+      window.history.replaceState(null, '', cleanUrl);
+    }
+
+    void restoreAuthSession().then(async (restoredUser) => {
+      void refreshBootstrap();
+      if (shouldAutoRedirect && (!restoredUser || wantAnnouncementsScope)) {
+        const scopesToRequest = wantAnnouncementsScope
+          ? ['openid', 'profile', 'email', 'announcements:read']
+          : ['openid', 'profile', 'email'];
+        const startRes = await startPesuOAuthSignIn(
+          scopesToRequest,
+          'redirect'
+        );
+        if (startRes.ok && startRes.authUrl) {
+          if (startRes.state) {
+            activeOAuthStateRef.current = startRes.state;
+            try {
+              sessionStorage.setItem('quackathon_oauth_state', startRes.state);
+            } catch {
+              // ignore storage error
+            }
+          }
+          window.location.assign(startRes.authUrl);
+        } else if (startRes.errorMessage) {
+          showToast(startRes.errorMessage);
+        }
+      }
+    });
+  }, [restoreAuthSession, refreshBootstrap, showToast]);
 
   // Listen for PESU OAuth2 Popup Callback, Same-Origin BroadcastChannel, or Redirect Fallback
   useEffect(() => {
@@ -412,90 +478,146 @@ export function App() {
   }, []);
 
   // Authentication Handlers
-  const handleSignInWithPesu = useCallback(async () => {
-    // Prevent duplicate login launches if a popup is already open or a request is in flight
-    if (pesuPopupRef.current && !pesuPopupRef.current.closed) {
-      pesuPopupRef.current.focus();
-      return;
-    }
-    if (isSigningIn) {
-      return;
-    }
-
-    setIsSigningIn(true);
-    clearPesuPopupMonitor();
-
-    try {
-      const res = await startPesuOAuthSignIn(['openid', 'profile', 'email']);
-      if (!res.ok || !res.authUrl) {
-        setIsSigningIn(false);
-        showToast(res.errorMessage || 'Could not start PESU OAuth2 sign-in.');
+  const handleSignInWithPesu = useCallback(
+    async (
+      mode: 'popup' | 'redirect' = 'popup',
+      requestedScopes: string[] = ['openid', 'profile', 'email']
+    ) => {
+      // If full-page redirect mode is requested from inside an embedded iframe,
+      // launch the canonical application URL in a top-level tab so cookies are 1st-party.
+      if (mode === 'redirect' && isEmbeddedPreview) {
+        const targetBase = canonicalAppOrigin || window.location.origin;
+        const scopeParam = requestedScopes.includes('announcements:read')
+          ? '&pesu_scope=announcements'
+          : '';
+        const topLevelAuthUrl = `${targetBase}/?start_pesu_oauth=redirect${scopeParam}${window.location.hash || ''}`;
+        const opened = window.open(topLevelAuthUrl, '_blank', 'noopener');
+        if (!opened) {
+          showToast(
+            `Please open ${targetBase} in a new browser tab to complete full-page PESU sign-in.`
+          );
+        } else {
+          showToast(
+            'Opened top-level tab for PESU OAuth2 full-page sign-in.'
+          );
+        }
         return;
       }
 
-      if (res.state) {
-        activeOAuthStateRef.current = res.state;
-        try {
-          sessionStorage.setItem('quackathon_oauth_state', res.state);
-        } catch {
-          // ignore storage error
-        }
+      // Prevent duplicate login launches if a popup is already open or a request is in flight
+      if (
+        mode === 'popup' &&
+        pesuPopupRef.current &&
+        !pesuPopupRef.current.closed
+      ) {
+        pesuPopupRef.current.focus();
+        return;
+      }
+      if (isSigningIn) {
+        return;
       }
 
-      const popup = window.open(
-        res.authUrl,
-        'pesu_oauth_popup',
-        'width=520,height=660,menubar=no,toolbar=no'
-      );
+      setIsSigningIn(true);
+      clearPesuPopupMonitor();
 
-      if (!popup) {
-        setIsSigningIn(false);
-        showToast(
-          'Sign-in popup was blocked by your browser. Please allow popups for this site and try again.'
+      try {
+        const res = await startPesuOAuthSignIn(requestedScopes, mode);
+        if (res.canonicalAppOrigin) {
+          setCanonicalAppOrigin(res.canonicalAppOrigin);
+        }
+        if (res.providerRedirectUriRegistered === false && res.redirectUri) {
+          setUnregisteredRedirectInfo({
+            redirectUri: res.redirectUri,
+            clientId: res.publicClientId || 'configured client',
+            portalUrl:
+              res.portalManageUrl || 'https://pesu-oauth2.onrender.com/portal',
+          });
+          setIsSigningIn(false);
+          showToast(
+            'Register the callback URI in PESU OAuth2 Portal and click "Save Changes" first.'
+          );
+          return;
+        } else if (res.providerRedirectUriRegistered === true) {
+          setUnregisteredRedirectInfo(null);
+        }
+        if (!res.ok || !res.authUrl) {
+          setIsSigningIn(false);
+          showToast(res.errorMessage || 'Could not start PESU OAuth2 sign-in.');
+          return;
+        }
+
+        if (res.state) {
+          activeOAuthStateRef.current = res.state;
+          try {
+            sessionStorage.setItem('quackathon_oauth_state', res.state);
+          } catch {
+            // ignore storage error
+          }
+        }
+
+        if (mode === 'redirect') {
+          window.location.assign(res.authUrl);
+          return;
+        }
+
+        const popup = window.open(
+          res.authUrl,
+          'pesu_oauth_popup',
+          'width=520,height=660,menubar=no,toolbar=no'
         );
-        return;
-      }
 
-      pesuPopupRef.current = popup;
-      const launchedState = res.state || '';
-
-      // Monitor popup closure to distinguish user cancellation from completed/failed callback
-      pesuPopupPollRef.current = window.setInterval(() => {
-        if (!pesuPopupRef.current || pesuPopupRef.current.closed) {
-          clearPesuPopupMonitor();
-          pesuPopupRef.current = null;
-          window.setTimeout(async () => {
-            if (
-              launchedState &&
-              handledOAuthStatesRef.current.has(launchedState)
-            ) {
-              return;
-            }
-            const restored = await restoreAuthSession();
-            setIsSigningIn(false);
-            if (restored) {
-              if (launchedState) {
-                handledOAuthStatesRef.current.add(launchedState);
-              }
-              await refreshBootstrap();
-              showToast(`Signed in with PESU as ${restored.displayName}.`);
-            } else {
-              showToast('PESU sign-in was cancelled before completion.');
-            }
-          }, 450);
+        if (!popup) {
+          setIsSigningIn(false);
+          showToast(
+            'Sign-in popup was blocked by your browser. Use "Full-Page Sign In" in the account menu or allow popups.'
+          );
+          return;
         }
-      }, 450);
-    } catch {
-      setIsSigningIn(false);
-      showToast('Could not start PESU OAuth2 sign-in.');
-    }
-  }, [
-    clearPesuPopupMonitor,
-    isSigningIn,
-    refreshBootstrap,
-    restoreAuthSession,
-    showToast,
-  ]);
+
+        pesuPopupRef.current = popup;
+        const launchedState = res.state || '';
+
+        // Monitor popup closure to distinguish user cancellation from completed/failed callback
+        pesuPopupPollRef.current = window.setInterval(() => {
+          if (!pesuPopupRef.current || pesuPopupRef.current.closed) {
+            clearPesuPopupMonitor();
+            pesuPopupRef.current = null;
+            window.setTimeout(async () => {
+              if (
+                launchedState &&
+                handledOAuthStatesRef.current.has(launchedState)
+              ) {
+                return;
+              }
+              const restored = await restoreAuthSession();
+              setIsSigningIn(false);
+              if (restored) {
+                if (launchedState) {
+                  handledOAuthStatesRef.current.add(launchedState);
+                }
+                await refreshBootstrap();
+                showToast(`Signed in with PESU as ${restored.displayName}.`);
+              } else {
+                showToast('PESU sign-in was cancelled before completion.');
+              }
+            }, 450);
+          }
+        }, 450);
+      } catch {
+        setIsSigningIn(false);
+        showToast('Could not start PESU OAuth2 sign-in.');
+      }
+    },
+    [
+      canonicalAppOrigin,
+      clearPesuPopupMonitor,
+      isEmbeddedPreview,
+      isSigningIn,
+      refreshBootstrap,
+      restoreAuthSession,
+      showToast,
+    ]
+  );
 
   const handleSignInWithGoogle = useCallback(async () => {
     setIsSigningIn(true);
@@ -1092,11 +1214,21 @@ export function App() {
                 <button
                   type="button"
                   disabled={isSigningIn}
-                  onClick={handleSignInWithPesu}
+                  onClick={() => void handleSignInWithPesu('popup')}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                 >
                   <LogIn className="w-3.5 h-3.5" />
                   <span>PESU Sign In</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isSigningIn}
+                  onClick={() => void handleSignInWithPesu('redirect')}
+                  title="Full-page OAuth redirect (recommended if embedded preview blocks popup cookies)"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/70 dark:bg-blue-950/40 hover:bg-blue-100 text-blue-700 dark:text-blue-300 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                >
+                  <ExternalLink className="w-3 h-3" />
+                  <span>Full-Page</span>
                 </button>
                 <button
                   type="button"
@@ -1149,13 +1281,36 @@ export function App() {
                           type="button"
                           onClick={() => {
                             setShowAccountMenu(false);
-                            void handleSignInWithPesu();
+                            void handleSignInWithPesu('popup');
                           }}
                           className="w-full px-3.5 py-2 text-left font-semibold text-blue-600 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
                         >
-                          <span>Sign in with PESU OAuth</span>
+                          <span>Sign in with PESU (Popup)</span>
                           <LogIn className="w-3.5 h-3.5" />
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowAccountMenu(false);
+                            void handleSignInWithPesu('redirect');
+                          }}
+                          className="w-full px-3.5 py-2 text-left font-semibold text-blue-700 dark:text-blue-300 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                        >
+                          <span>Sign in with PESU (Full-Page)</span>
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </button>
+                        {canonicalAppOrigin && (
+                          <a
+                            href={canonicalAppOrigin}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={() => setShowAccountMenu(false)}
+                            className="w-full px-3.5 py-2 text-left font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between"
+                          >
+                            <span>Open Top-Level App URL</span>
+                            <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
+                          </a>
+                        )}
                         <button
                           type="button"
                           onClick={() => {
@@ -1255,6 +1410,67 @@ export function App() {
 
       {/* Main Content Workspace */}
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6">
+        {unregisteredRedirectInfo && (
+          <div className="mb-6 rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50/90 dark:bg-amber-950/40 p-4 text-xs text-slate-800 dark:text-slate-200 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-2 flex-1">
+                <div className="font-bold text-sm text-amber-900 dark:text-amber-300">
+                  PESU OAuth2 Redirect URI Registration Required
+                </div>
+                <p className="leading-relaxed text-slate-700 dark:text-slate-300">
+                  The PESU OAuth2 provider rejected sign-in with{' '}
+                  <span className="font-mono font-semibold">
+                    &ldquo;Redirect URI is not registered for this client application.&rdquo;
+                  </span>{' '}
+                  for client{' '}
+                  <code className="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 font-mono">
+                    {unregisteredRedirectInfo.clientId}
+                  </code>
+                  . Register the exact callback URL below in the PESU OAuth2 Developer Portal:
+                </p>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <code className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-800 font-mono text-xs select-all break-all">
+                    {unregisteredRedirectInfo.redirectUri}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(
+                        unregisteredRedirectInfo.redirectUri
+                      );
+                      setCopiedRedirectUri(true);
+                      setTimeout(() => setCopiedRedirectUri(false), 2000);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-semibold cursor-pointer"
+                  >
+                    {copiedRedirectUri ? 'Copied URI!' : 'Copy Callback URI'}
+                  </button>
+                  <a
+                    href={unregisteredRedirectInfo.portalUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+                  >
+                    <span>Open PESU Developer Portal</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+                <p className="text-[11px] text-amber-900/90 dark:text-amber-300/90 pt-1">
+                  Important: In the PESU Developer Portal, paste the URI under{' '}
+                  <strong>Redirect URIs</strong>, click <strong>+ Add</strong>, and then click{' '}
+                  <strong>Save Changes</strong> (clicking + Add alone does not persist the URI).
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setUnregisteredRedirectInfo(null)}
+                className="text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 font-semibold px-2 py-1 cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
         <Suspense fallback={<ViewSkeleton />}>
           {activeTab === 'discover' && (
             <DiscoverView
@@ -1281,6 +1497,7 @@ export function App() {
           {activeTab === 'hackathons' && (
             <HackathonsView
               currentUser={currentUser}
+              currentProfile={currentProfile}
               executionMode={executionMode}
               hackathons={hackathons}
               privateAcademyHints={[]}
@@ -1289,6 +1506,17 @@ export function App() {
                 navigateToTab('discover');
               }}
               onSubmitEventCandidate={handleSubmitEventCandidate}
+              onSaveProfile={handleSaveProfile}
+              onConnectPesuAcademy={(mode) =>
+                void handleSignInWithPesu(mode, [
+                  'openid',
+                  'profile',
+                  'email',
+                  'announcements:read',
+                ])
+              }
+              onRefreshCatalog={refreshBootstrap}
+              onNotify={showToast}
             />
           )}
 

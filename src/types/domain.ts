@@ -49,7 +49,9 @@ export type SourceUrlVerificationStatus =
   | 'verified'
   | 'redirected_valid'
   | 'unverified'
-  | 'unavailable';
+  | 'unavailable'
+  | 'blocked_policy'
+  | 'broken';
 
 export type RequestDirection = 'application' | 'invitation';
 export type RequestStatus = 'pending' | 'accepted' | 'rejected' | 'withdrawn' | 'expired';
@@ -174,6 +176,7 @@ export interface Hackathon {
   maxTeamSize: number | null;
   eligibilityNotes: string | null;
   organizer: string;
+  sourceType?: EventSourceType;
   sourceIds: string[];
   fieldProvenance: Record<string, FieldProvenanceEntry>;
   suggestedByCount: number;
@@ -184,6 +187,7 @@ export interface Hackathon {
     reason: string;
   };
   lastVerifiedAt: string | null;
+  extractedAt?: string | null;
   verificationStatus: 'verified' | 'unconfirmed_constraints';
   status: EventLifecycleStatus;
   createdBy: string;

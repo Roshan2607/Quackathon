@@ -21,15 +21,24 @@ import {
   ExtractedEventFields,
   ExtractionMethodUsed,
   IntegrationErrorCategory,
+  PesuAnnouncementsResponse,
   PesuOAuthCallbackPostMessage,
   PesuOAuthDiscoveryResponse,
   PesuOAuthSessionStatusResponse,
   PesuOAuthStageStatuses,
   PesuOAuthUrlResponse,
+  PesuPublicEventsSyncResponse,
   PesuVerifiedIdentity,
   UrlVerificationStatus,
   VerifyUrlResponse,
 } from './src/types/apiContracts.ts';
+import {
+  normalizePesuAnnouncementPayload,
+  parseDateRangeFromText,
+  parsePesuEventDetailHtml,
+  parsePesuEventsHtmlListing,
+  sanitizeTextForPublicCandidate,
+} from './src/lib/eventsAndAnnouncements.ts';
 import {
   approveEventCandidateRecord,
   claimOrInspectOAuthTransactionRecord,
@@ -56,7 +65,9 @@ import {
   waitForOAuthTransactionCompletion,
 } from './src/db/repository.ts';
 import {
+  inspectSessionCookieHeader,
   SESSION_COOKIE_NAME,
+  SessionCookieInspection,
   signSessionId,
   verifySignedSessionCookie,
 } from './src/lib/crypto.ts';
@@ -1514,7 +1525,48 @@ function parseHtmlEventMetadataDeterministically(html: string, finalUrl: string)
     .trim()
     .slice(0, 10000);
 
+  const isPesuEventsHost = /(?:^|\.)events\.pes\.edu$/i.test(
+    (() => {
+      try {
+        return new URL(finalUrl).hostname;
+      } catch {
+        return '';
+      }
+    })()
+  );
+
+  if (isPesuEventsHost) {
+    const pesDetail = parsePesuEventDetailHtml(html, finalUrl);
+    if (pesDetail.title) {
+      return {
+        title: pesDetail.title,
+        organizer: pesDetail.organizer ?? 'PES University',
+        description: pesDetail.description ?? ogDescription ?? null,
+        startAt: pesDetail.startAt,
+        endAt: pesDetail.endAt,
+        registrationDeadline: pesDetail.registrationDeadline,
+        campus: pesDetail.campus,
+        venueName: pesDetail.venueName,
+        eventType: pesDetail.eventType,
+        themes: pesDetail.themes,
+        format: pesDetail.format,
+        canonicalUrl: pesDetail.canonicalUrl,
+        verifiedCanonicalUrl: pesDetail.canonicalUrl,
+        minTeamSize: pesDetail.minTeamSize,
+        maxTeamSize: pesDetail.maxTeamSize,
+        teamSizeExcerpt: pesDetail.extractedEvidenceQuote,
+        visibleTextExcerpt: visibleText.slice(0, 3500),
+        hasJsonLdEvent: Boolean(eventJsonLd),
+        registrationUrl: pesDetail.registrationUrl,
+      };
+    }
+  }
+
   const detTextFields = parseDeterministicEventText(visibleText, finalUrl);
+  const fallbackRange =
+    !detTextFields.startAt
+      ? parseDateRangeFromText(visibleText)
+      : { startAt: detTextFields.startAt, endAt: detTextFields.endAt };
 
   const resolvedCanonical = canonicalUrlRaw
     ? new URL(canonicalUrlRaw, finalUrl).toString()
@@ -1542,10 +1594,12 @@ function parseHtmlEventMetadataDeterministically(html: string, finalUrl: string)
     startAt:
       (eventJsonLd?.startDate as string | undefined) ??
       detTextFields.startAt ??
+      fallbackRange.startAt ??
       null,
     endAt:
       (eventJsonLd?.endDate as string | undefined) ??
       detTextFields.endAt ??
+      fallbackRange.endAt ??
       null,
     registrationDeadline: detTextFields.registrationDeadline,
     campus: detTextFields.campus,
@@ -1560,6 +1614,7 @@ function parseHtmlEventMetadataDeterministically(html: string, finalUrl: string)
     teamSizeExcerpt: detTextFields.extractedTextEvidence,
     visibleTextExcerpt: visibleText.slice(0, 3500),
     hasJsonLdEvent: Boolean(eventJsonLd),
+    registrationUrl: detTextFields.registrationUrl ?? resolvedCanonical,
   };
 }
 
@@ -1826,7 +1881,8 @@ ${det.visibleTextExcerpt}`,
     minTeamSize: aiSupplement?.minTeamSize ?? det.minTeamSize ?? null,
     maxTeamSize: aiSupplement?.maxTeamSize ?? det.maxTeamSize ?? null,
     eligibilityNotes: aiSupplement?.eligibilityNotes ?? null,
-    registrationUrl: aiSupplement?.registrationUrl ?? resolvedCanonical,
+    registrationUrl:
+      aiSupplement?.registrationUrl ?? det.registrationUrl ?? resolvedCanonical,
     officialSourceUrl: resolvedCanonical,
     extractedTextEvidence:
       aiSupplement?.extractedTextEvidence ??
@@ -2208,7 +2264,9 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
     if (idx > 0) {
       const k = pair.slice(0, idx).trim();
       const v = decodeURIComponent(pair.slice(idx + 1).trim());
-      result[k] = v;
+      if (!(k in result)) {
+        result[k] = v;
+      }
     }
   }
   return result;
@@ -2226,9 +2284,14 @@ function isHttpsRequest(req: express.Request): boolean {
   );
 }
 
+/**
+ * Builds cookie attributes for `quackathon_sid` and `quackathon_oauth_token`.
+ * Intentionally omits `Partitioned` so that cookies set inside the AI Studio preview
+ * are not isolated in an iframe-only CHIPS partition separate from top-level OAuth popups.
+ */
 function buildSessionCookieFlags(req: express.Request, maxAgeSeconds = 3600): string {
   return isHttpsRequest(req)
-    ? `Path=/; HttpOnly; SameSite=None; Secure; Partitioned; Max-Age=${maxAgeSeconds}`
+    ? `Path=/; HttpOnly; SameSite=None; Secure; Max-Age=${maxAgeSeconds}`
     : `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
 }
 
@@ -2254,6 +2317,12 @@ function logOAuthStructuredEvent(params: {
   callbackOutcome: string;
   httpStatus: number;
   durationMs: number;
+  initiatingOrigin?: string | null;
+  configuredCallbackOrigin?: string | null;
+  initiationCookieStatus?: 'existing' | 'new' | null;
+  callbackCookieStatus?: 'valid' | 'missing' | 'invalid_signature' | null;
+  sessionBindingMatched?: boolean | null;
+  handledByDifferentInstance?: boolean;
   note?: string;
 }): void {
   const entry = {
@@ -2267,30 +2336,34 @@ function logOAuthStructuredEvent(params: {
     callbackOutcome: params.callbackOutcome,
     httpStatus: params.httpStatus,
     durationMs: params.durationMs,
+    ...(params.initiatingOrigin !== undefined
+      ? { initiatingOrigin: params.initiatingOrigin }
+      : {}),
+    ...(params.configuredCallbackOrigin !== undefined
+      ? { configuredCallbackOrigin: params.configuredCallbackOrigin }
+      : {}),
+    ...(params.initiationCookieStatus !== undefined
+      ? { initiationCookieStatus: params.initiationCookieStatus }
+      : {}),
+    ...(params.callbackCookieStatus !== undefined
+      ? { callbackCookieStatus: params.callbackCookieStatus }
+      : {}),
+    ...(params.sessionBindingMatched !== undefined
+      ? { sessionBindingMatched: params.sessionBindingMatched }
+      : {}),
+    ...(params.handledByDifferentInstance !== undefined
+      ? { handledByDifferentInstance: params.handledByDifferentInstance }
+      : {}),
     ...(params.note ? { note: params.note } : {}),
   };
   console.info(`[PESU OAuth Diagnostic] ${JSON.stringify(entry)}`);
 }
 
-function getOrCreateSession(req: express.Request, res: express.Response): StoredAuthSession {
-  pruneExpiredOAuthStores();
-  const cookies = parseCookies(req.headers.cookie);
-  let sessionId = verifySignedSessionCookie(cookies[SESSION_COOKIE_NAME]);
-
-  if (!sessionId) {
-    sessionId = crypto.randomBytes(18).toString('base64url');
-    const signed = signSessionId(sessionId);
-    const cookieFlags = buildSessionCookieFlags(req, 3600);
-    res.append(
-      'Set-Cookie',
-      `${SESSION_COOKIE_NAME}=${encodeURIComponent(signed)}; ${cookieFlags}`
-    );
-  }
-
+function ensureStoredAuthSession(sessionId: string): StoredAuthSession {
+  const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
+  const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
   let session = serverAuthSessions.get(sessionId);
   if (!session) {
-    const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
-    const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
     session = {
       sessionId,
       stages: {
@@ -2313,8 +2386,6 @@ function getOrCreateSession(req: express.Request, res: express.Response): Stored
     };
     serverAuthSessions.set(sessionId, session);
   } else {
-    const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
-    const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
     session.stages.configuration = hasClientId
       ? hasClientSecret
         ? 'configured'
@@ -2322,17 +2393,87 @@ function getOrCreateSession(req: express.Request, res: express.Response): Stored
       : 'missing_client_id';
     session.updatedAt = Date.now();
   }
-
   return session;
 }
 
+function getOrCreateSessionWithDiagnostics(
+  req: express.Request,
+  res: express.Response
+): {
+  session: StoredAuthSession;
+  initiationCookieStatus: 'existing' | 'new';
+  cookieInspection: SessionCookieInspection;
+} {
+  pruneExpiredOAuthStores();
+  const cookieInspection = inspectSessionCookieHeader(
+    req.headers.cookie,
+    SESSION_COOKIE_NAME
+  );
+  let sessionId = cookieInspection.primarySessionId;
+  const initiationCookieStatus: 'existing' | 'new' = sessionId ? 'existing' : 'new';
+
+  if (!sessionId) {
+    sessionId = crypto.randomBytes(18).toString('base64url');
+  }
+
+  // Always set/refresh the unpartitioned session cookie so top-level popups and
+  // redirects share the exact same `quackathon_sid` value.
+  const signed = signSessionId(sessionId);
+  const cookieFlags = buildSessionCookieFlags(req, 3600);
+  res.append(
+    'Set-Cookie',
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(signed)}; ${cookieFlags}`
+  );
+
+  // If the browser sent multiple quackathon_sid cookies (e.g. a legacy Partitioned
+  // cookie alongside a top-level cookie), explicitly expire the legacy Partitioned cookie.
+  if (cookieInspection.rawCount > 1 && isHttpsRequest(req)) {
+    res.append(
+      'Set-Cookie',
+      `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=None; Secure; Partitioned; Max-Age=0`
+    );
+  }
+
+  const session = ensureStoredAuthSession(sessionId);
+  return { session, initiationCookieStatus, cookieInspection };
+}
+
+function getOrCreateSession(req: express.Request, res: express.Response): StoredAuthSession {
+  return getOrCreateSessionWithDiagnostics(req, res).session;
+}
+
+function isLocalTestEphemeralRequest(req: express.Request): boolean {
+  const forwardedHost = req.headers['x-forwarded-host'];
+  if (forwardedHost) return false;
+  const host = (req.get('host') || '').toLowerCase();
+  const isLoopback =
+    host.startsWith('127.0.0.1:') || host.startsWith('localhost:');
+  if (!isLoopback) return false;
+  const portPart = host.split(':')[1] || '';
+  return Boolean(portPart && portPart !== String(PORT));
+}
+
 function resolveTrustedAppOrigin(req: express.Request): string {
+  const configuredRedirect = process.env.PESU_OAUTH_REDIRECT_URI?.trim();
+  if (configuredRedirect && isValidHttpUrl(configuredRedirect)) {
+    try {
+      return new URL(configuredRedirect).origin;
+    } catch {
+      // fall through
+    }
+  }
   if (
     process.env.APP_URL &&
     process.env.APP_URL !== 'MY_APP_URL' &&
-    process.env.APP_URL.trim().startsWith('http')
+    process.env.APP_URL.trim().startsWith('http') &&
+    (!isLocalTestEphemeralRequest(req) ||
+      process.env.QUACKATHON_ENFORCE_APP_URL_IN_TEST === 'true')
   ) {
-    return process.env.APP_URL.trim().replace(/\/$/, '');
+    try {
+      return new URL(process.env.APP_URL.trim()).origin;
+    } catch {
+      return process.env.APP_URL.trim().replace(/\/$/, '');
+    }
   }
   const proto =
     (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim() ||
@@ -2343,6 +2484,22 @@ function resolveTrustedAppOrigin(req: express.Request): string {
 }
 
 function resolveInitiatingClientOrigin(req: express.Request): string {
+  const explicitHeaderOrigin = req.headers['x-client-origin'];
+  if (typeof explicitHeaderOrigin === 'string' && isValidHttpUrl(explicitHeaderOrigin)) {
+    try {
+      return new URL(explicitHeaderOrigin.trim()).origin;
+    } catch {
+      // fall through
+    }
+  }
+  const explicitQueryOrigin = req.query?.client_origin;
+  if (typeof explicitQueryOrigin === 'string' && isValidHttpUrl(explicitQueryOrigin)) {
+    try {
+      return new URL(explicitQueryOrigin.trim()).origin;
+    } catch {
+      // fall through
+    }
+  }
   const originHeader = req.headers.origin;
   if (typeof originHeader === 'string' && isValidHttpUrl(originHeader)) {
     try {
@@ -2361,7 +2518,10 @@ function resolveInitiatingClientOrigin(req: express.Request): string {
       // fall through
     }
   }
-  const host = req.get('host');
+  const forwardedHost = (req.headers['x-forwarded-host'] as string | undefined)
+    ?.split(',')[0]
+    ?.trim();
+  const host = forwardedHost || req.get('host');
   if (host) {
     const proto =
       (req.headers['x-forwarded-proto'] as string | undefined)
@@ -2452,38 +2612,29 @@ export function resolveAndValidatePesuIssuerUrl(req?: express.Request): {
 function getAllowedRedirectUris(req: express.Request): {
   expectedRedirectUri: string;
   allowedRedirectUris: string[];
+  configuredCallbackOrigin: string;
+  canonicalAppOrigin: string;
 } {
-  const origin = resolveTrustedAppOrigin(req);
-  const defaultCallback = `${origin}/auth/pesu/callback`;
   const configuredRedirect = process.env.PESU_OAUTH_REDIRECT_URI?.trim();
-  const issuerResolution = resolveAndValidatePesuIssuerUrl(req);
+  if (configuredRedirect && isValidHttpUrl(configuredRedirect)) {
+    const normalizedRedirect = configuredRedirect.replace(/\/+$/, '');
+    const callbackOrigin = new URL(normalizedRedirect).origin;
+    return {
+      expectedRedirectUri: normalizedRedirect,
+      allowedRedirectUris: [normalizedRedirect],
+      configuredCallbackOrigin: callbackOrigin,
+      canonicalAppOrigin: callbackOrigin,
+    };
+  }
 
-  const reqProto =
-    (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim() ||
-    req.protocol ||
-    'http';
-  const reqHost = req.get('host');
-  const reqOriginCallback = reqHost
-    ? `${reqProto}://${reqHost}/auth/pesu/callback`
-    : undefined;
-
-  const allowed = Array.from(
-    new Set(
-      [
-        configuredRedirect,
-        issuerResolution.misconfiguredCallbackUrl ?? undefined,
-        defaultCallback,
-        reqOriginCallback,
-        `http://localhost:${PORT}/auth/pesu/callback`,
-        `http://127.0.0.1:${PORT}/auth/pesu/callback`,
-      ].filter((u): u is string => Boolean(u && u.length > 0))
-    )
-  );
+  const canonicalOrigin = resolveTrustedAppOrigin(req);
+  const expectedRedirectUri = `${canonicalOrigin}/auth/pesu/callback`;
 
   return {
-    expectedRedirectUri:
-      configuredRedirect || issuerResolution.misconfiguredCallbackUrl || defaultCallback,
-    allowedRedirectUris: allowed,
+    expectedRedirectUri,
+    allowedRedirectUris: [expectedRedirectUri],
+    configuredCallbackOrigin: canonicalOrigin,
+    canonicalAppOrigin: canonicalOrigin,
   };
 }
 
@@ -2905,20 +3056,86 @@ async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
   }
 }
 
+async function checkProviderRedirectUriRegistration(params: {
+  authorizationEndpoint: string | null;
+  clientId: string | undefined;
+  redirectUri: string;
+}): Promise<boolean | null> {
+  if (
+    !params.authorizationEndpoint ||
+    !params.clientId ||
+    process.env.QUACKATHON_TEST_MODE === 'true' ||
+    Boolean(testOverrides.fetchImpl) ||
+    Boolean(testOverrides.fetchFn)
+  ) {
+    return null;
+  }
+  try {
+    const probeUrl = new URL(params.authorizationEndpoint);
+    probeUrl.searchParams.set('response_type', 'code');
+    probeUrl.searchParams.set('client_id', params.clientId);
+    probeUrl.searchParams.set('redirect_uri', params.redirectUri);
+    probeUrl.searchParams.set('scope', 'openid profile');
+    probeUrl.searchParams.set('state', 'probe_redirect_uri_check');
+    probeUrl.searchParams.set(
+      'code_challenge',
+      'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM'
+    );
+    probeUrl.searchParams.set('code_challenge_method', 'S256');
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const resp = await fetch(probeUrl.toString(), {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if ([301, 302, 303, 307, 308].includes(resp.status)) {
+        return true;
+      }
+      const body = await resp.text();
+      if (body.includes('Redirect URI is not registered')) {
+        return false;
+      }
+      return true;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
 app.get('/api/pesu-oauth/discovery', async (req, res) => {
   const startTime = Date.now();
   const session = getOrCreateSession(req, res);
   const { expectedRedirectUri, allowedRedirectUris } = getAllowedRedirectUris(req);
-  const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
+  const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
+  const hasClientId = Boolean(clientId);
   const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
 
   const disc = await discoverPesuOidcEndpoints(req);
+  const providerRedirectUriRegistered = await checkProviderRedirectUriRegistration({
+    authorizationEndpoint: disc.authorizationEndpoint,
+    clientId,
+    redirectUri: expectedRedirectUri,
+  });
+  const portalManageUrl =
+    clientId && disc.issuer
+      ? `${disc.issuer.replace(/\/+$/, '')}/portal/${encodeURIComponent(clientId)}`
+      : `${CANONICAL_PESU_OAUTH_ISSUER}/portal`;
+
   session.stages.providerDiscovery = disc.oidcDiscoveryAvailable
     ? 'ok'
     : disc.errorCategory === 'INVALID_DISCOVERY_HTML' ||
       disc.errorCategory === 'INVALID_DISCOVERY_METADATA'
     ? 'invalid_response'
     : 'unreachable';
+
+  if (providerRedirectUriRegistered === false) {
+    session.stages.redirectUriValidation = 'mismatch';
+  }
 
   const statusToReturn = disc.oidcDiscoveryAvailable
     ? 200
@@ -2957,12 +3174,18 @@ app.get('/api/pesu-oauth/discovery', async (req, res) => {
     supportedScopes: disc.supportedScopes,
     clientConfigured: hasClientId,
     clientSecretConfigured: hasClientSecret,
+    publicClientId: clientId ?? null,
+    portalManageUrl,
+    providerRedirectUriRegistered,
     expectedRedirectUri,
     allowedRedirectUris,
     stages: session.stages,
-    userMessage: disc.oidcDiscoveryAvailable
-      ? `Discovered valid OIDC metadata from ${disc.issuer} (HTTP ${disc.httpStatus}, Content-Type: ${disc.contentType}).`
-      : disc.note || `PESU OAuth2 OIDC discovery failed (${disc.requestedUrl}).`,
+    userMessage:
+      providerRedirectUriRegistered === false
+        ? `Redirect URI "${expectedRedirectUri}" is not registered on ${disc.issuer} for client "${clientId}". Add "${expectedRedirectUri}" in ${portalManageUrl}, click "+ Add", and then click "Save Changes".`
+        : disc.oidcDiscoveryAvailable
+        ? `Discovered valid OIDC metadata from ${disc.issuer} (HTTP ${disc.httpStatus}, Content-Type: ${disc.contentType}).`
+        : disc.note || `PESU OAuth2 OIDC discovery failed (${disc.requestedUrl}).`,
     note: disc.note,
     configWarning: disc.configWarning,
     diagnosticSnippet: disc.diagnosticSnippet,
@@ -2974,7 +3197,8 @@ app.get('/api/pesu-oauth/discovery', async (req, res) => {
 });
 
 app.get('/api/pesu-oauth/session', async (req, res) => {
-  const session = getOrCreateSession(req, res);
+  const { session } = getOrCreateSessionWithDiagnostics(req, res);
+  const { canonicalAppOrigin, configuredCallbackOrigin } = getAllowedRedirectUris(req);
   let dbUser = session.dbUser ?? null;
   let dbProfile = session.dbProfile ?? null;
   let identity = session.identity;
@@ -3029,6 +3253,8 @@ app.get('/api/pesu-oauth/session', async (req, res) => {
     profile: dbProfile,
     lastError: session.lastError,
     lastDiagnostics: session.lastDiagnostics,
+    canonicalAppOrigin,
+    configuredCallbackOrigin,
   };
   res.json(resp);
 });
@@ -3065,30 +3291,114 @@ app.post('/api/pesu-oauth/logout', async (req, res) => {
 
 app.get('/api/pesu-oauth/url', async (req, res) => {
   const startTime = Date.now();
-  const session = getOrCreateSession(req, res);
+  const requestId = createRequestId('oauth_url');
+  const { session, initiationCookieStatus } = getOrCreateSessionWithDiagnostics(
+    req,
+    res
+  );
   const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
-  const { expectedRedirectUri, allowedRedirectUris } = getAllowedRedirectUris(req);
+  const {
+    expectedRedirectUri,
+    allowedRedirectUris,
+    configuredCallbackOrigin,
+    canonicalAppOrigin,
+  } = getAllowedRedirectUris(req);
+  const initiatingOrigin = resolveInitiatingClientOrigin(req);
+  const sessionFp = createSafeFingerprint(session.sessionId);
 
   const requestedRedirectUri =
     typeof req.query.redirect_uri === 'string' && req.query.redirect_uri.trim()
       ? req.query.redirect_uri.trim()
       : expectedRedirectUri;
 
-  // Validate redirect_uri against registered/allowed callback URLs
-  if (!allowedRedirectUris.includes(requestedRedirectUri)) {
+  // 1. Prevent OAuth initiation from one preview origin and callback completion on another
+  if (initiatingOrigin.toLowerCase() !== configuredCallbackOrigin.toLowerCase()) {
     session.stages.redirectUriValidation = 'mismatch';
+    const durationMs = Date.now() - startTime;
     const diag: DeveloperDiagnosticTelemetry = {
       serviceName: 'pesu_oauth2',
       httpStatus: 400,
       errorCategory: 'OAUTH_REDIRECT_URI_MISMATCH',
       retryAttempts: 0,
-      durationMs: Date.now() - startTime,
+      durationMs,
+      requestId,
+      timestamp: new Date().toISOString(),
+      stateFingerprint: null,
+      sessionFingerprint: sessionFp,
+      transactionStatus: 'not_found',
+      callbackOutcome: 'rejected_origin_mismatch',
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
+    };
+    session.lastDiagnostics = diag;
+
+    logOAuthStructuredEvent({
+      requestId,
+      event: 'oauth_url_rejected_origin_mismatch',
+      stateFingerprint: null,
+      sessionFingerprint: sessionFp,
+      transactionStatus: 'not_found',
+      callbackOutcome: 'rejected_origin_mismatch',
+      httpStatus: 400,
+      durationMs,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
+    });
+
+    const resp: PesuOAuthUrlResponse = {
+      ok: false,
+      live: true,
+      redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      stages: session.stages,
+      userMessage: `Origin mismatch: OAuth sign-in was initiated from "${initiatingOrigin}", but the registered callback origin is "${configuredCallbackOrigin}". Please open ${canonicalAppOrigin} directly so your browser session cookie and callback share the same origin.`,
+      errorCategory: 'OAUTH_REDIRECT_URI_MISMATCH',
+      diagnostics: diag,
+    };
+    res.status(400).json(resp);
+    return;
+  }
+
+  // 2. Validate exact redirect_uri against registered canonical callback URL
+  if (!allowedRedirectUris.includes(requestedRedirectUri)) {
+    session.stages.redirectUriValidation = 'mismatch';
+    const durationMs = Date.now() - startTime;
+    const diag: DeveloperDiagnosticTelemetry = {
+      serviceName: 'pesu_oauth2',
+      httpStatus: 400,
+      errorCategory: 'OAUTH_REDIRECT_URI_MISMATCH',
+      retryAttempts: 0,
+      durationMs,
+      requestId,
+      timestamp: new Date().toISOString(),
+      stateFingerprint: null,
+      sessionFingerprint: sessionFp,
+      transactionStatus: 'not_found',
+      callbackOutcome: 'rejected_redirect_uri_mismatch',
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
     };
     session.lastDiagnostics = diag;
     const resp: PesuOAuthUrlResponse = {
       ok: false,
       live: true,
       redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
       stages: session.stages,
       userMessage: `Redirect URI mismatch: "${requestedRedirectUri}" does not match the registered callback URL (${expectedRedirectUri}).`,
       errorCategory: 'OAUTH_REDIRECT_URI_MISMATCH',
@@ -3141,12 +3451,24 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       errorCategory: disc.errorCategory,
       retryAttempts: 0,
       durationMs: Date.now() - startTime,
+      requestId,
+      timestamp: new Date().toISOString(),
+      sessionFingerprint: sessionFp,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
     };
     session.lastDiagnostics = diag;
     const resp: PesuOAuthUrlResponse = {
       ok: false,
       live: true,
       redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
       scopes: requestedScopes,
       scope: requestedScopes.join(' '),
       stages: session.stages,
@@ -3171,12 +3493,24 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       errorCategory: 'OAUTH_SCOPE_REJECTED',
       retryAttempts: 0,
       durationMs: Date.now() - startTime,
+      requestId,
+      timestamp: new Date().toISOString(),
+      sessionFingerprint: sessionFp,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
     };
     session.lastDiagnostics = diag;
     const resp: PesuOAuthUrlResponse = {
       ok: false,
       live: true,
       redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
       scopes: requestedScopes,
       scope: requestedScopes.join(' '),
       stages: session.stages,
@@ -3198,12 +3532,24 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       errorCategory: 'MISSING_CONFIG',
       retryAttempts: 0,
       durationMs: Date.now() - startTime,
+      requestId,
+      timestamp: new Date().toISOString(),
+      sessionFingerprint: sessionFp,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
     };
     session.lastDiagnostics = diag;
     const resp: PesuOAuthUrlResponse = {
       ok: false,
       live: true,
       redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
       scopes: requestedScopes,
       scope: requestedScopes.join(' '),
       stages: session.stages,
@@ -3217,7 +3563,6 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
   }
 
   // Generate PKCE S256 code_verifier, code_challenge, and cryptographic state
-  const requestId = createRequestId('oauth_url');
   const codeVerifier = crypto.randomBytes(32).toString('base64url');
   const codeChallenge = crypto
     .createHash('sha256')
@@ -3225,9 +3570,7 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     .digest('base64url');
   const state = crypto.randomBytes(24).toString('base64url');
   const normalizedScopeStr = requestedScopes.join(' ');
-  const clientOrigin = resolveInitiatingClientOrigin(req);
   const stateFp = createSafeFingerprint(state);
-  const sessionFp = createSafeFingerprint(session.sessionId);
 
   // Persist OAuth authorization transaction in PostgreSQL so it survives server
   // restarts and callbacks handled by any backend instance.
@@ -3236,7 +3579,7 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     sessionId: session.sessionId,
     codeVerifier,
     redirectUri: requestedRedirectUri,
-    clientOrigin,
+    clientOrigin: initiatingOrigin,
     scopes: requestedScopes,
     issuer: disc.issuer,
     authorizationEndpoint: disc.authorizationEndpoint,
@@ -3260,6 +3603,17 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
   });
 
   const authorizationUrl = `${disc.authorizationEndpoint}?${params.toString()}`;
+  const providerRedirectUriRegistered = await checkProviderRedirectUriRegistration({
+    authorizationEndpoint: disc.authorizationEndpoint,
+    clientId,
+    redirectUri: requestedRedirectUri,
+  });
+  const portalManageUrl = disc.issuer
+    ? `${disc.issuer.replace(/\/+$/, '')}/portal/${encodeURIComponent(clientId)}`
+    : `${CANONICAL_PESU_OAUTH_ISSUER}/portal/${encodeURIComponent(clientId)}`;
+  if (providerRedirectUriRegistered === false) {
+    session.stages.redirectUriValidation = 'mismatch';
+  }
   const durationMs = Date.now() - startTime;
   const diag: DeveloperDiagnosticTelemetry = {
     serviceName: 'pesu_oauth2',
@@ -3272,7 +3626,15 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     stateFingerprint: stateFp,
     sessionFingerprint: sessionFp,
     transactionStatus: 'pending',
-    callbackOutcome: 'authorization_url_issued',
+    callbackOutcome:
+      providerRedirectUriRegistered === false
+        ? 'provider_redirect_uri_unregistered'
+        : 'authorization_url_issued',
+    initiatingOrigin,
+    configuredCallbackOrigin,
+    initiationCookieStatus,
+    sessionBindingMatched: null,
+    handledByDifferentInstance: false,
   };
   session.lastDiagnostics = diag;
 
@@ -3282,9 +3644,17 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     stateFingerprint: stateFp,
     sessionFingerprint: sessionFp,
     transactionStatus: 'pending',
-    callbackOutcome: 'authorization_url_issued',
+    callbackOutcome:
+      providerRedirectUriRegistered === false
+        ? 'provider_redirect_uri_unregistered'
+        : 'authorization_url_issued',
     httpStatus: 200,
     durationMs,
+    initiatingOrigin,
+    configuredCallbackOrigin,
+    initiationCookieStatus,
+    sessionBindingMatched: null,
+    handledByDifferentInstance: false,
   });
 
   const resp: PesuOAuthUrlResponse = {
@@ -3294,12 +3664,21 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     authUrl: authorizationUrl,
     state,
     redirectUri: requestedRedirectUri,
+    canonicalAppOrigin,
+    initiatingOrigin,
+    configuredCallbackOrigin,
+    initiationCookieStatus,
+    publicClientId: clientId,
+    portalManageUrl,
+    providerRedirectUriRegistered,
     scope: normalizedScopeStr,
     scopes: requestedScopes,
     codeChallengeMethod: 'S256',
     stages: session.stages,
     userMessage:
-      'Generated PKCE S256 authorization URL. Waiting for user consent and token exchange.',
+      providerRedirectUriRegistered === false
+        ? `Redirect URI "${requestedRedirectUri}" is not registered on ${disc.issuer} for client "${clientId}". Add "${requestedRedirectUri}" in ${portalManageUrl}, click "+ Add", and then click "Save Changes".`
+        : 'Generated PKCE S256 authorization URL. Waiting for user consent and token exchange.',
     diagnostics: diag,
   };
 
@@ -3378,57 +3757,92 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
   const requestId = createRequestId('oauth_cb');
   pruneExpiredOAuthStores();
 
-  // Inspect incoming cookies BEFORE getOrCreateSession mints a new sessionId
-  const incomingCookies = parseCookies(req.headers.cookie);
-  const incomingVerifiedSid = verifySignedSessionCookie(
-    incomingCookies[SESSION_COOKIE_NAME]
+  const { configuredCallbackOrigin } = getAllowedRedirectUris(req);
+
+  // Inspect incoming cookies WITHOUT minting a new `quackathon_sid` cookie before validation
+  const cookieInspection = inspectSessionCookieHeader(
+    req.headers.cookie,
+    SESSION_COOKIE_NAME
   );
+  const incomingVerifiedSid = cookieInspection.primarySessionId;
+  const callbackCookieStatus = cookieInspection.cookieStatus;
+  const hadLocalSession = cookieInspection.verifiedSessionIds.some((sid) =>
+    serverAuthSessions.has(sid)
+  );
+  const handledByDifferentInstance = !hadLocalSession;
+
+  const incomingCookies = parseCookies(req.headers.cookie);
   const incomingOAuthToken = incomingCookies[OAUTH_SESSION_COOKIE];
   const existingAuthSession = incomingOAuthToken
     ? await getValidOAuthSessionRecord(incomingOAuthToken).catch(() => null)
     : null;
 
-  const session = getOrCreateSession(req, res);
+  // Create/attach in-memory session state only if the browser presented a valid session cookie,
+  // or create a transient non-cookie-setting holder for error stage reporting.
+  const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
+  const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
+  const transientStages: PesuOAuthStageStatuses = {
+    providerDiscovery: 'ok',
+    configuration: hasClientId
+      ? hasClientSecret
+        ? 'configured'
+        : 'public_client_only'
+      : 'missing_client_id',
+    redirectUriValidation: 'valid',
+    authorizationRedirect: 'idle',
+    tokenExchange: 'idle',
+    verifiedIdentity: 'unverified',
+  };
+
   const { code, state, error, error_description } = req.query as Record<
     string,
     string | undefined
   >;
 
   const stateFp = createSafeFingerprint(state);
-  const sessionFp = createSafeFingerprint(
-    incomingVerifiedSid ?? session.sessionId
-  );
+  const sessionFp = createSafeFingerprint(incomingVerifiedSid);
 
   // Case 1: Provider returned an OAuth error (e.g., access_denied, testing mode restriction)
   if (error) {
-    let trustedOrigin = resolveTrustedAppOrigin(req);
+    let trustedOrigin = configuredCallbackOrigin;
+    let sessionBindingMatched = false;
     if (state) {
       const claimed = await claimOrInspectOAuthTransactionRecord({
         state,
         incomingSessionId: incomingVerifiedSid,
+        candidateSessionIds: cookieInspection.verifiedSessionIds,
+        callbackCookieStatus,
       }).catch(() => null);
-      if (claimed?.transaction?.clientOrigin) {
-        trustedOrigin = claimed.transaction.clientOrigin;
+      if (claimed?.transactionMeta?.clientOrigin) {
+        trustedOrigin = claimed.transactionMeta.clientOrigin;
       }
-      await completeOAuthTransactionRecord({
-        state,
-        status: 'failed',
-        outcomeStatus: 400,
-        outcomeErrorCategory: 'OAUTH_CONSENT_ERROR',
-        outcomeMessage: `OAuth provider returned "${error}".`,
-      }).catch(() => {});
+      sessionBindingMatched = Boolean(claimed?.sessionBindingMatched);
+      if (sessionBindingMatched) {
+        await completeOAuthTransactionRecord({
+          state,
+          status: 'failed',
+          outcomeStatus: 400,
+          outcomeErrorCategory: 'OAUTH_CONSENT_ERROR',
+          outcomeMessage: `OAuth provider returned "${error}".`,
+        }).catch(() => {});
+      }
     }
 
-    session.stages.authorizationRedirect = 'consent_denied_or_error';
-    session.stages.tokenExchange = 'idle';
-    session.stages.verifiedIdentity = 'unverified';
+    const activeSession = incomingVerifiedSid
+      ? ensureStoredAuthSession(incomingVerifiedSid)
+      : null;
+    const stages = activeSession ? activeSession.stages : transientStages;
+
+    stages.authorizationRedirect = 'consent_denied_or_error';
+    stages.tokenExchange = 'idle';
+    stages.verifiedIdentity = 'unverified';
     const userMsg =
       error === 'access_denied'
         ? 'Authorization was declined or restricted (e.g., testing-mode user restriction).'
         : `OAuth provider returned "${error}"${
             error_description ? `: ${error_description}` : ''
           }.`;
-    session.lastError = userMsg;
+    if (activeSession) activeSession.lastError = userMsg;
 
     const durationMs = Date.now() - startTime;
     const diag: DeveloperDiagnosticTelemetry = {
@@ -3443,8 +3857,13 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       sessionFingerprint: sessionFp,
       transactionStatus: 'failed',
       callbackOutcome: 'provider_consent_error',
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched,
+      handledByDifferentInstance,
     };
-    session.lastDiagnostics = diag;
+    if (activeSession) activeSession.lastDiagnostics = diag;
 
     logOAuthStructuredEvent({
       requestId,
@@ -3455,6 +3874,11 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       callbackOutcome: 'provider_consent_error',
       httpStatus: 400,
       durationMs,
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched,
+      handledByDifferentInstance,
       note: error,
     });
 
@@ -3463,7 +3887,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       status: 'error',
       ok: false,
       state: state ?? '',
-      stages: session.stages,
+      stages,
       identity: null,
       userMessage: userMsg,
       error: userMsg,
@@ -3482,21 +3906,34 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         state,
         code: code ?? null,
         incomingSessionId: incomingVerifiedSid,
+        candidateSessionIds: cookieInspection.verifiedSessionIds,
+        callbackCookieStatus,
         authenticatedUid: existingAuthSession?.uid ?? null,
       })
     : {
         status: 'invalid' as const,
         transactionStatus: 'not_found' as const,
+        sessionBindingMatched: false,
+        matchedSessionId: null,
         transaction: null,
+        transactionMeta: null,
       };
 
   const trustedOrigin =
-    txLookup.transaction?.clientOrigin || resolveTrustedAppOrigin(req);
+    txLookup.transaction?.clientOrigin ||
+    txLookup.transactionMeta?.clientOrigin ||
+    configuredCallbackOrigin;
+  const resolvedMatchedSid = txLookup.matchedSessionId ?? incomingVerifiedSid;
+  const effectiveSessionFp = createSafeFingerprint(resolvedMatchedSid);
 
   // Case 2: Concurrent duplicate callback arrived while first callback is still in 'processing'
   if (state && code && txLookup.status === 'processing') {
     const waitedOutcome = await waitForOAuthTransactionCompletion(state, 4500);
     const durationMs = Date.now() - startTime;
+    const session = resolvedMatchedSid
+      ? ensureStoredAuthSession(resolvedMatchedSid)
+      : null;
+    const stages = session ? session.stages : transientStages;
 
     if (waitedOutcome && waitedOutcome.status === 'completed') {
       const userRecord = waitedOutcome.completedUid
@@ -3504,13 +3941,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
             () => null
           )
         : null;
-      session.stages.authorizationRedirect = 'callback_received';
-      session.stages.tokenExchange = 'succeeded';
-      session.stages.verifiedIdentity = 'verified';
-      session.dbUser = userRecord?.user ?? null;
-      session.dbProfile = userRecord?.profile ?? null;
-      session.identity =
+      stages.authorizationRedirect = 'callback_received';
+      stages.tokenExchange = 'succeeded';
+      stages.verifiedIdentity = 'verified';
+      const identity =
         (waitedOutcome.outcomeIdentity as PesuVerifiedIdentity | null) ?? null;
+      if (session) {
+        session.dbUser = userRecord?.user ?? null;
+        session.dbProfile = userRecord?.profile ?? null;
+        session.identity = identity;
+      }
 
       const diag: DeveloperDiagnosticTelemetry = {
         serviceName: 'pesu_oauth2',
@@ -3521,21 +3961,31 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         requestId,
         timestamp: new Date().toISOString(),
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'completed',
         callbackOutcome: 'duplicate_inflight_joined',
+        initiatingOrigin: trustedOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: txLookup.sessionBindingMatched,
+        handledByDifferentInstance,
       };
-      session.lastDiagnostics = diag;
+      if (session) session.lastDiagnostics = diag;
 
       logOAuthStructuredEvent({
         requestId,
         event: 'oauth_callback_duplicate_inflight_joined',
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'completed',
         callbackOutcome: 'duplicate_inflight_joined',
         httpStatus: 200,
         durationMs,
+        initiatingOrigin: trustedOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: txLookup.sessionBindingMatched,
+        handledByDifferentInstance,
       });
 
       const payload: PesuOAuthCallbackPostMessage = {
@@ -3544,8 +3994,8 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         ok: true,
         state,
         duplicateCallback: true,
-        stages: session.stages,
-        identity: session.identity,
+        stages,
+        identity,
         user: userRecord?.user ?? null,
         profile: userRecord?.profile ?? null,
         userMessage:
@@ -3559,13 +4009,13 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     }
 
     if (waitedOutcome && waitedOutcome.status === 'failed') {
-      session.stages.authorizationRedirect = 'callback_received';
-      session.stages.tokenExchange = 'failed';
-      session.stages.verifiedIdentity = 'unverified';
+      stages.authorizationRedirect = 'callback_received';
+      stages.tokenExchange = 'failed';
+      stages.verifiedIdentity = 'unverified';
       const userMsg =
         waitedOutcome.outcomeMessage ||
         'Token exchange with PESU OAuth2 failed. Please start a fresh sign-in flow.';
-      session.lastError = userMsg;
+      if (session) session.lastError = userMsg;
 
       const statusToSend = waitedOutcome.outcomeStatus || 502;
       const diag: DeveloperDiagnosticTelemetry = {
@@ -3579,21 +4029,31 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         requestId,
         timestamp: new Date().toISOString(),
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
         callbackOutcome: 'duplicate_failed_reported',
+        initiatingOrigin: trustedOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: txLookup.sessionBindingMatched,
+        handledByDifferentInstance,
       };
-      session.lastDiagnostics = diag;
+      if (session) session.lastDiagnostics = diag;
 
       logOAuthStructuredEvent({
         requestId,
         event: 'oauth_callback_duplicate_failed',
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
         callbackOutcome: 'duplicate_failed_reported',
         httpStatus: statusToSend,
         durationMs,
+        initiatingOrigin: trustedOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: txLookup.sessionBindingMatched,
+        handledByDifferentInstance,
       });
 
       const payload: PesuOAuthCallbackPostMessage = {
@@ -3602,7 +4062,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         ok: false,
         state,
         duplicateCallback: true,
-        stages: session.stages,
+        stages,
         identity: null,
         userMessage: userMsg,
         error: userMsg,
@@ -3625,13 +4085,21 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       ? await getUserAndProfileByUid(completedUid).catch(() => null)
       : null;
 
-    session.stages.authorizationRedirect = 'callback_received';
-    session.stages.tokenExchange = 'succeeded';
-    session.stages.verifiedIdentity = 'verified';
-    session.dbUser = userRecord?.user ?? null;
-    session.dbProfile = userRecord?.profile ?? null;
-    session.identity =
+    const session = resolvedMatchedSid
+      ? ensureStoredAuthSession(resolvedMatchedSid)
+      : null;
+    const stages = session ? session.stages : transientStages;
+
+    stages.authorizationRedirect = 'callback_received';
+    stages.tokenExchange = 'succeeded';
+    stages.verifiedIdentity = 'verified';
+    const identity =
       (txLookup.outcome.outcomeIdentity as PesuVerifiedIdentity | null) ?? null;
+    if (session) {
+      session.dbUser = userRecord?.user ?? null;
+      session.dbProfile = userRecord?.profile ?? null;
+      session.identity = identity;
+    }
 
     const diag: DeveloperDiagnosticTelemetry = {
       serviceName: 'pesu_oauth2',
@@ -3642,21 +4110,31 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       timestamp: new Date().toISOString(),
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'completed',
       callbackOutcome: 'duplicate_completed_reused',
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: txLookup.sessionBindingMatched,
+      handledByDifferentInstance,
     };
-    session.lastDiagnostics = diag;
+    if (session) session.lastDiagnostics = diag;
 
     logOAuthStructuredEvent({
       requestId,
       event: 'oauth_callback_duplicate_completed_reused',
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'completed',
       callbackOutcome: 'duplicate_completed_reused',
       httpStatus: 200,
       durationMs,
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: txLookup.sessionBindingMatched,
+      handledByDifferentInstance,
     });
 
     const payload: PesuOAuthCallbackPostMessage = {
@@ -3665,8 +4143,8 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       ok: true,
       state,
       duplicateCallback: true,
-      stages: session.stages,
-      identity: session.identity,
+      stages,
+      identity,
       user: userRecord?.user ?? null,
       profile: userRecord?.profile ?? null,
       userMessage:
@@ -3681,15 +4159,24 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
 
   const tx = txLookup.status === 'claimed' ? txLookup.transaction : null;
 
-  // Case 4: Missing, expired, replayed, session-mismatched, or previously-failed state parameter or missing code
+  // Case 4: Missing, expired, replayed, session-missing, session-invalid, session-mismatched, or previously-failed state parameter or missing code
   if (!state || !tx || !code) {
-    session.stages.authorizationRedirect = 'consent_denied_or_error';
-    session.stages.tokenExchange = 'failed';
-    session.stages.verifiedIdentity = 'unverified';
+    const activeSession = incomingVerifiedSid
+      ? ensureStoredAuthSession(incomingVerifiedSid)
+      : null;
+    const stages = activeSession ? activeSession.stages : transientStages;
+
+    stages.authorizationRedirect = 'consent_denied_or_error';
+    stages.tokenExchange = 'failed';
+    stages.verifiedIdentity = 'unverified';
     const userMsg = !state
       ? 'Invalid or expired OAuth2 state parameter. Please start a fresh sign-in flow.'
       : txLookup.status === 'expired'
       ? 'Invalid or expired OAuth2 state parameter. Your 10-minute sign-in window expired; please start a fresh sign-in flow.'
+      : txLookup.status === 'session_missing'
+      ? `Invalid OAuth2 state parameter: no browser session cookie (${SESSION_COOKIE_NAME}) was sent with the callback. If you are inside an embedded preview that blocks cookies, use Full-Page Sign-In or open ${configuredCallbackOrigin} in a top-level tab.`
+      : txLookup.status === 'session_invalid'
+      ? 'Invalid OAuth2 state parameter: the browser session cookie signature is invalid. Please start a fresh sign-in flow.'
       : txLookup.status === 'session_mismatch'
       ? 'Invalid OAuth2 state parameter: this authorization request belongs to a different browser session. Please start a fresh sign-in flow.'
       : txLookup.status === 'failed_previously'
@@ -3701,11 +4188,15 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       : !tx
       ? 'Invalid or expired OAuth2 state parameter. Please start a fresh sign-in flow.'
       : 'Authorization callback did not include an authorization code.';
-    session.lastError = userMsg;
+    if (activeSession) activeSession.lastError = userMsg;
 
     const outcomeLabel =
       txLookup.status === 'expired'
         ? 'rejected_expired'
+        : txLookup.status === 'session_missing'
+        ? 'rejected_missing_session_cookie'
+        : txLookup.status === 'session_invalid'
+        ? 'rejected_invalid_session_cookie'
         : txLookup.status === 'session_mismatch'
         ? 'rejected_session_mismatch'
         : txLookup.status === 'failed_previously'
@@ -3715,7 +4206,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         : 'rejected_invalid_state';
 
     console.warn(
-      `[PESU OAuth Callback] Rejected callback: stateStatus=${txLookup.status}, outcome=${outcomeLabel}, hasCode=${Boolean(
+      `[PESU OAuth Callback] Rejected callback: stateStatus=${txLookup.status}, outcome=${outcomeLabel}, cookieStatus=${callbackCookieStatus}, sessionMatched=${txLookup.sessionBindingMatched}, hasCode=${Boolean(
         code
       )}`
     );
@@ -3730,21 +4221,31 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       timestamp: new Date().toISOString(),
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: txLookup.transactionStatus,
       callbackOutcome: outcomeLabel,
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: txLookup.sessionBindingMatched,
+      handledByDifferentInstance,
     };
-    session.lastDiagnostics = diag;
+    if (activeSession) activeSession.lastDiagnostics = diag;
 
     logOAuthStructuredEvent({
       requestId,
       event: 'oauth_callback_rejected',
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: txLookup.transactionStatus,
       callbackOutcome: outcomeLabel,
       httpStatus: 400,
       durationMs,
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: txLookup.sessionBindingMatched,
+      handledByDifferentInstance,
     });
 
     const payload: PesuOAuthCallbackPostMessage = {
@@ -3752,7 +4253,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       status: 'error',
       ok: false,
       state: state ?? '',
-      stages: session.stages,
+      stages,
       identity: null,
       userMessage: userMsg,
       error: userMsg,
@@ -3764,8 +4265,20 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     return;
   }
 
-  // Correlate session with the current request session
-  const targetSession = session;
+  // Correlate session with the verified matched session ID
+  const verifiedSidForCallback =
+    resolvedMatchedSid ?? crypto.randomBytes(18).toString('base64url');
+  const targetSession = ensureStoredAuthSession(verifiedSidForCallback);
+  // Refresh the verified unpartitioned session cookie on successful claim
+  const signedSid = signSessionId(verifiedSidForCallback);
+  res.append(
+    'Set-Cookie',
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(signedSid)}; ${buildSessionCookieFlags(
+      req,
+      3600
+    )}`
+  );
+
   targetSession.stages.authorizationRedirect = 'callback_received';
   targetSession.stages.tokenExchange = 'exchanging';
 
@@ -3840,9 +4353,14 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         requestId,
         timestamp: new Date().toISOString(),
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
         callbackOutcome: 'token_exchange_failed',
+        initiatingOrigin: tx.clientOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: true,
+        handledByDifferentInstance,
       };
       targetSession.lastDiagnostics = diag;
 
@@ -3850,11 +4368,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         requestId,
         event: 'oauth_callback_token_exchange_failed',
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
         callbackOutcome: 'token_exchange_failed',
         httpStatus: tokenResp.status || 502,
         durationMs,
+        initiatingOrigin: tx.clientOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: true,
+        handledByDifferentInstance,
         note: upstreamErr,
       });
 
@@ -4049,9 +4572,14 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       timestamp: new Date().toISOString(),
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'completed',
       callbackOutcome: 'token_exchanged_success',
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
     };
     targetSession.lastDiagnostics = diag;
 
@@ -4059,11 +4587,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       event: 'oauth_callback_succeeded',
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'completed',
       callbackOutcome: 'token_exchanged_success',
       httpStatus: 200,
       durationMs,
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
     });
 
     // Never include bearer session tokens or provider credentials in postMessage!
@@ -4107,9 +4640,14 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       timestamp: new Date().toISOString(),
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'failed',
       callbackOutcome: 'token_exchange_failed',
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
     };
     targetSession.lastDiagnostics = diag;
 
@@ -4117,11 +4655,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       event: 'oauth_callback_exception',
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'failed',
       callbackOutcome: 'token_exchange_failed',
       httpStatus: 502,
       durationMs,
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
       note: userMsg,
     });
 
@@ -4271,101 +4814,635 @@ app.post('/api/auth/logout', async (req: AuthenticatedRequest, res) => {
   }
 });
 
+// Per-user in-flight deduplication and short TTL cache for PESU Academy announcements
+const inFlightAnnouncementsByUid = new Map<
+  string,
+  Promise<{ status: number; payload: PesuAnnouncementsResponse }>
+>();
+const announcementsCacheByUid = new Map<
+  string,
+  { expiresAt: number; payload: PesuAnnouncementsResponse }
+>();
+const ANNOUNCEMENTS_CACHE_TTL_MS = 90 * 1000;
+
 /**
  * Consent-based PESU Academy announcement retrieval using server-stored OAuth token.
- * Never exposes Academy tokens to the frontend, and never generates fake announcements.
+ * - Parses `{ resource: "announcements", data: [...], fetched_at }` as well as legacy formats.
+ * - Never exposes Academy access tokens to the frontend.
+ * - Never reports missing scope, expired sessions, or provider failures as "0 announcements".
  */
-app.get('/api/pesu/announcements', requireAuth, async (req: AuthenticatedRequest, res) => {
-  try {
-    const authUser = req.user!;
-    const record = await getUserAndProfileByUid(authUser.uid);
-    if (!record?.user.privacyPreferences.academyAnnouncementsOptIn) {
-      res.status(403).json({
+app.get(
+  '/api/pesu/announcements',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const startTime = Date.now();
+    try {
+      const authUser = req.user!;
+      const forceRefresh = req.query.refresh === 'true';
+      const record = await getUserAndProfileByUid(authUser.uid);
+
+      if (!record?.user.privacyPreferences.academyAnnouncementsOptIn) {
+        const payload: PesuAnnouncementsResponse = {
+          ok: false,
+          errorCode: 'OPT_IN_REQUIRED',
+          requiresOptIn: true,
+          userMessage:
+            'PESU Academy announcement retrieval is optional and requires your explicit opt-in consent.',
+          error: 'Opt-in consent required for PESU Academy announcements.',
+        };
+        res.status(403).json(payload);
+        return;
+      }
+
+      if (!authUser.pesuSessionToken) {
+        const payload: PesuAnnouncementsResponse = {
+          ok: false,
+          errorCode: 'AUTH_REQUIRED',
+          requiresReauth: true,
+          requiresScopeGrant: true,
+          userMessage:
+            'No active PESU OAuth2 session found. Connect your PESU account with the announcements:read scope to view your Academy announcements.',
+          error: 'No active PESU OAuth2 session token.',
+        };
+        res.status(401).json(payload);
+        return;
+      }
+
+      const oauthSess =
+        (await getValidOAuthSessionRecord(authUser.pesuSessionToken)) ??
+        (await getValidOAuthSessionByInitiatingSessionId(
+          authUser.pesuSessionToken
+        ));
+      if (!oauthSess || !oauthSess.accessToken) {
+        const payload: PesuAnnouncementsResponse = {
+          ok: false,
+          errorCode: 'TOKEN_EXPIRED_OR_REVOKED',
+          requiresReauth: true,
+          userMessage:
+            'Your PESU OAuth2 session has expired or been revoked. Please sign in with PESU again.',
+          error: 'PESU OAuth2 token expired or revoked.',
+        };
+        res.status(401).json(payload);
+        return;
+      }
+
+      if (!oauthSess.scopes.includes('announcements:read')) {
+        const payload: PesuAnnouncementsResponse = {
+          ok: false,
+          errorCode: 'MISSING_ANNOUNCEMENTS_SCOPE',
+          requiresScopeGrant: true,
+          grantedScopes: oauthSess.scopes,
+          userMessage:
+            'Your current PESU sign-in only granted basic identity verification. Authorize the optional announcements:read scope to fetch PESU Academy announcements.',
+          error: 'Missing announcements:read OAuth scope.',
+        };
+        res.status(403).json(payload);
+        return;
+      }
+
+      const useCache =
+        !forceRefresh && !testOverrides.fetchImpl && !testOverrides.fetchFn;
+      if (useCache) {
+        const cached = announcementsCacheByUid.get(authUser.uid);
+        if (cached && cached.expiresAt > Date.now()) {
+          res.status(200).json({ ...cached.payload, cached: true });
+          return;
+        }
+      }
+
+      let inFlight = inFlightAnnouncementsByUid.get(authUser.uid);
+      if (!inFlight) {
+        inFlight = (async (): Promise<{
+          status: number;
+          payload: PesuAnnouncementsResponse;
+        }> => {
+          const { issuerBaseUrl } = resolveAndValidatePesuIssuerUrl(req);
+          const announcementsUrl = `${issuerBaseUrl}/api/v1/announcements`;
+          const fetchFn = getFetch();
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 12000);
+
+          let upstreamResp: Response;
+          try {
+            upstreamResp = await fetchFn(announcementsUrl, {
+              headers: {
+                Authorization: `Bearer ${oauthSess.accessToken}`,
+                Accept: 'application/json',
+              },
+              signal: controller.signal,
+            });
+          } catch (netErr) {
+            clearTimeout(timer);
+            const msg =
+              netErr instanceof Error ? netErr.message : String(netErr);
+            return {
+              status: 502,
+              payload: {
+                ok: false,
+                errorCode: 'NETWORK_ERROR',
+                grantedScopes: oauthSess.scopes,
+                userMessage:
+                  'Could not reach the PESU OAuth2 announcements endpoint. Please try again shortly.',
+                error: msg,
+                diagnostics: {
+                  serviceName: 'pesu_oauth2',
+                  httpStatus: 502,
+                  errorCategory: 'NETWORK_ERROR',
+                  retryAttempts: 0,
+                  durationMs: Date.now() - startTime,
+                },
+              },
+            };
+          }
+          clearTimeout(timer);
+
+          const rawBody = await upstreamResp.json().catch(() => null);
+
+          if (!upstreamResp.ok) {
+            const errObj =
+              rawBody && typeof rawBody === 'object'
+                ? (rawBody as Record<string, unknown>)
+                : {};
+            const upstreamError =
+              typeof errObj.error === 'string' ? errObj.error : '';
+            const upstreamDesc =
+              typeof errObj.error_description === 'string'
+                ? errObj.error_description
+                : typeof errObj.message === 'string'
+                  ? errObj.message
+                  : '';
+
+            if (upstreamResp.status === 401 || upstreamError === 'invalid_token') {
+              return {
+                status: 401,
+                payload: {
+                  ok: false,
+                  errorCode: 'TOKEN_EXPIRED_OR_REVOKED',
+                  requiresReauth: true,
+                  grantedScopes: oauthSess.scopes,
+                  userMessage:
+                    upstreamDesc ||
+                    'Your PESU OAuth2 access token expired or was rejected by the provider. Please sign in again.',
+                  error: upstreamError || 'invalid_token',
+                  diagnostics: {
+                    serviceName: 'pesu_oauth2',
+                    httpStatus: 401,
+                    errorCategory: 'AUTH_ERROR',
+                    retryAttempts: 0,
+                    durationMs: Date.now() - startTime,
+                  },
+                },
+              };
+            }
+
+            if (
+              upstreamResp.status === 403 &&
+              upstreamError === 'consent_required'
+            ) {
+              return {
+                status: 403,
+                payload: {
+                  ok: false,
+                  errorCode: 'DELEGATED_CREDENTIALS_REQUIRED',
+                  requiresScopeGrant: true,
+                  requiresReauth: true,
+                  grantedScopes: oauthSess.scopes,
+                  userMessage:
+                    upstreamDesc ||
+                    'Delegated PESU Academy credentials are required on the PESU-Dev provider to fetch announcements. Please re-connect and authorize delegated access.',
+                  error: 'consent_required',
+                  diagnostics: {
+                    serviceName: 'pesu_oauth2',
+                    httpStatus: 403,
+                    errorCategory: 'OAUTH_CONSENT_ERROR',
+                    retryAttempts: 0,
+                    durationMs: Date.now() - startTime,
+                  },
+                },
+              };
+            }
+
+            if (
+              upstreamResp.status === 403 ||
+              upstreamError === 'insufficient_scope'
+            ) {
+              return {
+                status: 403,
+                payload: {
+                  ok: false,
+                  errorCode: 'MISSING_ANNOUNCEMENTS_SCOPE',
+                  requiresScopeGrant: true,
+                  grantedScopes: oauthSess.scopes,
+                  userMessage:
+                    upstreamDesc ||
+                    'The PESU OAuth2 provider rejected the request because announcements:read scope is missing.',
+                  error: upstreamError || 'insufficient_scope',
+                  diagnostics: {
+                    serviceName: 'pesu_oauth2',
+                    httpStatus: 403,
+                    errorCategory: 'OAUTH_SCOPE_REJECTED',
+                    retryAttempts: 0,
+                    durationMs: Date.now() - startTime,
+                  },
+                },
+              };
+            }
+
+            const statusOut =
+              upstreamResp.status >= 500 ? 502 : upstreamResp.status;
+            return {
+              status: statusOut,
+              payload: {
+                ok: false,
+                errorCode: 'PROVIDER_UNAVAILABLE',
+                grantedScopes: oauthSess.scopes,
+                userMessage:
+                  upstreamDesc ||
+                  `PESU Academy announcements provider returned HTTP ${upstreamResp.status}.`,
+                error: upstreamError || `HTTP_${upstreamResp.status}`,
+                diagnostics: {
+                  serviceName: 'pesu_oauth2',
+                  httpStatus: upstreamResp.status,
+                  errorCategory: 'UPSTREAM_5XX',
+                  retryAttempts: 0,
+                  durationMs: Date.now() - startTime,
+                },
+              },
+            };
+          }
+
+          const normalized = normalizePesuAnnouncementPayload(rawBody);
+          if (!normalized.validEnvelope) {
+            return {
+              status: 502,
+              payload: {
+                ok: false,
+                errorCode: 'MALFORMED_PROVIDER_PAYLOAD',
+                grantedScopes: oauthSess.scopes,
+                userMessage:
+                  'PESU Academy provider returned a malformed response payload.',
+                error: 'Invalid announcements JSON envelope.',
+                diagnostics: {
+                  serviceName: 'pesu_oauth2',
+                  httpStatus: 502,
+                  errorCategory: 'VALIDATION_ERROR',
+                  retryAttempts: 0,
+                  durationMs: Date.now() - startTime,
+                },
+              },
+            };
+          }
+
+          const successPayload: PesuAnnouncementsResponse = {
+            ok: true,
+            resource: normalized.resource,
+            announcements: normalized.announcements.map((a) => ({
+              id: a.id,
+              title: a.title,
+              date: a.date,
+              description: a.description,
+              image: a.image,
+              attachments: a.attachments,
+            })),
+            fetchedAt: normalized.fetchedAt,
+            grantedScopes: oauthSess.scopes,
+            userMessage:
+              normalized.announcements.length > 0
+                ? `Retrieved ${normalized.announcements.length} announcement(s) from PESU Academy.`
+                : 'No announcements are currently posted on your PESU Academy feed.',
+            diagnostics: {
+              serviceName: 'pesu_oauth2',
+              httpStatus: 200,
+              errorCategory: 'NONE',
+              retryAttempts: 0,
+              durationMs: Date.now() - startTime,
+            },
+          };
+
+          if (useCache) {
+            announcementsCacheByUid.set(authUser.uid, {
+              expiresAt: Date.now() + ANNOUNCEMENTS_CACHE_TTL_MS,
+              payload: successPayload,
+            });
+          }
+
+          return { status: 200, payload: successPayload };
+        })().finally(() => {
+          inFlightAnnouncementsByUid.delete(authUser.uid);
+        });
+        inFlightAnnouncementsByUid.set(authUser.uid, inFlight);
+      }
+
+      const result = await inFlight;
+      res.status(result.status).json(result.payload);
+    } catch (error) {
+      console.error('Error in GET /api/pesu/announcements:', error);
+      res.status(502).json({
         ok: false,
-        available: false,
-        announcements: [],
+        errorCode: 'NETWORK_ERROR',
         userMessage:
-          'PESU Academy announcement retrieval requires explicit opt-in in your Profile privacy settings.',
-      });
-      return;
+          'PESU Academy announcement retrieval encountered an unexpected error.',
+      } satisfies PesuAnnouncementsResponse);
+    }
+  }
+);
+
+// ============================================================================
+// PESU Public Events (`https://events.pes.edu`) Live Discovery & Sync Pipeline
+// ============================================================================
+const PESU_PUBLIC_SOURCE_URLS = [
+  'https://events.pes.edu/browse/?tag=hackathon',
+  'https://events.pes.edu/browse/?status=upcoming',
+  'https://events.pes.edu/browse/?department=computer-science',
+];
+
+let inFlightPesuPublicSync: Promise<PesuPublicEventsSyncResponse> | null = null;
+let lastPesuPublicSyncResult: {
+  expiresAt: number;
+  response: PesuPublicEventsSyncResponse;
+} | null = null;
+const PESU_PUBLIC_SYNC_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+export async function syncPublicPesuEventsCatalog(options?: {
+  forceRefresh?: boolean;
+  actorUid?: string;
+}): Promise<PesuPublicEventsSyncResponse> {
+  const forceRefresh = Boolean(options?.forceRefresh);
+  const useCache =
+    !forceRefresh && !testOverrides.fetchImpl && !testOverrides.fetchFn;
+
+  if (
+    useCache &&
+    lastPesuPublicSyncResult &&
+    lastPesuPublicSyncResult.expiresAt > Date.now()
+  ) {
+    return lastPesuPublicSyncResult.response;
+  }
+
+  if (inFlightPesuPublicSync) {
+    return inFlightPesuPublicSync;
+  }
+
+  inFlightPesuPublicSync = (async (): Promise<PesuPublicEventsSyncResponse> => {
+    const fetchedAt = new Date().toISOString();
+    const warnings: string[] = [];
+    let reachablePagesCount = 0;
+
+    const listingMap = new Map<
+      string,
+      ReturnType<typeof parsePesuEventsHtmlListing>[number]
+    >();
+
+    for (const browseUrl of PESU_PUBLIC_SOURCE_URLS) {
+      const res = await safeFetchFollowRedirects(browseUrl);
+      if (!res.ok || !res.bodyText) {
+        warnings.push(
+          `Could not fetch ${browseUrl} (${res.error || `HTTP ${res.status}`}).`
+        );
+        continue;
+      }
+      reachablePagesCount++;
+      const cards = parsePesuEventsHtmlListing(res.bodyText);
+      for (const card of cards) {
+        if (!listingMap.has(card.eventId)) {
+          listingMap.set(card.eventId, card);
+        } else {
+          // Merge tags if seen across multiple browse views
+          const existing = listingMap.get(card.eventId)!;
+          for (const t of card.tags) {
+            if (!existing.tags.includes(t)) existing.tags.push(t);
+          }
+        }
+      }
     }
 
-    if (!authUser.pesuSessionToken) {
-      res.status(200).json({
+    if (reachablePagesCount === 0) {
+      return {
         ok: false,
-        available: false,
-        announcements: [],
+        live: true,
+        fetchedAt,
+        sourcePagesChecked: PESU_PUBLIC_SOURCE_URLS,
+        reachablePagesCount: 0,
+        discoveredCount: 0,
+        publishedOrUpdatedCount: 0,
+        stagedForReviewCount: 0,
+        duplicatesSkippedCount: 0,
         userMessage:
-          'No active PESU OAuth2 session token found. Sign in via PESU OAuth2 with the announcements:read scope to retrieve campus announcements.',
-      });
-      return;
+          'events.pes.edu is currently unreachable. No synthetic or fallback events were generated.',
+        warnings,
+      };
     }
 
-    const oauthSess = await getValidOAuthSessionRecord(authUser.pesuSessionToken);
-    if (!oauthSess || !oauthSess.accessToken) {
-      res.status(200).json({
-        ok: false,
-        available: false,
-        announcements: [],
-        userMessage:
-          'Your PESU OAuth2 token has expired or been revoked. Please sign in again.',
+    const discoveredCards = Array.from(listingMap.values());
+    let publishedOrUpdatedCount = 0;
+    let stagedForReviewCount = 0;
+    let duplicatesSkippedCount = 0;
+
+    // Fetch up to 10 detail pages for grounded metadata (venue, hosted by, full date range, registration link)
+    for (const card of discoveredCards.slice(0, 10)) {
+      const detailFetch = await safeFetchFollowRedirects(card.detailUrl);
+      const detail =
+        detailFetch.ok && detailFetch.bodyText
+          ? parsePesuEventDetailHtml(detailFetch.bodyText, card.detailUrl)
+          : null;
+
+      const resolvedTitle = detail?.title || card.title;
+      const resolvedOrganizer =
+        detail?.organizer || card.organizer || 'PES University';
+      const resolvedDescription =
+        detail?.description || card.summary || `Official event listed on ${card.detailUrl}`;
+      const resolvedStartAt = detail?.startAt ?? card.startAt ?? null;
+      const resolvedEndAt = detail?.endAt ?? card.endAt ?? resolvedStartAt;
+      const resolvedDeadline = detail?.registrationDeadline ?? null;
+      const resolvedCampus = detail?.campus ?? card.campus ?? null;
+      const resolvedVenueName = detail?.venueName ?? card.venueName ?? null;
+      const resolvedEventType =
+        detail && detail.eventType !== 'unknown'
+          ? detail.eventType
+          : card.eventType !== 'unknown'
+            ? card.eventType
+            : 'other';
+      const resolvedMatchable =
+        detail !== null ? detail.matchable : card.matchable;
+      const resolvedThemes =
+        detail && detail.themes.length > 0
+          ? detail.themes
+          : card.tags.length > 0
+            ? card.tags.map((t) => t.replace(/^#/, ''))
+            : ['PESU Event'];
+      const resolvedRegUrl = detail?.registrationUrl || card.detailUrl;
+      const canonicalUrl = detail?.canonicalUrl || card.detailUrl;
+
+      // Stage record in event_candidates for provenance and admin review auditability
+      const staged = await createEventCandidateRecord({
+        id: `cand_pes_public_${card.eventId}`,
+        source: 'pes_public_events',
+        sourceUrl: canonicalUrl,
+        originalSubmissionUrl: canonicalUrl,
+        verifiedCanonicalUrl: canonicalUrl,
+        sourceUrlStatus: 'verified',
+        submittedByUid: options?.actorUid,
+        externalFingerprint: `pes_events_${card.eventId}`,
+        title: resolvedTitle,
+        organizer: resolvedOrganizer,
+        eventType: resolvedEventType,
+        matchable: resolvedMatchable,
+        themes: resolvedThemes,
+        description: resolvedDescription,
+        startAt: resolvedStartAt,
+        endAt: resolvedEndAt,
+        registrationDeadline: resolvedDeadline,
+        timezone: 'Asia/Kolkata',
+        venue: {
+          campus: resolvedCampus,
+          name: resolvedVenueName,
+        },
+        format:
+          detail?.format && detail.format !== 'unknown'
+            ? detail.format
+            : resolvedCampus === 'Online / Multi-Campus'
+              ? 'online'
+              : 'onsite',
+        teamSize: {
+          min: detail?.minTeamSize ?? null,
+          max: detail?.maxTeamSize ?? null,
+        },
+        registrationUrl: resolvedRegUrl,
+        eligibilityNotes: null,
+        fieldEvidence: {
+          source: [
+            {
+              sourceUrl: canonicalUrl,
+              excerpt:
+                detail?.extractedEvidenceQuote ||
+                `Listed on events.pes.edu (${card.dateText || 'Date TBA'})`,
+            },
+          ],
+        },
+        classification: {
+          ruleGatePassed: resolvedMatchable,
+          mlScore: resolvedMatchable ? 1 : 0,
+          reason:
+            detail?.classificationReason ||
+            `Classified from events.pes.edu tags (${card.tags.join(', ') || resolvedEventType}).`,
+        },
+        reviewStatus: 'approved',
+        warnings: [],
+        lastSeenAt: fetchedAt,
       });
-      return;
+
+      if (staged.duplicateOfHackathonId && !staged.updatesExistingHackathonId) {
+        duplicatesSkippedCount++;
+      }
+
+      // Publish/update verified official events.pes.edu listing in hackathons table
+      await createPublishedHackathonDirect({
+        slug: `pes_event_${card.eventId}`,
+        name: resolvedTitle,
+        organizer: resolvedOrganizer,
+        description: resolvedDescription,
+        eventType: resolvedEventType,
+        matchable: resolvedMatchable,
+        themes: resolvedThemes,
+        campus: resolvedCampus,
+        venueName: resolvedVenueName,
+        format:
+          detail?.format && detail.format !== 'unknown'
+            ? detail.format
+            : resolvedCampus === 'Online / Multi-Campus'
+              ? 'online'
+              : 'onsite',
+        startAt: resolvedStartAt,
+        endAt: resolvedEndAt,
+        registrationDeadline: resolvedDeadline,
+        minTeamSize: detail?.minTeamSize ?? null,
+        maxTeamSize: detail?.maxTeamSize ?? null,
+        registrationUrl: resolvedRegUrl,
+        verifiedCanonicalUrl: canonicalUrl,
+        sourceUrlStatus: 'verified',
+        sourceType: 'pes_public_events',
+        extractedAt: fetchedAt,
+        createdByUid: options?.actorUid || 'system_pes_events_sync',
+      });
+      publishedOrUpdatedCount++;
     }
 
-    if (!oauthSess.scopes.includes('announcements:read')) {
-      res.status(200).json({
-        ok: false,
-        available: false,
-        announcements: [],
-        userMessage:
-          'Your current PESU OAuth2 session was not granted the announcements:read scope.',
-      });
-      return;
-    }
-
-    const { issuerBaseUrl } = resolveAndValidatePesuIssuerUrl(req);
-    const announcementsUrl = `${issuerBaseUrl}/api/v1/announcements`;
-    const fetchFn = getFetch();
-    const upstreamResp = await fetchFn(announcementsUrl, {
-      headers: {
-        Authorization: `Bearer ${oauthSess.accessToken}`,
-        Accept: 'application/json',
-      },
-    });
-
-    if (!upstreamResp.ok) {
-      res.status(200).json({
-        ok: false,
-        available: false,
-        httpStatus: upstreamResp.status,
-        announcements: [],
-        userMessage: `PESU Academy announcements endpoint (${announcementsUrl}) returned HTTP ${upstreamResp.status}.`,
-      });
-      return;
-    }
-
-    const rawBody = await upstreamResp.json().catch(() => null);
-    const list = Array.isArray(rawBody)
-      ? rawBody
-      : Array.isArray((rawBody as Record<string, unknown> | null)?.announcements)
-      ? ((rawBody as Record<string, unknown>).announcements as unknown[])
-      : [];
-
-    res.json({
+    const syncResponse: PesuPublicEventsSyncResponse = {
       ok: true,
-      available: true,
-      announcements: list,
-      userMessage: `Retrieved ${list.length} announcement(s) from PESU-Dev resource server.`,
+      live: true,
+      fetchedAt,
+      sourcePagesChecked: PESU_PUBLIC_SOURCE_URLS,
+      reachablePagesCount,
+      discoveredCount: discoveredCards.length,
+      publishedOrUpdatedCount,
+      stagedForReviewCount,
+      duplicatesSkippedCount,
+      userMessage: `Synced ${publishedOrUpdatedCount} public PESU event(s) from events.pes.edu (${reachablePagesCount}/${PESU_PUBLIC_SOURCE_URLS.length} listing pages reachable).`,
+      warnings,
+    };
+
+    if (useCache) {
+      lastPesuPublicSyncResult = {
+        expiresAt: Date.now() + PESU_PUBLIC_SYNC_COOLDOWN_MS,
+        response: syncResponse,
+      };
+    }
+
+    return syncResponse;
+  })().finally(() => {
+    inFlightPesuPublicSync = null;
+  });
+
+  return inFlightPesuPublicSync;
+}
+
+app.post('/api/events/sync-pesu-public', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const forceRefresh = Boolean(req.body?.forceRefresh);
+    const syncRes = await syncPublicPesuEventsCatalog({
+      forceRefresh,
+      actorUid: authUser?.uid,
+    });
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    res.status(syncRes.ok ? 200 : 502).json({
+      ...syncRes,
+      hackathons: data.hackathons,
     });
   } catch (error) {
-    console.error('Error in GET /api/pesu/announcements:', error);
-    res.status(200).json({
+    console.error('Error in POST /api/events/sync-pesu-public:', error);
+    res.status(500).json({
       ok: false,
-      available: false,
-      announcements: [],
-      userMessage:
-        'PESU Academy announcement retrieval is currently unreachable.',
+      live: true,
+      userMessage: 'Failed to synchronize public PESU events.',
+    });
+  }
+});
+
+app.get('/api/events/pesu-public', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const forceRefresh = req.query.refresh === 'true';
+    const syncRes = await syncPublicPesuEventsCatalog({
+      forceRefresh,
+      actorUid: authUser?.uid,
+    });
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    const pesPublicEvents = data.hackathons.filter(
+      (h) =>
+        h.sourceType === 'pes_public_events' ||
+        h.verifiedCanonicalUrl?.includes('events.pes.edu')
+    );
+    res.status(syncRes.ok ? 200 : 502).json({
+      ...syncRes,
+      events: pesPublicEvents,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/events/pesu-public:', error);
+    res.status(500).json({
+      ok: false,
+      live: true,
+      userMessage: 'Failed to retrieve public PESU events.',
     });
   }
 });
@@ -4561,8 +5638,53 @@ app.post(
         return;
       }
 
+      // Strip personal student identifiers from announcement-derived candidates
+      const isAnnouncementHint = candidate.source === 'academy_opt_in_hint';
+      const sanitizedTitle = isAnnouncementHint
+        ? sanitizeTextForPublicCandidate(candidate.title)
+        : candidate.title.trim();
+      const sanitizedOrganizer = isAnnouncementHint
+        ? sanitizeTextForPublicCandidate(candidate.organizer)
+        : candidate.organizer.trim();
+      const sanitizedDescription = isAnnouncementHint
+        ? sanitizeTextForPublicCandidate(candidate.description || '')
+        : candidate.description || '';
+
+      // If candidate has a public URL that hasn't been verified yet, verify it against public source if reachable
+      let verifiedCanonicalUrl = candidate.verifiedCanonicalUrl ?? null;
+      let sourceUrlStatus = candidate.sourceUrlStatus ?? 'unverified';
+      const publicUrlToCheck =
+        candidate.originalSubmissionUrl ||
+        candidate.sourceUrl ||
+        candidate.registrationUrl ||
+        null;
+
+      if (
+        !verifiedCanonicalUrl &&
+        publicUrlToCheck &&
+        publicUrlToCheck.startsWith('http') &&
+        !publicUrlToCheck.includes('pesuacademy.com')
+      ) {
+        const check = checkSafePublicUrl(publicUrlToCheck);
+        if (check.safe) {
+          const verifyFetch = await safeFetchFollowRedirects(publicUrlToCheck, 3);
+          if (verifyFetch.ok) {
+            verifiedCanonicalUrl = verifyFetch.finalUrl;
+            sourceUrlStatus =
+              verifyFetch.redirectChain.length > 1
+                ? 'redirected_valid'
+                : 'verified';
+          }
+        }
+      }
+
       const savedCandidate = await createEventCandidateRecord({
         ...candidate,
+        title: sanitizedTitle,
+        organizer: sanitizedOrganizer,
+        description: sanitizedDescription,
+        verifiedCanonicalUrl,
+        sourceUrlStatus,
         submittedByUid: authUser.uid,
       });
 
