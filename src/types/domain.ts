@@ -382,7 +382,111 @@ export interface CandidateCard {
     availabilitySim: number;
     collabOrSkillSim: number;
     coldStartRedistributed: boolean;
+    skillComplementarityScore?: number;
+    sharedInterestsScore?: number;
+    pastSwipeAffinityScore?: number;
+    totalScore?: number;
+    evaluatedAgainstTeamId?: string;
+    evaluatedAgainstMemberCount?: number;
+    complementarySkills?: string[];
   };
+}
+
+export type TeamProposalStatus =
+  | 'pending_votes'
+  | 'invited'
+  | 'accepted'
+  | 'rejected'
+  | 'declined'
+  | 'expired';
+
+export interface TeamProposalVote {
+  id: string;
+  proposalId: string;
+  teamId: string;
+  voterUid: string;
+  voterName?: string;
+  decision: 'approve' | 'reject';
+  comment?: string;
+  votedAt: string;
+}
+
+export interface TeamProposal {
+  id: string;
+  hackathonId: string;
+  teamId: string;
+  teamName?: string;
+  candidateUid: string;
+  candidateName?: string;
+  candidateHeadline?: string;
+  candidateSkills?: string[];
+  proposedByUid: string;
+  proposedByName?: string;
+  proposedRole: string;
+  message?: string;
+  status: TeamProposalStatus;
+  resolutionNote?: string;
+  votes: TeamProposalVote[];
+  requiredVoterUids: string[];
+  approvedCount: number;
+  requiredCount: number;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+}
+
+export type TeamRegistrationStatus =
+  | 'forming'
+  | 'ready_to_register'
+  | 'registration_in_progress'
+  | 'registered'
+  | 'registration_closed';
+
+export interface TeamRegistration {
+  teamId: string;
+  hackathonId: string;
+  registrationStatus: TeamRegistrationStatus;
+  officialRegistrationUrl: string | null;
+  externalRegistrationReference?: string | null;
+  confirmationNotes?: string | null;
+  registeredByUid?: string | null;
+  registeredAt?: string | null;
+  minRequiredMembers: number;
+  maxAllowedMembers: number;
+  currentMemberCount: number;
+  isEligibleToRegister: boolean;
+  readinessReason: string;
+  updatedAt: string;
+}
+
+export interface ShortlistEntry {
+  uid: string;
+  displayName: string;
+  campus: CampusType;
+  program?: string;
+  graduationYear?: number;
+  headline: string;
+  skillTags: string[];
+  interestTags: string[];
+  preferredRoles: string[];
+  swipedAt: string;
+  status:
+    | 'awaiting_response'
+    | 'interested_in_you'
+    | 'mutual_match'
+    | 'in_your_team'
+    | 'proposal_pending_votes'
+    | 'proposal_invited';
+  conversationId?: string;
+  teamId?: string;
+  proposalId?: string;
+}
+
+export interface ShortlistPayload {
+  hackathonId: string;
+  interested: ShortlistEntry[];
+  interestedInYou: ShortlistEntry[];
+  mutualMatches: ShortlistEntry[];
 }
 
 export interface InterestCircle {
@@ -419,3 +523,4 @@ export interface AuditLog {
   summary: string;
   createdAt: string;
 }
+

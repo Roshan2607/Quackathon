@@ -274,3 +274,53 @@ export const profilesRelations = relations(profiles, ({ one }) => ({
     references: [users.uid],
   }),
 }));
+
+export const teamProposals = pgTable('team_proposals', {
+  id: serial('id').primaryKey(),
+  proposalUid: text('proposal_uid').notNull().unique(),
+  hackathonSlug: text('hackathon_slug').notNull(),
+  teamSlug: text('team_slug').notNull(),
+  candidateUid: text('candidate_uid').notNull(),
+  proposedByUid: text('proposed_by_uid').notNull(),
+  proposedRole: text('proposed_role').notNull().default('Core Builder'),
+  message: text('message'),
+  status: text('status').notNull().default('pending_votes'), // 'pending_votes' | 'invited' | 'accepted' | 'rejected' | 'declined' | 'expired'
+  resolutionNote: text('resolution_note'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+});
+
+export const teamProposalVotes = pgTable('team_proposal_votes', {
+  id: serial('id').primaryKey(),
+  voteKey: text('vote_key').notNull().unique(), // `${proposalUid}_${voterUid}`
+  proposalUid: text('proposal_uid').notNull(),
+  teamSlug: text('team_slug').notNull(),
+  voterUid: text('voter_uid').notNull(),
+  decision: text('decision').notNull(), // 'approve' | 'reject'
+  comment: text('comment'),
+  votedAt: timestamp('voted_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const teamRegistrations = pgTable('team_registrations', {
+  id: serial('id').primaryKey(),
+  teamSlug: text('team_slug').notNull().unique(),
+  hackathonSlug: text('hackathon_slug').notNull(),
+  registrationStatus: text('registration_status').notNull().default('forming'), // 'forming' | 'ready_to_register' | 'registration_in_progress' | 'registered' | 'registration_closed'
+  officialRegistrationUrl: text('official_registration_url'),
+  externalRegistrationReference: text('external_registration_reference'),
+  confirmationNotes: text('confirmation_notes'),
+  registeredByUid: text('registered_by_uid'),
+  registeredAt: timestamp('registered_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const userBlocks = pgTable('user_blocks', {
+  id: serial('id').primaryKey(),
+  blockKey: text('block_key').notNull().unique(), // `${blockerUid}_${blockedUid}`
+  blockerUid: text('blocker_uid').notNull(),
+  blockedUid: text('blocked_uid').notNull(),
+  reason: text('reason'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
