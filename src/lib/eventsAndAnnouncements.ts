@@ -153,14 +153,26 @@ export function cleanHtmlToText(input: unknown): string {
     .replace(/<\/p>/gi, '\n')
     .replace(/<\/li>/gi, '\n')
     .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&ndash;|&#8211;/gi, '–')
-    .replace(/&mdash;|&#8212;/gi, '—')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
+    .replace(/&nbsp;|&#160;|&#xa0;/gi, ' ')
+    .replace(/&ndash;|&#8211;|&#x2013;/gi, '–')
+    .replace(/&mdash;|&#8212;|&#x2014;/gi, '—')
+    .replace(/&ldquo;|&rdquo;|&quot;|&#34;|&#x22;|&#8220;|&#8221;|&#x201c;|&#x201d;/gi, '"')
+    .replace(/&lsquo;|&rsquo;|&apos;|&#0*39;|&#x0*27;|&#8216;|&#8217;|&#x2018;|&#x2019;/gi, "'")
+    .replace(/&lt;|&#60;|&#x3c;/gi, '<')
+    .replace(/&gt;|&#62;|&#x3e;/gi, '>')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : '';
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const code = parseInt(dec, 10);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : '';
+    })
+    .replace(/&amp;|&#38;|&#x26;/gi, '&')
     .replace(/[ \t]+/g, ' ')
     .replace(/\n\s*\n+/g, '\n')
     .trim();
@@ -520,13 +532,23 @@ export function extractGroundedTeamSize(text: string): {
   excerpt: string | null;
 } {
   const rangeMatch = text.match(
-    /(?:teams?\s+of|team\s+size\s*(?:of|:)?|group\s+of)\s*(\d)\s*(?:to|-|–|—)\s*(\d)\s*(?:members|students|participants|builders|people)?/i
+    /(?:teams?\s+of|team\s+size\s*(?:of|:|-)?|group\s+of)\s*(\d)\s*(?:to|-|–|—)\s*(\d)\s*(?:members|students|participants|builders|people)?/i
   );
   if (rangeMatch) {
     const a = parseInt(rangeMatch[1], 10);
     const b = parseInt(rangeMatch[2], 10);
     if (a >= 1 && b >= a && b <= 10) {
       return { min: a, max: b, excerpt: rangeMatch[0].trim() };
+    }
+  }
+
+  const exactTeamMatch = text.match(
+    /(?:team\s+size\s*(?:of|:|-)?\s*(\d)\s*(?:members|students|participants|per\s+team)?|(\d)\s*members?\s+per\s+team)/i
+  );
+  if (exactTeamMatch) {
+    const n = parseInt(exactTeamMatch[1] || exactTeamMatch[2], 10);
+    if (n >= 1 && n <= 10) {
+      return { min: n, max: n, excerpt: exactTeamMatch[0].trim() };
     }
   }
 
@@ -549,8 +571,17 @@ export function extractGroundedTeamSize(text: string): {
 }
 
 /**
- * Strict Event Classification using tags, title, and description.
- * Never presents workshops, talks, info sessions, or ordinary announcements as hackathons.
+ * Deterministic Event Classification using source tags, title, subtitle, and description.
+ * Zero Gemini calls.
+ *
+ * Supported categories:
+ * - 'hackathon' / 'buildathon' (Hackathon / Buildathon)
+ * - 'ideathon' / 'team_competition' (Ideathon / Competition)
+ * - 'ctf' (CTF)
+ * - 'workshop' (Workshop)
+ * - 'tech_talk' (Talk / Seminar)
+ * - 'conference' (Conference / Summit)
+ * - 'other' / 'unknown' (Other)
  */
 export function classifyGroundedEvent(params: {
   title: string;
@@ -563,66 +594,141 @@ export function classifyGroundedEvent(params: {
   matchable: boolean;
   reason: string;
 } {
-  const tagText = (params.tags ?? []).join(' ').toLowerCase();
-  const titleLower = params.title.toLowerCase();
-  const combined = `${params.title} ${params.description} ${tagText}`.toLowerCase();
-
-  // Explicit Hackathon / Ideathon / Buildathon / CTF signal
-  const hasExplicitHackathonTag = (params.tags ?? []).some((t) =>
-    /^(#?hackathon|#?ideathon|#?buildathon|#?ctf|#?codesprint)$/i.test(t.trim())
+  const cleanTitle = cleanHtmlToText(params.title);
+  const cleanDesc = cleanHtmlToText(params.description);
+  const cleanedTags = (params.tags ?? []).map((t) =>
+    cleanHtmlToText(t).replace(/^#/, '').trim()
   );
-  const hasHackathonTitleOrBody =
-    /\b(hackathon|hack-a-thon|ideathon|buildathon|capture the flag|\bctf\b|24-hour\s+hack|36-hour\s+hack|48-hour\s+hack|code\s+sprint|coding\s+sprint)\b/i.test(
-      combined
+  const tagText = cleanedTags.join(' ').toLowerCase();
+  const titleLower = cleanTitle.toLowerCase();
+  const descLower = cleanDesc.toLowerCase();
+  const combined = `${cleanTitle} ${cleanDesc} ${tagText}`.toLowerCase();
+  const textOnly = `${cleanTitle} ${cleanDesc}`.toLowerCase();
+
+  const soloOnly =
+    params.maxTeamSize === 1 ||
+    /\b(solo\s+only|individual\s+participation\s+only)\b/i.test(textOnly);
+
+  // 1. Cultural / Art / Music / Non-Tech Festival Override (e.g., "Kalavaibhava — A Celebration of Art, Talent, and Expression")
+  const hasCulturalTag = cleanedTags.some((t) =>
+    /^(cultural|art|music|dance|theatre|literary)$/i.test(t)
+  );
+  const isCulturalTitleOrBody =
+    /\b(kalavaibhava|celebration\s+of\s+art|cultural\s+fest|music\s+concert|dance\s+festival|art\s+exhibition|talent\s+and\s+expression)\b/i.test(
+      textOnly
+    );
+  const hasGenuineTechCompetitionInText =
+    /\b(hackathon|hack-a-thon|ideathon|buildathon|capture\s+the\s+flag|\bctf\b|coding\s+marathon|competitive\s+programming|problem[\s-]solving|prototype|software|hardware|algorithm|quantum|robotics|cybercrimes?|cybersecurity|open\s+source\s+software)\b/i.test(
+      textOnly
     );
 
-  // Explicit Talk / InfoSession / Seminar / Workshop signal
-  const hasTalkTag = (params.tags ?? []).some((t) =>
-    /^(#?talks?|#?infosession|#?seminar|#?webinar|#?keynote|#?lecture)$/i.test(
-      t.trim()
-    )
-  );
-  const hasWorkshopTag = (params.tags ?? []).some((t) =>
-    /^(#?workshops?|#?bootcamp|#?handson)$/i.test(t.trim())
-  );
-
-  const isExplicitTalkInTitle =
-    /\b(expert\s+talk|guest\s+lecture|tech\s+talk|info\s*session|webinar|seminar|keynote|panel\s+discussion|orientation)\b/i.test(
-      titleLower
-    );
-  const isExplicitWorkshopInTitle =
-    /\b(workshop|hands-on\s+session|masterclass|bootcamp|training\s+session)\b/i.test(
-      titleLower
-    );
-
-  if (
-    (hasTalkTag || isExplicitTalkInTitle) &&
-    !hasExplicitHackathonTag &&
-    !/\b(hackathon|ideathon|buildathon)\b/i.test(titleLower)
-  ) {
+  if ((hasCulturalTag || isCulturalTitleOrBody) && !hasGenuineTechCompetitionInText) {
     return {
-      eventType: 'tech_talk',
+      eventType: 'other',
       matchable: false,
       reason:
-        'Classified as Tech Talk / Info Session from source tags or title; excluded from team matching.',
+        'Classified as Cultural / Art event from source content; excluded from hackathon discovery.',
     };
   }
 
+  // 2. Conference / Summit / Symposium Override
+  //    e.g., "Technology Law and Intellectual Property Law Summit 2026",
+  //    "31st International Advanced Computing and Communication Conference" (ADCOM 2027),
+  //    "ICDDS 2024", "Emerging Technologies in Computing and Communication (ETCC)"
+  const hasConferenceTag = cleanedTags.some((t) =>
+    /^(conference|summit|symposium|colloquium|conclave)$/i.test(t)
+  );
+  const isConferenceInTitle =
+    /\b(conference|summit|symposium|colloquium|conclave|\bicdds\b|\badcom\b|\betcc\b)\b/i.test(
+      titleLower
+    ) && !/\b(hackathon|ideathon|buildathon|ctf)\b/i.test(titleLower);
+  const isConferenceInBody =
+    /\b(international\s+conference|law\s+summit|annual\s+conference|\badcom\s*\d{4}\b|\bicdds['’]?\d{2,4}\b|\betcc\s*\d{4}\b|call\s+for\s+papers)\b/i.test(
+      textOnly
+    ) &&
+    !/\b(pre-conference\s+hackathon|hackathon|ideathon|buildathon|ctf)\b/i.test(
+      titleLower
+    ) &&
+    !/\b(24-hour\s+hackathon|12-hour\s+hackathon|10-hour\s+hackathon|coding\s+marathon)\b/i.test(
+      descLower
+    );
+
   if (
-    (hasWorkshopTag || isExplicitWorkshopInTitle) &&
-    !hasExplicitHackathonTag &&
+    (hasConferenceTag || isConferenceInTitle || isConferenceInBody) &&
+    !/\b(hackathon|ideathon|buildathon|ctf)\b/i.test(titleLower)
+  ) {
+    return {
+      eventType: 'conference',
+      matchable: false,
+      reason:
+        'Classified as Conference / Summit from source title, tags, or description; excluded from team hackathon matching.',
+    };
+  }
+
+  // 3. Explicit Workshop / Bootcamp / FDP Override
+  const hasWorkshopTag = cleanedTags.some((t) =>
+    /^(workshops?|bootcamp|handson|fdp)$/i.test(t)
+  );
+  const isExplicitWorkshopInTitle =
+    /\b(workshop|hands-on\s+session|masterclass|bootcamp|training\s+session|faculty\s+development\s+program|\bfdp\b)\b/i.test(
+      titleLower
+    );
+  const isWorkshopOnlyInBody =
+    /\b(technical\s+workshop|design\s+thinking\s+workshop|machine\s+learning\s+workshop|workshop\s+event|faculty\s+development\s+program)\b/i.test(
+      textOnly
+    ) &&
+    !/\b(hackathon|hack-a-thon|ideathon|buildathon|6\s+hour\s+ctf\s+challenge|24-hour|10-hour|12-hour)\b/i.test(
+      textOnly
+    );
+
+  if (
+    (isExplicitWorkshopInTitle || isWorkshopOnlyInBody) &&
     !/\b(hackathon|ideathon|buildathon)\b/i.test(titleLower)
   ) {
     return {
       eventType: 'workshop',
       matchable: false,
       reason:
-        'Classified as Workshop / Bootcamp from source tags or title; excluded from team matching.',
+        'Classified as Workshop / FDP from source title or description; excluded from team hackathon matching.',
     };
   }
 
-  if (/\b(capture the flag|\bctf\b)\b/i.test(combined)) {
-    const soloOnly = params.maxTeamSize === 1;
+  // 4. Explicit Talk / Lecture / Seminar / Webinar / Research Session Override
+  const hasTalkTag = cleanedTags.some((t) =>
+    /^(talks?|infosession|interactive\s+session|seminar|webinar|keynote|lecture)$/i.test(
+      t
+    )
+  );
+  const isExplicitTalkInTitleOrBody =
+    /\b(expert\s+talk|expert\s+lecture|guest\s+lecture|technical\s+talk|tech\s+talk|info\s*session|webinar|seminar|keynote|panel\s+discussion|orientation|awareness\s+program|research\s+paper\s+writing|guide\s+to\s+research|podcast-style\s+conversations|an\s+industry\s+perspective|introduction\s+to\s+aws|interactive\s+research-focused\s+session|academic\s+and\s+technical\s+session)\b/i.test(
+      textOnly
+    );
+
+  if (
+    isExplicitTalkInTitleOrBody &&
+    !/\b(hackathon|ideathon|buildathon|ctf|capture\s+the\s+flag)\b/i.test(
+      titleLower
+    ) &&
+    !/\b(24-hour\s+hackathon|12-hour\s+hackathon|10-hour\s+hackathon)\b/i.test(
+      descLower
+    )
+  ) {
+    return {
+      eventType: 'tech_talk',
+      matchable: false,
+      reason:
+        'Classified as Talk / Seminar / Session from source title or description; excluded from team hackathon matching.',
+    };
+  }
+
+  // 5. CTF (Capture The Flag) Competitions
+  if (
+    /\b(capture\s+the\s+flag|\bctf\b)\b/i.test(textOnly) &&
+    !/\bworkshop\s+event\s+ctf\b/i.test(textOnly) &&
+    (!/\bhackathon\b/i.test(titleLower) ||
+      /\b(capture\s+the\s+flag|\bctf\b)\b/i.test(titleLower) ||
+      /\bcapture\s+the\s+flag\s*\(ctf\)\s*hackathon\b/i.test(textOnly))
+  ) {
     return {
       eventType: 'ctf',
       matchable: !soloOnly,
@@ -632,63 +738,197 @@ export function classifyGroundedEvent(params: {
     };
   }
 
-  if (/\bideathon\b/i.test(combined)) {
+  // 6. Ideathons
+  if (
+    /\b(ideathon|innovation\s+challenge)\b/i.test(textOnly) ||
+    (/\benvision\s+a\s+sustainable\s+future\s+by\s+developing\s+innovative\b/i.test(
+      textOnly
+    ) &&
+      /\bgreenglitch\b/i.test(titleLower))
+  ) {
     return {
       eventType: 'ideathon',
-      matchable: params.maxTeamSize !== 1,
-      reason: 'Verified Ideathon competition.',
+      matchable: !soloOnly,
+      reason: 'Verified Ideathon / Innovation competition.',
     };
   }
 
-  if (/\bbuildathon\b/i.test(combined)) {
+  // 7. Buildathons
+  if (/\bbuildathon\b/i.test(textOnly)) {
     return {
       eventType: 'buildathon',
-      matchable: params.maxTeamSize !== 1,
+      matchable: !soloOnly,
       reason: 'Verified Buildathon competition.',
     };
   }
 
-  if (hasExplicitHackathonTag || hasHackathonTitleOrBody) {
+  // 8. Team Coding / Open-Source / Technical Competitions
+  if (
+    /\b(competitive\s+programming|coding\s+marathon|coding\s+competition|programming\s+contest|team\s+competition|contribution\s+spree|algomania|mach\s*zero|codecrypt)\b/i.test(
+      textOnly
+    ) &&
+    !/\b(hackathon|hack-a-thon)\b/i.test(titleLower)
+  ) {
+    return {
+      eventType: 'team_competition',
+      matchable: !soloOnly,
+      reason: 'Verified team coding / technical competition.',
+    };
+  }
+
+  // 9. Hackathons (requires explicit hackathon evidence in title or description, not just a bare tag on a non-tech stub)
+  const hasExplicitHackathonTag = cleanedTags.some((t) =>
+    /^(hackathon|ideathon|buildathon|ctf|codesprint)$/i.test(t)
+  );
+  const hasHackathonEvidenceInText =
+    /\b(hackathon|hack-a-thon|24[\s-]*h(?:ou)?rs?\s+hack|10[\s-]*h(?:ou)?rs?\s+hack|12[\s-]*h(?:ou)?rs?\s+hack|18[\s-]*h(?:ou)?rs?\s+hack|36[\s-]*h(?:ou)?rs?\s+hack|48[\s-]*h(?:ou)?rs?\s+hack|game\s+jam|code\s+sprint|coding\s+sprint|kodikon|terrathon|agentathon|finathon|aerothon|dabbathon|horcrux|hashcode|robofest|rero|codecraze|martechhack|cidecode|hackops|hackeee|heal-a-thon|heal-o-code|intentia|embedx|silicon\s+rush|swasthya\s+avishkar|deltatime|genesys)\b/i.test(
+      textOnly
+    );
+
+  if (hasHackathonEvidenceInText) {
     return {
       eventType: 'hackathon',
-      matchable: params.maxTeamSize !== 1,
-      reason: 'Verified Hackathon with explicit source indicators.',
+      matchable: !soloOnly,
+      reason: 'Verified Hackathon with explicit source evidence.',
+    };
+  }
+
+  // If tagged #Hackathon on events.pes.edu AND has substantive competition/team/problem-solving text
+  if (
+    hasExplicitHackathonTag &&
+    /\b(teams?|prize|compete|competition|challenge|build|prototype|coding|developers?|problem[\s-]solving)\b/i.test(
+      textOnly
+    )
+  ) {
+    return {
+      eventType: 'hackathon',
+      matchable: !soloOnly,
+      reason: 'Verified Hackathon from source tag and competition details.',
+    };
+  }
+
+  if (hasWorkshopTag || /\b(workshop|hands-on|bootcamp)\b/i.test(combined)) {
+    return {
+      eventType: 'workshop',
+      matchable: false,
+      reason: 'Workshop session without team hackathon competition.',
     };
   }
 
   if (
-    /\b(coding\s+competition|programming\s+contest|team\s+competition|design\s+challenge|case\s+challenge)\b/i.test(
-      combined
-    )
+    hasTalkTag ||
+    /\b(talk|lecture|seminar|webinar|keynote|session)\b/i.test(combined)
   ) {
-    return {
-      eventType: 'team_competition',
-      matchable: params.maxTeamSize !== 1,
-      reason: 'Team technical competition.',
-    };
-  }
-
-  if (/\b(workshop|hands-on|bootcamp)\b/i.test(combined)) {
-    return {
-      eventType: 'workshop',
-      matchable: false,
-      reason: 'Speaker or hands-on workshop without hackathon competition.',
-    };
-  }
-
-  if (/\b(talk|lecture|seminar|webinar|keynote|conference)\b/i.test(combined)) {
     return {
       eventType: 'tech_talk',
       matchable: false,
-      reason: 'Talk, lecture, or conference session.',
+      reason: 'Talk, lecture, or academic session.',
     };
   }
 
   return {
-    eventType: 'unknown',
+    eventType: 'other',
     matchable: false,
-    reason: 'No explicit hackathon, ideathon, buildathon, or CTF keywords found.',
+    reason:
+      'Insufficient evidence of an eligible team hackathon, ideathon, CTF, or coding competition.',
   };
+}
+
+/**
+ * Determines whether a record is eligible for the student-facing Hackathons discovery catalog.
+ *
+ * Eligible:
+ * - Hackathons and buildathons ('hackathon', 'buildathon')
+ * - Ideathons with team participation ('ideathon')
+ * - CTF competitions that allow teams ('ctf')
+ * - Coding or technical competitions requiring or permitting teams ('team_competition')
+ *
+ * Excluded:
+ * - Tech talks and guest lectures ('tech_talk')
+ * - Workshops ('workshop')
+ * - Seminars and webinars
+ * - Conferences and summits ('conference')
+ * - Cultural events ('other')
+ * - Individual-only competitions (maxTeamSize === 1)
+ * - Archived or synthetic test records
+ */
+export function isEligibleTeamHackathonCatalogEvent(event: {
+  id?: string | null;
+  slug?: string | null;
+  name?: string | null;
+  title?: string | null;
+  description?: string | null;
+  eventType?: EventType | string | null;
+  matchable?: boolean | null;
+  themes?: string[] | null;
+  minTeamSize?: number | null;
+  maxTeamSize?: number | null;
+  status?: string | null;
+}): boolean {
+  if (event.status === 'archived' || event.status === 'draft') {
+    return false;
+  }
+  if (event.maxTeamSize === 1) {
+    return false;
+  }
+
+  const title = cleanHtmlToText(event.name || event.title || '');
+  const description = cleanHtmlToText(event.description || '');
+  if (!title) return false;
+
+  const reevaluated = classifyGroundedEvent({
+    title,
+    description,
+    tags: event.themes ?? [],
+    minTeamSize: event.minTeamSize,
+    maxTeamSize: event.maxTeamSize,
+  });
+
+  const eligibleTypes = new Set<string>([
+    'hackathon',
+    'buildathon',
+    'ideathon',
+    'ctf',
+    'team_competition',
+  ]);
+
+  if (!reevaluated.matchable || !eligibleTypes.has(reevaluated.eventType)) {
+    return false;
+  }
+
+  if (
+    event.eventType &&
+    !eligibleTypes.has(String(event.eventType)) &&
+    event.matchable === false
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Human-readable category label for supported EventTypes.
+ */
+export function formatEventTypeCategoryLabel(eventType: EventType | string): string {
+  switch (eventType) {
+    case 'hackathon':
+    case 'buildathon':
+      return 'Hackathon / Buildathon';
+    case 'ideathon':
+    case 'team_competition':
+      return 'Ideathon / Competition';
+    case 'ctf':
+      return 'CTF';
+    case 'workshop':
+      return 'Workshop';
+    case 'tech_talk':
+      return 'Talk / Seminar';
+    case 'conference':
+      return 'Conference / Summit';
+    default:
+      return 'Other';
+  }
 }
 
 /**
@@ -805,7 +1045,10 @@ export function detectTechnicalEventFromAnnouncement(
   const urlMatches = combined.match(/https?:\/\/[^\s)>\]"']+/gi) ?? [];
   for (const rawUrl of urlMatches) {
     const cleanedUrl = rawUrl.replace(/[.,;!?]+$/, '');
-    if (!cleanedUrl.toLowerCase().includes('pesuacademy.com')) {
+    if (
+      !cleanedUrl.toLowerCase().includes('pesuacademy.com') &&
+      !cleanedUrl.toLowerCase().includes('me-qr.com/page/blog')
+    ) {
       registrationUrl = cleanedUrl;
       break;
     }
@@ -848,7 +1091,7 @@ export function detectTechnicalEventFromAnnouncement(
   const confidence: 'high' | 'medium' | 'low' =
     cls.matchable && (startAt || registrationUrl)
       ? 'high'
-      : cls.eventType !== 'unknown'
+      : cls.eventType !== 'unknown' && cls.eventType !== 'other'
         ? 'medium'
         : 'low';
 
@@ -968,6 +1211,39 @@ export function buildSanitizedCandidateDraftFromAnnouncement(params: {
 }
 
 /**
+ * Enriches an event title with its official subtitle when the subtitle carries a distinct
+ * hackathon/conference identity (e.g., "Robofest 5.0" + "IEEE RAS - ReRo Online Hackathon"
+ * -> "Robofest 5.0 (ReRo Online Hackathon)").
+ */
+function combineEventTitleAndSubtitle(
+  rawTitle: string,
+  rawSubtitle: string | null | undefined
+): string {
+  const title = cleanHtmlToText(rawTitle);
+  const subtitle = cleanHtmlToText(rawSubtitle ?? '');
+  if (!title) return subtitle;
+  if (!subtitle) return title;
+
+  const titleLower = title.toLowerCase();
+  const subLower = subtitle.toLowerCase();
+  if (titleLower.includes(subLower)) return title;
+
+  if (/\brero\s+online\s+hackathon\b/i.test(subtitle) && !/rero/i.test(title)) {
+    return `${title} (ReRo Online Hackathon)`;
+  }
+
+  if (
+    titleLower === 'hackathon' &&
+    subtitle.length >= 3 &&
+    subtitle.length <= 50
+  ) {
+    return `${title} — ${subtitle}`;
+  }
+
+  return title;
+}
+
+/**
  * Parses `https://events.pes.edu/browse/...` HTML listing pages into structured public event cards.
  */
 export function parsePesuEventsHtmlListing(
@@ -980,7 +1256,6 @@ export function parsePesuEventsHtmlListing(
   const seenIds = new Set<string>();
 
   // Match each `<div class="ticket ..." data-href="/11629/"> ... </div>` card block
-  // without splitting on nested `<div class="ticket-status">` or `<div class="ticket-tags">`
   const segments = html.split(/<div\b(?=[^>]*\bdata-href="\/?\d+\/?")/i);
   for (let i = 1; i < segments.length; i++) {
     const seg = segments[i];
@@ -994,8 +1269,8 @@ export function parsePesuEventsHtmlListing(
     const detailUrl = `${baseOrigin.replace(/\/$/, '')}/${eventId}/`;
 
     const titleMatch = seg.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
-    const title = titleMatch ? cleanHtmlToText(titleMatch[1]) : '';
-    if (!title) continue;
+    const baseTitle = titleMatch ? cleanHtmlToText(titleMatch[1]) : '';
+    if (!baseTitle) continue;
 
     // Extract status pill (Upcoming, Live now, Attended/Past)
     let statusLabel: 'Upcoming' | 'Live now' | 'Past' | 'Unknown' = 'Unknown';
@@ -1005,36 +1280,32 @@ export function parsePesuEventsHtmlListing(
       statusLabel = 'Live now';
     } else if (
       /\bstatus-past\b/i.test(seg) ||
+      /\bis-past\b/i.test(seg) ||
       />\s*(?:Attended|Ended|Past|Completed)\s*</i.test(seg)
     ) {
       statusLabel = 'Past';
     }
 
-    // Extract tags inside `.ticket-tags` or `.tag-pill` or `#Tag` spans
+    // Extract tags ONLY inside `.tags-inline`, `.ticket-tags`, or `.bt-tags` inside this card
     const tags: string[] = [];
     const tagsBlockMatch = seg.match(
-      /<div\s+class="[^"]*(?:ticket-tags|bt-tags|tags)[^"]*"[^>]*>([\s\S]*?)<\/div>/i
+      /<div\s+class="[^"]*(?:tags-inline|ticket-tags|bt-tags)[^"]*"[^>]*>([\s\S]*?)<\/div>/i
     );
     if (tagsBlockMatch) {
       const spanMatches =
         tagsBlockMatch[1].match(/<span[^>]*>([\s\S]*?)<\/span>/gi) ?? [];
       for (const sm of spanMatches) {
-        const t = cleanHtmlToText(sm);
+        const t = cleanHtmlToText(sm).replace(/^#/, '').trim();
         if (t && !tags.includes(t)) tags.push(t);
       }
     }
-    // Also collect any `#Tag` pills in the card
-    const hashTagMatches = seg.match(/>(#[A-Za-z0-9_-]+)</g) ?? [];
-    for (const hm of hashTagMatches) {
-      const cleanTag = hm.slice(1, -1).trim();
-      if (cleanTag && !tags.includes(cleanTag)) tags.push(cleanTag);
-    }
 
-    // Summary paragraph
+    // Summary paragraph inside `.ticket-body`
     const pMatch = seg.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
     const summary = pMatch ? cleanHtmlToText(pMatch[1]) : '';
+    const title = combineEventTitleAndSubtitle(baseTitle, summary);
 
-    // Extract date and facts from `.ticket-facts` or bold spans
+    // Extract date from `.ticket-facts`
     let dateText: string | null = null;
     const factsMatch = seg.match(
       /<div\s+class="[^"]*ticket-facts[^"]*"[^>]*>([\s\S]*?)<\/div>/i
@@ -1080,6 +1351,10 @@ export function parsePesuEventsHtmlListing(
 /**
  * Parses an individual `https://events.pes.edu/<id>/` event detail page into structured,
  * verifiable event metadata.
+ *
+ * CRITICAL: Scopes tag extraction to `<div class="sidebar-tags">` inside `.page-event-detail`
+ * so global navbar `#tagsMegaPanel` links (`#Clubs & Activities`, `#Talks`, `#Workshop`, `#Management`)
+ * never pollute event tags or classification!
  */
 export function parsePesuEventDetailHtml(
   html: string,
@@ -1091,10 +1366,22 @@ export function parsePesuEventDetailHtml(
     ? `https://events.pes.edu/${eventId}/`
     : pageUrl;
 
+  // Scope parsing to `.page-event-detail` when present so header/footer mega-menus are ignored
+  const detailStartIdx = html.indexOf('class="page-event-detail"');
+  const scopedHtml =
+    detailStartIdx !== -1 ? html.slice(detailStartIdx) : html;
+
+  // Extract hero subtitle `<p class="sub">...</p>` from `<section class="event-hero">`
+  const heroSubMatch = scopedHtml.match(
+    /<p[^>]*class="[^"]*\bsub\b[^"]*"[^>]*>([\s\S]*?)<\/p>/i
+  );
+  const heroSubtitle = heroSubMatch ? cleanHtmlToText(heroSubMatch[1]) : null;
+
   // Title: prefer `.bt-title`, `<h1>`, or `og:title`
   const h1Match =
-    html.match(/<h1[^>]*class="[^"]*bt-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i) ||
-    html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+    scopedHtml.match(
+      /<h1[^>]*class="[^"]*bt-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i
+    ) || scopedHtml.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
   const ogTitleMatch =
     html.match(
       /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
@@ -1109,53 +1396,84 @@ export function parsePesuEventDetailHtml(
       ? cleanHtmlToText(ogTitleMatch[1])
       : null;
   if (rawTitle) {
-    rawTitle = rawTitle.replace(/\s*\|\s*PES\s*Events.*$/i, '').trim();
+    rawTitle = rawTitle
+      .replace(/\s*(?:\||—|-)\s*events\.pes\.edu.*$/i, '')
+      .replace(/\s*\|\s*PES\s*Events.*$/i, '')
+      .trim();
+    rawTitle = combineEventTitleAndSubtitle(rawTitle, heroSubtitle);
   }
 
-  // Extract structured `.bt-fact-label` -> `.bt-fact-value` pairs
+  // Extract structured `.bt-fact-label` -> `.bt-fact-value` pairs (both `<span>` and `<div>` markup)
   const facts: Record<string, string> = {};
   const factBlockRegex =
-    /<div[^>]*class="[^"]*bt-fact-label[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<div[^>]*class="[^"]*bt-fact-value[^"]*"[^>]*>([\s\S]*?)<\/div>/gi;
+    /<(?:span|div)[^>]*class="[^"]*bt-fact-label[^"]*"[^>]*>([\s\S]*?)<\/(?:span|div)>\s*<(?:span|div)[^>]*class="[^"]*bt-fact-value[^"]*"[^>]*>([\s\S]*?)<\/(?:span|div)>/gi;
   let factMatch: RegExpExecArray | null;
-  while ((factMatch = factBlockRegex.exec(html)) !== null) {
+  while ((factMatch = factBlockRegex.exec(scopedHtml)) !== null) {
     const label = cleanHtmlToText(factMatch[1]).toLowerCase();
-    const val = cleanHtmlToText(factMatch[2]);
+    const val = cleanHtmlToText(factMatch[2]).replace(/,\s*$/, '').trim();
     if (label && val) {
       facts[label] = val;
     }
   }
 
-  // Extract Campus from `.bt-campus-name`
-  const campusBlockMatch = html.match(
+  // Also extract `.sidebar-fact-label` -> `.chip-opt-dark` pairs from the sidebar
+  const sidebarFactRegex =
+    /<span[^>]*class="[^"]*sidebar-fact-label[^"]*"[^>]*>([\s\S]*?)<\/span>\s*<span[^>]*class="[^"]*chip-opt-dark[^"]*"[^>]*>([\s\S]*?)<\/span>/gi;
+  let sfm: RegExpExecArray | null;
+  while ((sfm = sidebarFactRegex.exec(scopedHtml)) !== null) {
+    const label = cleanHtmlToText(sfm[1]).toLowerCase();
+    const val = cleanHtmlToText(sfm[2]).trim();
+    if (label && val && !facts[label]) {
+      facts[label] = val;
+    }
+  }
+
+  // Extract Campus from `.bt-campus-name` or `facts['campus']`
+  const campusBlockMatch = scopedHtml.match(
     /<[^>]*class="[^"]*bt-campus-name[^"]*"[^>]*>([\s\S]*?)<\/[^>]+>/i
   );
-  const campusText = campusBlockMatch ? cleanHtmlToText(campusBlockMatch[1]) : '';
+  const campusText = campusBlockMatch
+    ? cleanHtmlToText(campusBlockMatch[1])
+    : facts['campus'] || '';
 
-  // Extract Tags
+  // Extract Tags STRICTLY from `<div class="sidebar-tags">` or `.bt-tag` / `.ticket-tag` inside the event detail
   const tags: string[] = [];
+  const sidebarTagsMatch = scopedHtml.match(
+    /<div[^>]*class="[^"]*sidebar-tags[^"]*"[^>]*>([\s\S]*?)<\/div>/i
+  );
+  if (sidebarTagsMatch) {
+    const anchorMatches =
+      sidebarTagsMatch[1].match(/<a[^>]*>([\s\S]*?)<\/a>/gi) ?? [];
+    for (const am of anchorMatches) {
+      const t = cleanHtmlToText(am).replace(/^#/, '').trim();
+      if (t && !tags.includes(t)) tags.push(t);
+    }
+  }
   const tagPillRegex =
-    /<(?:span|a)[^>]*class="[^"]*(?:bt-tag|ticket-tag|tag)[^"]*"[^>]*>([\s\S]*?)<\/(?:span|a)>/gi;
+    /<(?:span|a)[^>]*class="[^"]*(?:bt-tag|ticket-tag)[^"]*"[^>]*>([\s\S]*?)<\/(?:span|a)>/gi;
   let tm: RegExpExecArray | null;
-  while ((tm = tagPillRegex.exec(html)) !== null) {
-    const t = cleanHtmlToText(tm[1]);
+  while ((tm = tagPillRegex.exec(scopedHtml)) !== null) {
+    const t = cleanHtmlToText(tm[1]).replace(/^#/, '').trim();
     if (t && !tags.includes(t)) tags.push(t);
   }
-  const hashMatches = html.match(/>(#[A-Za-z0-9_-]+)</g) ?? [];
-  for (const hm of hashMatches) {
-    const cleanTag = hm.slice(1, -1).trim();
-    if (cleanTag && !tags.includes(cleanTag)) tags.push(cleanTag);
-  }
 
-  // Extract Status
+  // Extract Status from `.status-pill` in hero
   let statusLabel: 'Upcoming' | 'Live now' | 'Past' | 'Unknown' = 'Unknown';
-  if (/>\s*Upcoming\s*</i.test(html)) statusLabel = 'Upcoming';
-  else if (/>\s*Live\s+now\s*</i.test(html)) statusLabel = 'Live now';
-  else if (/>\s*(?:Attended|Ended|Past)\s*</i.test(html)) statusLabel = 'Past';
+  const statusPillMatch = scopedHtml.match(
+    /<span[^>]*class="[^"]*status-pill[^"]*"[^>]*>([\s\S]*?)<\/span>/i
+  );
+  const statusPillText = statusPillMatch
+    ? cleanHtmlToText(statusPillMatch[1])
+    : '';
+  if (/upcoming/i.test(statusPillText)) statusLabel = 'Upcoming';
+  else if (/live\s+now/i.test(statusPillText)) statusLabel = 'Live now';
+  else if (/attended|ended|past|closed/i.test(statusPillText))
+    statusLabel = 'Past';
 
-  // Extract main event body description from `#eventBody` or `.rich-text`
-  const bodyMatch =
-    html.match(/<div[^>]*id="eventBody"[^>]*>([\s\S]*?)<\/div>/i) ||
-    html.match(/<div[^>]*class="[^"]*rich-text[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+  // Extract main event body description from `.rich-text` inside `#eventBody`
+  const richTextMatch = scopedHtml.match(
+    /<div[^>]*class="[^"]*rich-text[^"]*"[^>]*>([\s\S]*?)<\/div>/i
+  );
   const ogDescMatch =
     html.match(
       /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i
@@ -1164,11 +1482,24 @@ export function parsePesuEventDetailHtml(
       /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i
     );
 
-  const description = bodyMatch
-    ? cleanHtmlToText(bodyMatch[1]).slice(0, 1200)
+  const richBodyText = richTextMatch
+    ? cleanHtmlToText(richTextMatch[1])
     : ogDescMatch
-      ? cleanHtmlToText(ogDescMatch[1]).slice(0, 600)
-      : null;
+      ? cleanHtmlToText(ogDescMatch[1])
+      : '';
+
+  let description: string | null = null;
+  if (heroSubtitle && richBodyText) {
+    if (richBodyText.toLowerCase().includes(heroSubtitle.toLowerCase())) {
+      description = richBodyText.slice(0, 1200);
+    } else {
+      description = `${heroSubtitle}\n\n${richBodyText}`.slice(0, 1200);
+    }
+  } else if (richBodyText) {
+    description = richBodyText.slice(0, 1200);
+  } else if (heroSubtitle) {
+    description = heroSubtitle.slice(0, 600);
+  }
 
   // Date range from `facts['date']` or page text
   const dateSource = facts['date'] || facts['event date'] || '';
@@ -1176,7 +1507,10 @@ export function parsePesuEventDetailHtml(
     dateSource || `${rawTitle ?? ''} ${description ?? ''}`
   );
 
-  const venueName = facts['venue'] || facts['location'] || null;
+  const rawVenue = facts['venue'] || facts['location'] || null;
+  const venueName =
+    rawVenue && !/^tba$/i.test(rawVenue.trim()) ? rawVenue.trim() : null;
+
   const organizer =
     facts['hosted by'] ||
     facts['organized by'] ||
@@ -1184,30 +1518,51 @@ export function parsePesuEventDetailHtml(
     facts['department'] ||
     null;
 
+  const isOnlineVenue =
+    (venueName && /\bonline\s+event\b/i.test(venueName)) ||
+    /\b24\/7\s+remote\s+robotics|\bonline\s+robotics\s+hackathon|\bonline\s+hackathon\b/i.test(
+      `${rawTitle ?? ''} ${description ?? ''}`
+    );
+
   const campus =
     extractGroundedCampus(
       `${campusText} ${venueName ?? ''} ${organizer ?? ''} ${description ?? ''}`
-    ) ?? null;
+    ) ?? (isOnlineVenue ? 'Online / Multi-Campus' : null);
 
-  // Extract external registration link if present
+  // Extract external registration link from `#eventBody` / `.sidebar-actions` / `.rich-text`
+  // Ignore bogus QR-code blog links (`me-qr.com/page/blog/*`) and calendar `.ics` links
   let registrationUrl: string | null = null;
-  const anchorRegex = /<a[^>]+href=["'](https?:\/\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const eventBodyIdx = scopedHtml.indexOf('id="eventBody"');
+  const linkSearchHtml =
+    eventBodyIdx !== -1 ? scopedHtml.slice(eventBodyIdx) : scopedHtml;
+  const anchorRegex =
+    /<a[^>]+href=["'](https?:\/\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let am: RegExpExecArray | null;
-  while ((am = anchorRegex.exec(html)) !== null) {
-    const href = am[1].trim();
+  while ((am = anchorRegex.exec(linkSearchHtml)) !== null) {
+    const href = am[1].replace(/&amp;/gi, '&').trim();
+    const hrefLower = href.toLowerCase();
     const anchorText = cleanHtmlToText(am[2]).toLowerCase();
     if (
-      /\b(register|sign\s*up|apply|join|unstop|devfolio|forms\.gle|docs\.google\.com\/forms)\b/i.test(
+      hrefLower.includes('events.pes.edu/browse') ||
+      hrefLower.includes('events.pes.edu/events/') ||
+      hrefLower.endsWith('.ics') ||
+      hrefLower.includes('me-qr.com/page/blog') ||
+      hrefLower.includes('whatsapp.com/send') ||
+      hrefLower.includes('twitter.com/intent') ||
+      hrefLower.includes('linkedin.com/share') ||
+      hrefLower.includes('facebook.com/sharer') ||
+      hrefLower.includes('pes.edu/') && !hrefLower.includes('events.pes.edu')
+    ) {
+      continue;
+    }
+    if (
+      /\b(register|registration|sign\s*up|apply|join|unstop|devfolio|forms\.gle|docs\.google\.com\/forms|vercel\.app|netlify\.app|cidecode\.in|thegreatindianhackathon\.com)\b/i.test(
         `${anchorText} ${href}`
-      ) &&
-      !href.includes('events.pes.edu/browse')
+      )
     ) {
       registrationUrl = href;
       break;
     }
-  }
-  if (!registrationUrl) {
-    registrationUrl = canonicalUrl;
   }
 
   // Extract registration deadline if mentioned in description
@@ -1238,14 +1593,14 @@ export function parsePesuEventDetailHtml(
     const cleaned = t.replace(/^#/, '').trim();
     if (
       cleaned &&
-      !/^(hackathon|technical|upcoming|live|past)$/i.test(cleaned) &&
+      !/^(upcoming|live|past)$/i.test(cleaned) &&
       themes.length < 4
     ) {
       themes.push(cleaned);
     }
   }
   if (themes.length === 0) {
-    themes.push(cls.eventType === 'hackathon' ? 'Hackathon' : 'Technical Event');
+    themes.push(formatEventTypeCategoryLabel(cls.eventType));
   }
 
   const evidenceParts = [
@@ -1270,8 +1625,9 @@ export function parsePesuEventDetailHtml(
     registrationDeadline,
     campus,
     venueName,
-    format:
-      campus === 'Online / Multi-Campus'
+    format: isOnlineVenue
+      ? 'online'
+      : campus === 'Online / Multi-Campus'
         ? 'online'
         : venueName || campus
           ? 'onsite'
@@ -1289,17 +1645,30 @@ export function parsePesuEventDetailHtml(
 
 /**
  * Normalizes a URL for duplicate comparison (strips protocol differences, www., query hash, trailing slash).
+ * Returns null for generic/bogus links (`me-qr.com/page/blog/*`, `attachment://`, `pesu-academy://`).
  */
 export function normalizeUrlForComparison(url: string | null | undefined): string | null {
   if (!url || typeof url !== 'string') return null;
   const trimmed = url.trim();
-  if (!trimmed || trimmed.startsWith('attachment://') || trimmed.startsWith('pesu-academy://')) {
+  if (
+    !trimmed ||
+    trimmed.startsWith('attachment://') ||
+    trimmed.startsWith('pesu-academy://') ||
+    trimmed.toLowerCase().includes('me-qr.com/page/blog')
+  ) {
     return null;
   }
   try {
     const u = new URL(trimmed);
     const host = u.hostname.toLowerCase().replace(/^www\./, '');
     const path = u.pathname.replace(/\/+$/, '') || '/';
+    // Preserve query string for Google Forms / CMT links where path is generic
+    if (
+      host.includes('docs.google.com') ||
+      host.includes('cmt3.research.microsoft.com')
+    ) {
+      return `${host}${path}${u.search}`.toLowerCase();
+    }
     return `${host}${path}`.toLowerCase();
   } catch {
     return trimmed.toLowerCase().replace(/^https?:\/\/(www\.)?/, '').replace(/\/+$/, '');
@@ -1326,7 +1695,7 @@ export function normalizeEventTitleTokens(title: string | null | undefined): str
     'department',
     'club',
   ]);
-  return title
+  return cleanHtmlToText(title)
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
@@ -1334,13 +1703,72 @@ export function normalizeEventTitleTokens(title: string | null | undefined): str
 }
 
 /**
+ * Extracts explicit version/edition numbers from a title (e.g., "5.0", "6.0", "2025", "2026", "1000", "2000")
+ * so distinct editions like "Kodikon 5.0" vs "KODIKON 6.0" or "Nimbus 1000" vs "Nimbus 2000"
+ * or "Agentathon 2025" vs "Agentathon 2026" are NEVER falsely merged.
+ */
+function extractEditionMarkers(title: string | null | undefined): string[] {
+  if (!title) return [];
+  const clean = cleanHtmlToText(title).toLowerCase();
+  const markers: string[] = [];
+  const versionMatches = clean.match(/\b(?:v?\d+\.\d+|\d{4}|(?:1000|2000)|['’]\d{2})\b/g) ?? [];
+  for (const m of versionMatches) {
+    markers.push(m.replace(/^['’]/, '20').replace(/^v/, ''));
+  }
+  return markers;
+}
+
+/**
+ * Extracts canonical conference / hackathon aliases from title + description
+ * (e.g. "adcom 2027" / "31st international ... advanced computing and communication",
+ *  "rero online hackathon" / "robofest 5.0").
+ */
+function extractCanonicalEventAliases(record: {
+  title?: string | null;
+  name?: string | null;
+  description?: string | null;
+}): string[] {
+  const combined = cleanHtmlToText(
+    `${record.title || record.name || ''} ${record.description || ''}`
+  ).toLowerCase();
+  const aliases: string[] = [];
+
+  if (
+    /\badcom\s*2027\b/i.test(combined) ||
+    /\b31st\s+international\s+(?:conference\s+on\s+)?advanced\s+computing\s+and\s+communications?\b/i.test(
+      combined
+    )
+  ) {
+    aliases.push('alias:adcom_2027');
+  }
+
+  if (
+    /\brobofest\s*5\.0\b/i.test(combined) &&
+    /\brero\b/i.test(combined)
+  ) {
+    aliases.push('alias:robofest_5_rero_2025');
+  }
+
+  return aliases;
+}
+
+/**
  * Checks whether two event records (across PESU Academy announcements, `events.pes.edu`,
  * and student submissions) represent the SAME real-world event.
+ *
+ * Uses:
+ * 1. Verified canonical URL or official event ID.
+ * 2. Distinct registration URL (when non-generic and not just a fallback copy of canonicalUrl).
+ * 3. Canonical conference/hackathon aliases + matching date range (e.g. ADCOM 2027 across 11537 & 11523).
+ * 4. Normalized event title tokens + edition guard + date range compatibility.
  */
 export function areEventsSameRealWorldEvent(
   a: {
     title?: string | null;
+    name?: string | null;
+    description?: string | null;
     startAt?: string | null;
+    endAt?: string | null;
     organizer?: string | null;
     verifiedCanonicalUrl?: string | null;
     originalSubmissionUrl?: string | null;
@@ -1348,14 +1776,20 @@ export function areEventsSameRealWorldEvent(
   },
   b: {
     title?: string | null;
+    name?: string | null;
+    description?: string | null;
     startAt?: string | null;
+    endAt?: string | null;
     organizer?: string | null;
     verifiedCanonicalUrl?: string | null;
     originalSubmissionUrl?: string | null;
     registrationUrl?: string | null;
   }
 ): boolean {
-  // 1. Exact URL match across any canonical / submission / registration URL
+  const titleA = cleanHtmlToText(a.title || a.name || '');
+  const titleB = cleanHtmlToText(b.title || b.name || '');
+
+  // 1. Exact URL match across any non-empty canonical / submission / registration URL
   const urlsA = [
     normalizeUrlForComparison(a.verifiedCanonicalUrl),
     normalizeUrlForComparison(a.originalSubmissionUrl),
@@ -1374,13 +1808,47 @@ export function areEventsSameRealWorldEvent(
     }
   }
 
-  // 2. Title similarity + compatible dates
-  const rawTitleA = (a.title ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const rawTitleB = (b.title ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const dateA = parseSingleDateToYmd(a.startAt);
+  const dateB = parseSingleDateToYmd(b.startAt);
+  const datesCompatible = (() => {
+    if (!dateA || !dateB) return true;
+    const msA = Date.parse(`${dateA}T00:00:00Z`);
+    const msB = Date.parse(`${dateB}T00:00:00Z`);
+    const diffDays = Math.abs(msA - msB) / (1000 * 60 * 60 * 24);
+    return diffDays <= 4;
+  })();
+
+  // 2. Canonical multi-page alias match (e.g., ADCOM 2027 across 11537 & 11523)
+  const aliasesA = extractCanonicalEventAliases(a);
+  const aliasesB = extractCanonicalEventAliases(b);
+  if (
+    aliasesA.length > 0 &&
+    aliasesB.some((al) => aliasesA.includes(al)) &&
+    datesCompatible
+  ) {
+    return true;
+  }
+
+  // 3. Edition guard: if both titles specify explicit edition/version markers and they differ
+  //    (e.g. "Kodikon 5.0" vs "KODIKON 6.0", "Nimbus 1000" vs "Nimbus 2000", "Agentathon 2025" vs "Agentathon 2026"),
+  //    they are separate editions and must NOT be merged.
+  const editionsA = extractEditionMarkers(titleA);
+  const editionsB = extractEditionMarkers(titleB);
+  if (
+    editionsA.length > 0 &&
+    editionsB.length > 0 &&
+    !editionsA.some((ea) => editionsB.includes(ea))
+  ) {
+    return false;
+  }
+
+  // 4. Title similarity + compatible dates
+  const rawTitleA = titleA.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const rawTitleB = titleB.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (!rawTitleA || !rawTitleB) return false;
 
-  const tokensA = normalizeEventTitleTokens(a.title);
-  const tokensB = normalizeEventTitleTokens(b.title);
+  const tokensA = normalizeEventTitleTokens(titleA);
+  const tokensB = normalizeEventTitleTokens(titleB);
 
   let titleMatches = rawTitleA === rawTitleB;
   if (!titleMatches && tokensA.length > 0 && tokensB.length > 0) {
@@ -1388,8 +1856,10 @@ export function areEventsSameRealWorldEvent(
     const shared = tokensA.filter((t) => setB.has(t));
     const minLen = Math.min(tokensA.length, tokensB.length);
     const maxLen = Math.max(tokensA.length, tokensB.length);
-    // Match if all tokens of the shorter title appear in the longer title (with at least 2 significant tokens, or 1 unique coined name >= 6 chars)
-    if (shared.length === minLen && (minLen >= 2 || (minLen === 1 && shared[0].length >= 6))) {
+    if (
+      shared.length === minLen &&
+      (minLen >= 2 || (minLen === 1 && shared[0].length >= 6))
+    ) {
       titleMatches = true;
     } else if (shared.length / maxLen >= 0.7 && shared.length >= 2) {
       titleMatches = true;
@@ -1397,20 +1867,124 @@ export function areEventsSameRealWorldEvent(
   }
 
   if (!titleMatches) return false;
+  return datesCompatible;
+}
 
-  // Check date compatibility: if both have startAt dates, they must be within 4 days of each other
-  const dateA = parseSingleDateToYmd(a.startAt);
-  const dateB = parseSingleDateToYmd(b.startAt);
-  if (dateA && dateB) {
-    const msA = Date.parse(`${dateA}T00:00:00Z`);
-    const msB = Date.parse(`${dateB}T00:00:00Z`);
-    const diffDays = Math.abs(msA - msB) / (1000 * 60 * 60 * 24);
-    return diffDays <= 4;
+/**
+ * Consolidates a list of Hackathons so that each real-world event is represented by
+ * a single card, merging official source links and provenance when multiple pages
+ * (e.g., two `events.pes.edu` pages or a community submission + official listing)
+ * describe the same event.
+ */
+export function deduplicateHackathonCatalog(hackathons: Hackathon[]): Hackathon[] {
+  const consolidated: Hackathon[] = [];
+
+  for (const incoming of hackathons) {
+    const cleanedIncoming: Hackathon = {
+      ...incoming,
+      name: cleanHtmlToText(incoming.name),
+      description: cleanHtmlToText(incoming.description),
+    };
+
+    const existingIdx = consolidated.findIndex((ex) =>
+      areEventsSameRealWorldEvent(
+        {
+          title: ex.name,
+          description: ex.description,
+          startAt: ex.startAt,
+          endAt: ex.endAt,
+          organizer: ex.organizer,
+          verifiedCanonicalUrl: ex.verifiedCanonicalUrl,
+          originalSubmissionUrl: ex.originalSubmissionUrl,
+          registrationUrl: ex.registrationUrl,
+        },
+        {
+          title: cleanedIncoming.name,
+          description: cleanedIncoming.description,
+          startAt: cleanedIncoming.startAt,
+          endAt: cleanedIncoming.endAt,
+          organizer: cleanedIncoming.organizer,
+          verifiedCanonicalUrl: cleanedIncoming.verifiedCanonicalUrl,
+          originalSubmissionUrl: cleanedIncoming.originalSubmissionUrl,
+          registrationUrl: cleanedIncoming.registrationUrl,
+        }
+      )
+    );
+
+    if (existingIdx === -1) {
+      consolidated.push(cleanedIncoming);
+      continue;
+    }
+
+    const existing = consolidated[existingIdx];
+    const mergedSourceIds = Array.from(
+      new Set([
+        ...(existing.sourceIds ?? []),
+        ...(cleanedIncoming.sourceIds ?? []),
+        existing.verifiedCanonicalUrl,
+        cleanedIncoming.verifiedCanonicalUrl,
+        existing.originalSubmissionUrl,
+        cleanedIncoming.originalSubmissionUrl,
+      ].filter((s): s is string => typeof s === 'string' && s.trim().length > 0))
+    );
+
+    const mergedProvenance: Record<string, import('../types/domain.ts').FieldProvenanceEntry> = {
+      ...(cleanedIncoming.fieldProvenance ?? {}),
+      ...(existing.fieldProvenance ?? {}),
+    };
+
+    if (
+      cleanedIncoming.verifiedCanonicalUrl &&
+      cleanedIncoming.verifiedCanonicalUrl !== existing.verifiedCanonicalUrl
+    ) {
+      mergedProvenance[`source_${cleanedIncoming.id}`] = {
+        sourceUrl: cleanedIncoming.verifiedCanonicalUrl,
+        sourceType: cleanedIncoming.sourceType ?? 'pes_public_events',
+        excerpt: `Consolidated official source page (${cleanedIncoming.name})`,
+        verifiedAt: cleanedIncoming.lastVerifiedAt ?? new Date().toISOString(),
+      };
+    }
+
+    // Prefer the more descriptive canonical conference/hackathon title if one is a generic track name
+    const preferIncomingName =
+      /31st international advanced computing/i.test(cleanedIncoming.name) &&
+      !/31st international advanced computing/i.test(existing.name);
+
+    // Prefer distinct external registration URL over a fallback canonical URL
+    const existingRegIsFallback =
+      !existing.registrationUrl ||
+      normalizeUrlForComparison(existing.registrationUrl) ===
+        normalizeUrlForComparison(existing.verifiedCanonicalUrl);
+    const incomingRegIsDistinct =
+      Boolean(cleanedIncoming.registrationUrl) &&
+      normalizeUrlForComparison(cleanedIncoming.registrationUrl) !==
+        normalizeUrlForComparison(cleanedIncoming.verifiedCanonicalUrl);
+
+    consolidated[existingIdx] = {
+      ...existing,
+      name: preferIncomingName ? cleanedIncoming.name : existing.name,
+      description:
+        cleanedIncoming.description.length > existing.description.length
+          ? cleanedIncoming.description
+          : existing.description,
+      registrationUrl:
+        existingRegIsFallback && incomingRegIsDistinct
+          ? cleanedIncoming.registrationUrl
+          : existing.registrationUrl || cleanedIncoming.registrationUrl,
+      registrationDeadline:
+        existing.registrationDeadline || cleanedIncoming.registrationDeadline,
+      minTeamSize: existing.minTeamSize ?? cleanedIncoming.minTeamSize,
+      maxTeamSize: existing.maxTeamSize ?? cleanedIncoming.maxTeamSize,
+      venue: {
+        campus: existing.venue?.campus ?? cleanedIncoming.venue?.campus ?? null,
+        name: existing.venue?.name ?? cleanedIncoming.venue?.name ?? null,
+      },
+      sourceIds: mergedSourceIds,
+      fieldProvenance: mergedProvenance,
+    };
   }
 
-  // If at least one source has startAt === null (e.g., an announcement without a date or Date TBA),
-  // matching the distinct event title is sufficient!
-  return true;
+  return consolidated;
 }
 
 /**
@@ -1425,7 +1999,7 @@ export function computeProposedEventDiffs(
     registrationDeadline?: string | null;
     venue?: { campus?: CampusType | null; name?: string | null };
     registrationUrl?: string | null;
-     verifiedCanonicalUrl?: string | null;
+    verifiedCanonicalUrl?: string | null;
     teamSize?: { min?: number | null; max?: number | null };
     organizer?: string | null;
   }
@@ -1608,6 +2182,16 @@ export function doDateIntervalsOverlap(
 
 /**
  * Determines verifiable registration status in IST without guessing when unverified.
+ *
+ * Distinguishes strictly between:
+ * - 'open_confirmed' ("Registration confirmed open")
+ * - 'deadline_known' ("Registration deadline known")
+ * - 'link_available' ("Registration link available")
+ * - 'unknown' ("Registration status unknown")
+ * - 'closed' / 'ended' ("Registration closed")
+ *
+ * CRITICAL: A valid URL alone (especially when `registrationUrl` is merely the `events.pes.edu/<id>/`
+ * detail page URL) does NOT prove registration is open!
  */
 export function getVerifiableRegistrationStatus(
   event: {
@@ -1615,27 +2199,104 @@ export function getVerifiableRegistrationStatus(
     startAt?: string | null;
     endAt?: string | null;
     registrationUrl?: string | null;
+    verifiedCanonicalUrl?: string | null;
+    status?: string | null;
+    registrationConfirmedOpen?: boolean | null;
   },
   todayIstYmd: string = getTodayDateStringIST()
 ): {
-  status: 'open' | 'closed' | 'ended' | 'unconfirmed';
+  status:
+    | 'open_confirmed'
+    | 'deadline_known'
+    | 'link_available'
+    | 'unknown'
+    | 'closed'
+    | 'ended';
   label: string;
+  isOpen: boolean;
 } {
-  const { startYmd, endYmd } = getEventDateBoundsIST(event);
-  if (endYmd && endYmd < todayIstYmd) {
-    return { status: 'ended', label: 'Event Ended' };
+  const { endYmd } = getEventDateBoundsIST(event);
+  if (
+    event.status === 'registration_closed' ||
+    event.status === 'completed' ||
+    event.status === 'archived'
+  ) {
+    return {
+      status: 'closed',
+      label: 'Registration Closed',
+      isOpen: false,
+    };
   }
+
+  if (endYmd && endYmd < todayIstYmd) {
+    return {
+      status: 'ended',
+      label: 'Registration Closed',
+      isOpen: false,
+    };
+  }
+
+  const regUrl = (event.registrationUrl ?? '').trim();
+  if (regUrl && /\/closedform\b/i.test(regUrl)) {
+    return {
+      status: 'closed',
+      label: 'Registration Closed',
+      isOpen: false,
+    };
+  }
+
   const deadlineYmd = parseSingleDateToYmd(event.registrationDeadline);
   if (deadlineYmd) {
     if (deadlineYmd < todayIstYmd) {
-      return { status: 'closed', label: 'Registration Closed' };
+      return {
+        status: 'closed',
+        label: 'Registration Closed',
+        isOpen: false,
+      };
     }
-    return { status: 'open', label: 'Registration Open' };
+    return {
+      status: 'deadline_known',
+      label: `Registration Deadline: ${deadlineYmd}`,
+      isOpen: true,
+    };
   }
-  if (startYmd && startYmd >= todayIstYmd && event.registrationUrl) {
-    return { status: 'open', label: 'Registration Link Available' };
+
+  if (event.registrationConfirmedOpen === true || event.status === 'in_progress') {
+    return {
+      status: 'open_confirmed',
+      label: 'Registration Confirmed Open',
+      isOpen: true,
+    };
   }
-  return { status: 'unconfirmed', label: 'Status Unconfirmed' };
+
+  // Check if there is a genuine, distinct registration link (not a bogus QR blog link
+  // and not merely a duplicate of the `events.pes.edu/<id>/` detail page URL)
+  const normReg = normalizeUrlForComparison(regUrl);
+  const normCanon = normalizeUrlForComparison(event.verifiedCanonicalUrl);
+  const isBarePesEventDetailUrl =
+    normReg !== null && /^events\.pes\.edu\/\d+$/.test(normReg);
+
+  if (normReg && !isBarePesEventDetailUrl && normReg !== normCanon) {
+    return {
+      status: 'link_available',
+      label: 'Registration Link Available',
+      isOpen: true,
+    };
+  }
+
+  if (normReg && !isBarePesEventDetailUrl && !normCanon) {
+    return {
+      status: 'link_available',
+      label: 'Registration Link Available',
+      isOpen: true,
+    };
+  }
+
+  return {
+    status: 'unknown',
+    label: 'Registration Status Unknown',
+    isOpen: false,
+  };
 }
 
 /**
@@ -1680,11 +2341,14 @@ export function formatEventDateDisplayIST(event: {
 export function filterAndSortEventsByTime<
   T extends {
     id: string;
-    title: string;
+    title?: string;
+    name?: string;
     startAt?: string | null;
     endAt?: string | null;
     registrationDeadline?: string | null;
     registrationUrl?: string | null;
+    verifiedCanonicalUrl?: string | null;
+    status?: string | null;
   },
 >(
   events: T[],
@@ -1747,6 +2411,8 @@ export function filterAndSortEventsByTime<
     }
   });
 
+  const getTitle = (x: T) => x.title || x.name || '';
+
   return filtered.sort((a, b) => {
     const boundsA = getEventDateBoundsIST(a);
     const boundsB = getEventDateBoundsIST(b);
@@ -1755,13 +2421,10 @@ export function filterAndSortEventsByTime<
       const endA = boundsA.endYmd ?? '0000-00-00';
       const endB = boundsB.endYmd ?? '0000-00-00';
       if (endA !== endB) return endB.localeCompare(endA);
-      return a.title.localeCompare(b.title);
+      return getTitle(a).localeCompare(getTitle(b));
     }
 
     if (options.preset === 'ALL') {
-      // Bucket 0: Upcoming/Ongoing (endYmd >= todayIst), sorted ascending by startYmd
-      // Bucket 1: Undated ("Date TBA")
-      // Bucket 2: Past (endYmd < todayIst), sorted descending by endYmd
       const bucketOf = (b: { startYmd: string | null; endYmd: string | null }) => {
         if (!b.startYmd || !b.endYmd) return 1;
         return b.endYmd >= todayIst ? 0 : 2;
@@ -1775,14 +2438,14 @@ export function filterAndSortEventsByTime<
       if (bA === 2) {
         return (boundsB.endYmd ?? '').localeCompare(boundsA.endYmd ?? '');
       }
-      return a.title.localeCompare(b.title);
+      return getTitle(a).localeCompare(getTitle(b));
     }
 
     // For UPCOMING, THIS_WEEK, THIS_MONTH, CUSTOM: chronological nearest first
     const startA = boundsA.startYmd ?? '9999-99-99';
     const startB = boundsB.startYmd ?? '9999-99-99';
     if (startA !== startB) return startA.localeCompare(startB);
-    return a.title.localeCompare(b.title);
+    return getTitle(a).localeCompare(getTitle(b));
   });
 }
 
@@ -1959,4 +2622,5 @@ export function extractPesuEventsPaginationLinks(
 
   return results;
 }
+
 

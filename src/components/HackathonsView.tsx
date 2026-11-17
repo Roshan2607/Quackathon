@@ -29,9 +29,11 @@ import {
   filterAnnouncementsByPublicationDate,
   filterAndSortEventsByTime,
   formatEventDateDisplayIST,
+  formatEventTypeCategoryLabel,
   getHackathonSourceLabel,
   getTodayDateStringIST,
   getVerifiableRegistrationStatus,
+  isEligibleTeamHackathonCatalogEvent,
   NormalizedPesuAnnouncement,
   resolveHackathonSourceCategory,
   TimeFilterPreset,
@@ -79,15 +81,12 @@ interface HackathonsViewProps {
   onNotify?: (message: string) => void;
 }
 
-type TypeFilterMode = 'ALL' | 'MATCHABLE_ONLY' | 'WORKSHOPS_AND_TALKS';
-
 interface PersistedEventsFilterState {
   sourceFilter: UnifiedEventSourceFilter;
   timePreset: TimeFilterPreset;
   customStart: string;
   customEnd: string;
   openRegistrationOnly: boolean;
-  typeFilter: TypeFilterMode;
   campusFilter: CampusType | 'ALL';
   searchQuery: string;
 }
@@ -101,7 +100,6 @@ function loadPersistedFilterState(): PersistedEventsFilterState {
     customStart: '',
     customEnd: '',
     openRegistrationOnly: false,
-    typeFilter: 'ALL',
     campusFilter: 'ALL',
     searchQuery: '',
   };
@@ -116,7 +114,6 @@ function loadPersistedFilterState(): PersistedEventsFilterState {
       customStart: parsed.customStart ?? defaults.customStart,
       customEnd: parsed.customEnd ?? defaults.customEnd,
       openRegistrationOnly: Boolean(parsed.openRegistrationOnly),
-      typeFilter: parsed.typeFilter ?? defaults.typeFilter,
       campusFilter: parsed.campusFilter ?? defaults.campusFilter,
       searchQuery: parsed.searchQuery ?? defaults.searchQuery,
     };
@@ -152,13 +149,12 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   const [openRegistrationOnly, setOpenRegistrationOnly] = useState<boolean>(
     initialFilters.openRegistrationOnly
   );
-  const [typeFilter, setTypeFilter] = useState<TypeFilterMode>(
-    initialFilters.typeFilter
-  );
   const [campusFilter, setCampusFilter] = useState<CampusType | 'ALL'>(
     initialFilters.campusFilter
   );
   const [searchQuery, setSearchQuery] = useState(initialFilters.searchQuery);
+  const [selectedDetailHackathon, setSelectedDetailHackathon] =
+    useState<Hackathon | null>(null);
 
   // Persist filter selections in sessionStorage while navigating within the page
   useEffect(() => {
@@ -169,7 +165,6 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
         customStart,
         customEnd,
         openRegistrationOnly,
-        typeFilter,
         campusFilter,
         searchQuery,
       };
@@ -183,7 +178,6 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
     customStart,
     customEnd,
     openRegistrationOnly,
-    typeFilter,
     campusFilter,
     searchQuery,
   ]);
@@ -509,12 +503,18 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
     setShowSubmitModal(true);
   };
 
-  // Source-filtered + Search/Campus/Type-filtered + IST Time-filtered Published Events
+  // Eligible Hackathons-only catalog (excludes workshops, talks, conferences, cultural events, and solo-only events)
+  const eligibleCatalogHackathons = useMemo(
+    () => hackathons.filter((h) => isEligibleTeamHackathonCatalogEvent(h)),
+    [hackathons]
+  );
+
+  // Source-filtered + Search/Campus-filtered + IST Time-filtered Published Hackathons
   const sourceCounts = useMemo(() => {
     let allCount = 0;
     let pesPublicCount = 0;
     let communityCount = 0;
-    for (const h of hackathons) {
+    for (const h of eligibleCatalogHackathons) {
       allCount++;
       if (resolveHackathonSourceCategory(h) === 'PES_PUBLIC') {
         pesPublicCount++;
@@ -528,17 +528,14 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
       communityCount,
       academyCount: academyAnnouncements.length,
     };
-  }, [hackathons, academyAnnouncements.length]);
+  }, [eligibleCatalogHackathons, academyAnnouncements.length]);
 
   const filteredHackathons = useMemo(() => {
-    const baseFiltered = hackathons.filter((h) => {
+    const baseFiltered = eligibleCatalogHackathons.filter((h) => {
       const cat = resolveHackathonSourceCategory(h);
       if (sourceFilter === 'PES_PUBLIC' && cat !== 'PES_PUBLIC') return false;
       if (sourceFilter === 'COMMUNITY_VERIFIED' && cat !== 'COMMUNITY_VERIFIED')
         return false;
-
-      if (typeFilter === 'MATCHABLE_ONLY' && !h.matchable) return false;
-      if (typeFilter === 'WORKSHOPS_AND_TALKS' && h.matchable) return false;
 
       if (campusFilter !== 'ALL' && h.venue.campus !== campusFilter)
         return false;
@@ -566,9 +563,8 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
       }
     );
   }, [
-    hackathons,
+    eligibleCatalogHackathons,
     sourceFilter,
-    typeFilter,
     campusFilter,
     searchQuery,
     timePreset,
@@ -936,14 +932,14 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
       <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h1 className="text-lg font-bold text-slate-900 dark:text-slate-100">
-            PESU Events, Hackathons & Announcements
+            Hackathons
           </h1>
           <p className="text-xs text-slate-500 mt-0.5">
-            Grounded event discovery across official{' '}
+            Discover verified team hackathons, ideathons, CTFs, and coding competitions from{' '}
             <span className="font-mono text-slate-700 dark:text-slate-300">
               events.pes.edu
             </span>{' '}
-            listings, verified community submissions, and optional PESU Academy announcements.
+            and community submissions.
           </p>
         </div>
 
@@ -953,7 +949,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
               type="button"
               disabled={isSyncingPesuPublic}
               onClick={() => void handleSyncPesuPublicEvents(true)}
-              title="Fetch latest public event listings from events.pes.edu"
+              title="Fetch latest public hackathon listings from events.pes.edu"
               className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors cursor-pointer disabled:opacity-50"
             >
               <RefreshCw
@@ -971,7 +967,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
             className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>Suggest Event</span>
+            <span>Suggest Hackathon</span>
           </button>
         </div>
       </div>
@@ -997,7 +993,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 dark:border-slate-800 pb-2.5">
           <div
             role="tablist"
-            aria-label="Event discovery sources"
+            aria-label="Hackathon discovery sources"
             className="flex flex-wrap items-center gap-1.5"
           >
             <button
@@ -1011,7 +1007,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                   : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
               }`}
             >
-              <span>All Published Events</span>
+              <span>All Hackathons</span>
               <span className="font-mono text-[11px] opacity-75">
                 ({sourceCounts.allCount})
               </span>
@@ -1079,12 +1075,12 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
           </span>
         </div>
 
-        {/* Time Filter Bar (Applies to Events by Event Date, or Announcements by Publication Date) */}
+        {/* Date Filter Bar (Upcoming, This Week, This Month, Past, All) */}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-1">
             <span className="text-[11px] font-semibold text-slate-500 mr-1 inline-flex items-center gap-1">
               <Clock className="w-3 h-3" />
-              {sourceFilter === 'MY_ACADEMY' ? 'Published:' : 'When:'}
+              {sourceFilter === 'MY_ACADEMY' ? 'Published:' : 'Date:'}
             </span>
             {(
               [
@@ -1092,7 +1088,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                 { id: 'THIS_WEEK', label: 'This Week' },
                 { id: 'THIS_MONTH', label: 'This Month' },
                 { id: 'PAST', label: 'Past' },
-                { id: 'ALL', label: sourceFilter === 'MY_ACADEMY' ? 'All Dates' : 'All (incl. Date TBA)' },
+                { id: 'ALL', label: 'All' },
                 { id: 'CUSTOM', label: 'Custom Range' },
               ] as { id: TimeFilterPreset; label: string }[]
             ).map((item) => (
@@ -1155,7 +1151,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
           </div>
         )}
 
-        {/* Search + Type + Campus Filter Row */}
+        {/* Search + Campus Filter Row (No Workshop/Talk Filter) */}
         <div className="flex flex-col md:flex-row gap-2.5 pt-1">
           <div className="relative flex-1">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -1166,55 +1162,29 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
               placeholder={
                 sourceFilter === 'MY_ACADEMY'
                   ? 'Search your PESU Academy announcements...'
-                  : 'Search by event title, organizer, venue, or domain tag...'
+                  : 'Search hackathons by name, campus, or domain...'
               }
               className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:outline-none focus:border-blue-500"
             />
           </div>
 
           {sourceFilter !== 'MY_ACADEMY' && (
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-700 p-0.5 bg-slate-50 dark:bg-slate-800">
-                {(
-                  [
-                    { id: 'ALL', label: 'All Types' },
-                    { id: 'MATCHABLE_ONLY', label: 'Team Hackathons' },
-                    { id: 'WORKSHOPS_AND_TALKS', label: 'Talks / Workshops' },
-                  ] as { id: TypeFilterMode; label: string }[]
-                ).map((tab) => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setTypeFilter(tab.id)}
-                    className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                      typeFilter === tab.id
-                        ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs font-semibold'
-                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
-                    }`}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-
-              <div className="flex items-center gap-1.5">
-                <Filter className="w-3.5 h-3.5 text-slate-400" />
-                <select
-                  aria-label="Filter by campus"
-                  value={campusFilter}
-                  onChange={(e) =>
-                    setCampusFilter(e.target.value as CampusType | 'ALL')
-                  }
-                  className="text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-2.5 py-1.5 text-slate-700 dark:text-slate-300"
-                >
-                  <option value="ALL">All Campuses</option>
-                  <option value="RR Campus">RR Campus</option>
-                  <option value="EC Campus">EC Campus</option>
-                  <option value="HN Campus">HN Campus</option>
-                  <option value="Online">Online</option>
-                  <option value="Cross-Campus">Cross-Campus</option>
-                </select>
-              </div>
+            <div className="flex items-center gap-1.5">
+              <Filter className="w-3.5 h-3.5 text-slate-400" />
+              <select
+                aria-label="Filter by campus"
+                value={campusFilter}
+                onChange={(e) =>
+                  setCampusFilter(e.target.value as CampusType | 'ALL')
+                }
+                className="text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-2.5 py-1.5 text-slate-700 dark:text-slate-300"
+              >
+                <option value="ALL">All Campuses</option>
+                <option value="RR Campus">RR Campus</option>
+                <option value="EC Campus">EC Campus</option>
+                <option value="HN Campus">HN Campus</option>
+                <option value="Online / Multi-Campus">Online / Multi-Campus</option>
+              </select>
             </div>
           )}
         </div>
@@ -1575,18 +1545,18 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
         </div>
       ) : (
         /* ==================================================================== */
-        /* VIEW B: UNIFIED PUBLISHED EVENTS LIST (ALL / PESU PUBLIC / COMMUNITY) */
+        /* VIEW B: MINIMAL HACKATHONS DISCOVERY GRID                            */
         /* ==================================================================== */
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
           {filteredHackathons.length === 0 ? (
             <div className="col-span-full bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2.5">
               <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">
-                No published events match your current time or source filters.
+                No hackathons match your current date or source filters.
               </p>
               <p className="text-xs text-slate-500 max-w-md mx-auto">
                 {timePreset === 'UPCOMING'
-                  ? 'Switch the time filter to "All (incl. Date TBA)" or "Past" to view undated or completed events, or sync official listings from events.pes.edu.'
-                  : 'Try broadening your time filter, clearing search keywords, or suggesting a verified event.'}
+                  ? 'Switch the date filter to "All" or "Past" to view earlier or undated hackathons, or sync official listings from events.pes.edu.'
+                  : 'Try broadening your date filter, clearing search keywords, or suggesting a verified hackathon.'}
               </p>
               <div className="pt-1 flex flex-wrap justify-center gap-2">
                 {timePreset !== 'ALL' && (
@@ -1595,7 +1565,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                     onClick={() => setTimePreset('ALL')}
                     className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold cursor-pointer"
                   >
-                    Show All Dates (incl. Date TBA)
+                    Show All Hackathons
                   </button>
                 )}
                 <button
@@ -1610,151 +1580,274 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
             </div>
           ) : (
             filteredHackathons.map((h) => {
-              const sourceInfo = getHackathonSourceLabel(h);
               const dateDisplay = formatEventDateDisplayIST(h);
               const regStatus = getVerifiableRegistrationStatus(h, todayIst);
-              const officialLink =
-                h.registrationUrl ||
-                h.verifiedCanonicalUrl ||
-                h.originalSubmissionUrl ||
-                null;
+              const hasVerifiedTeamSize =
+                h.minTeamSize !== null && h.maxTeamSize !== null;
+              const locationDisplay =
+                h.format === 'online'
+                  ? h.venue.campus && h.venue.campus !== 'Online / Multi-Campus'
+                    ? `Online · ${h.venue.campus}`
+                    : 'Online'
+                  : [h.venue.name, h.venue.campus].filter(Boolean).join(' · ') ||
+                    'PES University';
 
               return (
                 <div
                   key={h.id}
+                  data-testid={`hackathon-card-${h.id}`}
                   className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 flex flex-col justify-between gap-3 hover:border-slate-300 dark:hover:border-slate-700 transition-colors"
                 >
                   <div className="space-y-2">
-                    {/* Top Badges: Source Distinction + Event Type + Registration Status */}
+                    {/* Top Row: Registration Status Badge */}
                     <div className="flex flex-wrap items-center justify-between gap-1.5">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span
-                          className={`px-2 py-0.5 rounded text-[11px] font-semibold inline-flex items-center gap-1 ${
-                            sourceInfo.isPesuOfficial
-                              ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200/60 dark:border-blue-800/60'
-                              : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
-                          }`}
-                        >
-                          {sourceInfo.isPesuOfficial ? (
-                            <Globe className="w-3 h-3" />
-                          ) : (
-                            <ShieldCheck className="w-3 h-3" />
-                          )}
-                          <span>{sourceInfo.label}</span>
-                        </span>
+                      <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300">
+                        {formatEventTypeCategoryLabel(h.eventType)}
+                      </span>
 
-                        <span
-                          className={`px-2 py-0.5 rounded text-[11px] font-semibold uppercase tracking-wide ${
-                            h.matchable
-                              ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
-                              : 'bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300'
-                          }`}
-                        >
-                          {h.eventType.replace('_', ' ')}
-                        </span>
-                      </div>
-
-                      {regStatus.status !== 'unconfirmed' && (
-                        <span
-                          className={`text-[11px] font-medium px-2 py-0.5 rounded ${
-                            regStatus.status === 'open'
-                              ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                      <span
+                        className={`text-[11px] font-medium px-2 py-0.5 rounded ${
+                          regStatus.isOpen
+                            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                            : regStatus.status === 'unknown'
+                              ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300'
                               : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
-                          }`}
-                        >
-                          {regStatus.label}
-                        </span>
-                      )}
+                        }`}
+                      >
+                        {regStatus.label}
+                      </span>
                     </div>
 
-                    {/* Event Title & Organizer */}
-                    <div>
-                      <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100 leading-snug">
+                    {/* 1. Hackathon Name */}
+                    <button
+                      type="button"
+                      onClick={() => setSelectedDetailHackathon(h)}
+                      className="text-left group cursor-pointer block w-full"
+                    >
+                      <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 leading-snug transition-colors">
                         {h.name}
                       </h2>
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        {h.organizer}
-                      </p>
-                    </div>
+                    </button>
 
-                    {/* Description */}
-                    {h.description && (
-                      <p className="text-xs text-slate-600 dark:text-slate-300 line-clamp-2">
-                        {h.description}
-                      </p>
-                    )}
-
-                    {/* Grounded Metadata Facts: Date/Range, Campus/Venue, Deadline, Team Size */}
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-600 dark:text-slate-400 pt-1">
+                    {/* 2. Date, 3. Campus/Location, 4. Team Size (only if verified) */}
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 dark:text-slate-400 pt-0.5">
                       <span className="inline-flex items-center gap-1 font-medium text-slate-800 dark:text-slate-200">
                         <Calendar className="w-3.5 h-3.5 text-slate-400" />
                         {dateDisplay}
                       </span>
 
-                      {(h.venue.campus || h.venue.name) && (
-                        <span className="inline-flex items-center gap-1">
-                          <MapPin className="w-3.5 h-3.5 text-slate-400" />
-                          {[h.venue.name, h.venue.campus]
-                            .filter(Boolean)
-                            .join(' · ')}
-                        </span>
-                      )}
+                      <span className="inline-flex items-center gap-1">
+                        <MapPin className="w-3.5 h-3.5 text-slate-400" />
+                        {locationDisplay}
+                      </span>
 
-                      {h.registrationDeadline && (
-                        <span className="inline-flex items-center gap-1 font-mono">
-                          Deadline: {h.registrationDeadline.slice(0, 10)}
-                        </span>
-                      )}
-
-                      {h.matchable && (
-                        <span className="inline-flex items-center gap-1 font-mono">
+                      {hasVerifiedTeamSize && (
+                        <span className="inline-flex items-center gap-1 font-mono text-[11px]">
                           <Users className="w-3.5 h-3.5 text-slate-400" />
-                          {h.minTeamSize !== null && h.maxTeamSize !== null
-                            ? `${h.minTeamSize}–${h.maxTeamSize} members`
-                            : 'Team size unconfirmed'}
+                          {h.minTeamSize === h.maxTeamSize
+                            ? `${h.minTeamSize} members`
+                            : `${h.minTeamSize}–${h.maxTeamSize} members`}
                         </span>
                       )}
                     </div>
                   </div>
 
-                  {/* Card Footer: Official Link + Team Discovery Action */}
+                  {/* Card Footer: View Details + Find Teammates */}
                   <div className="pt-2.5 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      {officialLink && officialLink.startsWith('http') ? (
-                        <a
-                          href={officialLink}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:underline truncate"
-                        >
-                          <span>Official Event Page</span>
-                          <ExternalLink className="w-3 h-3 shrink-0" />
-                        </a>
-                      ) : (
-                        <span className="text-[11px] text-slate-400">
-                          No external link listed
-                        </span>
-                      )}
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedDetailHackathon(h)}
+                      className="text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer"
+                    >
+                      View Details
+                    </button>
 
-                    {h.matchable ? (
-                      <button
-                        type="button"
-                        onClick={() => onSelectHackathonForDiscovery(h.id)}
-                        className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
-                      >
-                        Find Teammates
-                      </button>
-                    ) : (
-                      <span className="text-[11px] text-slate-400 italic shrink-0">
-                        Non-team event
-                      </span>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => onSelectHackathonForDiscovery(h.id)}
+                      className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
+                    >
+                      Find Teammates
+                    </button>
                   </div>
                 </div>
               );
             })
           )}
+        </div>
+      )}
+
+      {/* ==================================================================== */}
+      {/* EVENT DETAIL VIEW MODAL (Full Description, Organizer, Source Links)  */}
+      {/* ==================================================================== */}
+      {selectedDetailHackathon && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="event-detail-modal-title"
+        >
+          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-lg w-full border border-slate-200 dark:border-slate-800 shadow-2xl overflow-hidden my-8">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-start justify-between gap-3">
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300">
+                    {formatEventTypeCategoryLabel(selectedDetailHackathon.eventType)}
+                  </span>
+                  <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300">
+                    {getHackathonSourceLabel(selectedDetailHackathon).label}
+                  </span>
+                </div>
+                <h2
+                  id="event-detail-modal-title"
+                  className="text-base font-bold text-slate-900 dark:text-slate-100"
+                >
+                  {selectedDetailHackathon.name}
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Organized by {selectedDetailHackathon.organizer}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedDetailHackathon(null)}
+                className="text-xs text-slate-500 hover:text-slate-800 px-2.5 py-1 rounded-lg border border-slate-200 cursor-pointer shrink-0"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto text-xs">
+              <div className="grid grid-cols-2 gap-3 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200/70 dark:border-slate-800">
+                <div>
+                  <div className="text-[11px] text-slate-500 font-medium">
+                    Event Date (IST)
+                  </div>
+                  <div className="font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
+                    {formatEventDateDisplayIST(selectedDetailHackathon)}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-500 font-medium">
+                    Location / Format
+                  </div>
+                  <div className="font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
+                    {selectedDetailHackathon.format === 'online'
+                      ? 'Online'
+                      : [
+                          selectedDetailHackathon.venue.name,
+                          selectedDetailHackathon.venue.campus,
+                        ]
+                          .filter(Boolean)
+                          .join(' · ') || 'PES University'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-500 font-medium">
+                    Registration Status
+                  </div>
+                  <div className="font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
+                    {
+                      getVerifiableRegistrationStatus(
+                        selectedDetailHackathon,
+                        todayIst
+                      ).label
+                    }
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-500 font-medium">
+                    Team Size
+                  </div>
+                  <div className="font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
+                    {selectedDetailHackathon.minTeamSize !== null &&
+                    selectedDetailHackathon.maxTeamSize !== null
+                      ? selectedDetailHackathon.minTeamSize ===
+                        selectedDetailHackathon.maxTeamSize
+                        ? `${selectedDetailHackathon.minTeamSize} members`
+                        : `${selectedDetailHackathon.minTeamSize}–${selectedDetailHackathon.maxTeamSize} members`
+                      : 'Not specified on official page'}
+                  </div>
+                </div>
+              </div>
+
+              {selectedDetailHackathon.description && (
+                <div className="space-y-1">
+                  <div className="font-semibold text-slate-800 dark:text-slate-200">
+                    About this Hackathon
+                  </div>
+                  <p className="text-slate-600 dark:text-slate-300 whitespace-pre-line leading-relaxed">
+                    {selectedDetailHackathon.description}
+                  </p>
+                </div>
+              )}
+
+              {/* Verified Source & Registration Links */}
+              <div className="space-y-1.5 pt-2 border-t border-slate-100 dark:border-slate-800">
+                <div className="font-semibold text-slate-800 dark:text-slate-200">
+                  Official Links & Provenance
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {selectedDetailHackathon.registrationUrl &&
+                    selectedDetailHackathon.registrationUrl.startsWith('http') && (
+                      <a
+                        href={selectedDetailHackathon.registrationUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+                      >
+                        <span>Registration Link</span>
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    )}
+                  {Array.from(
+                    new Set(
+                      [
+                        selectedDetailHackathon.verifiedCanonicalUrl,
+                        ...(selectedDetailHackathon.sourceIds ?? []).filter((s) =>
+                          s.startsWith('http')
+                        ),
+                      ].filter((u): u is string => Boolean(u))
+                    )
+                  ).map((url, idx) => (
+                    <a
+                      key={url}
+                      href={url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold"
+                    >
+                      <span>
+                        Official Source Page{idx > 0 ? ` #${idx + 1}` : ''}
+                      </span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex items-center justify-end gap-2 bg-slate-50/50 dark:bg-slate-900">
+              <button
+                type="button"
+                onClick={() => setSelectedDetailHackathon(null)}
+                className="px-3.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 cursor-pointer"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const id = selectedDetailHackathon.id;
+                  setSelectedDetailHackathon(null);
+                  onSelectHackathonForDiscovery(id);
+                }}
+                className="px-4 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer"
+              >
+                Find Teammates for this Hackathon
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

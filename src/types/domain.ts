@@ -20,6 +20,7 @@ export type EventType =
   | 'team_competition'
   | 'workshop'
   | 'tech_talk'
+  | 'conference'
   | 'other'
   | 'unknown';
 

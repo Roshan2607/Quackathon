@@ -40,8 +40,13 @@ import {
 } from '../types/domain.ts';
 import {
   areEventsSameRealWorldEvent,
+  classifyGroundedEvent,
+  cleanHtmlToText,
   computeProposedEventDiffs,
+  deduplicateHackathonCatalog,
+  isEligibleTeamHackathonCatalogEvent,
 } from '../lib/eventsAndAnnouncements.ts';
+import { isSyntheticTestHackathonRecord } from './testCleanup.ts';
 
 export async function ensureMatchingAndTeamSchema(): Promise<void> {
   // Tables team_proposals, team_proposal_votes, team_registrations, and user_blocks
@@ -55,6 +60,39 @@ function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+const POLLUTED_NAVBAR_TAGS = new Set([
+  'clubs & activities',
+  'talks',
+  'workshop',
+  'management',
+]);
+
+function cleanStoredEventThemes(rawThemes: string[]): {
+  themes: string[];
+  hadNavbarPollution: boolean;
+} {
+  const normalized = rawThemes
+    .map((t) => cleanHtmlToText(t).replace(/^#/, '').trim())
+    .filter(Boolean);
+  const lowerSet = new Set(normalized.map((t) => t.toLowerCase()));
+  const hadNavbarPollution =
+    lowerSet.has('clubs & activities') &&
+    lowerSet.has('talks') &&
+    lowerSet.has('workshop');
+
+  if (!hadNavbarPollution) {
+    return { themes: normalized, hadNavbarPollution: false };
+  }
+
+  const filtered = normalized.filter(
+    (t) => !POLLUTED_NAVBAR_TAGS.has(t.toLowerCase())
+  );
+  return {
+    themes: filtered.length > 0 ? filtered : ['PESU Event'],
+    hadNavbarPollution: true,
+  };
 }
 
 const DEFAULT_PRIVACY: User['privacyPreferences'] = {
@@ -149,16 +187,72 @@ export function mapDbHackathonToDomain(
       ? 'pes_public_events'
       : 'submitted_public_url');
 
+  const cleanName = cleanHtmlToText(row.name || '');
+  const cleanOrganizer = cleanHtmlToText(row.organizer || '');
+  const cleanDescription = cleanHtmlToText(row.description || '');
+  const rawThemes = safeJsonParse<string[]>(row.themesJson, []);
+  const { themes: cleanedThemes, hadNavbarPollution } =
+    cleanStoredEventThemes(rawThemes);
+
+  let resolvedEventType = (row.eventType as EventType) || 'hackathon';
+  let resolvedMatchable = row.matchable;
+  let resolvedReason = row.classificationReason || 'Verified event entry.';
+
+  // Re-evaluate classification when a PESU public event row had polluted navbar tags or needs conference/cultural disambiguation
+  if (
+    resolvedSourceType === 'pes_public_events' ||
+    hadNavbarPollution ||
+    row.slug.startsWith('pes_event_')
+  ) {
+    const reclassified = classifyGroundedEvent({
+      title: cleanName,
+      description: cleanDescription,
+      tags: cleanedThemes.filter((t) => t !== 'PESU Event'),
+    });
+    if (reclassified.eventType !== 'unknown') {
+      resolvedEventType = reclassified.eventType;
+      resolvedMatchable = reclassified.matchable;
+      resolvedReason = reclassified.reason;
+    }
+  }
+
+  // Strip bogus QR-generator blog links or bare events.pes.edu canonical duplicates from registrationUrl
+  let cleanRegistrationUrl = row.registrationUrl ?? null;
+  if (cleanRegistrationUrl) {
+    const lowerReg = cleanRegistrationUrl.toLowerCase();
+    if (
+      lowerReg.includes('me-qr.com/page/blog') ||
+      (row.verifiedCanonicalUrl &&
+        cleanRegistrationUrl === row.verifiedCanonicalUrl &&
+        lowerReg.includes('events.pes.edu/'))
+    ) {
+      cleanRegistrationUrl = null;
+    }
+  }
+
+  const allSourceUrls = Array.isArray(parsedProv?._meta?.allSourceUrls)
+    ? (parsedProv._meta.allSourceUrls as string[])
+    : [];
+  const sourceIds = Array.from(
+    new Set(
+      [
+        row.slug,
+        row.verifiedCanonicalUrl,
+        ...allSourceUrls,
+      ].filter((v): v is string => Boolean(v && v.trim()))
+    )
+  );
+
   return {
     id: row.slug,
-    name: row.name,
-    organizer: row.organizer,
-    description: row.description,
-    eventType: (row.eventType as EventType) || 'hackathon',
-    matchable: row.matchable,
-    themes: safeJsonParse<string[]>(row.themesJson, []),
+    name: cleanName,
+    organizer: cleanOrganizer,
+    description: cleanDescription,
+    eventType: resolvedEventType,
+    matchable: resolvedMatchable,
+    themes: cleanedThemes,
     venue: {
-      name: row.venueName ?? null,
+      name: row.venueName ? cleanHtmlToText(row.venueName) : null,
       campus: (row.campus as CampusType | null) ?? null,
     },
     format:
@@ -174,21 +268,21 @@ export function mapDbHackathonToDomain(
     registrationDeadline: row.registrationDeadline ?? null,
     originalSubmissionUrl: row.originalSubmissionUrl ?? null,
     verifiedCanonicalUrl: row.verifiedCanonicalUrl ?? null,
-    registrationUrl: row.registrationUrl ?? null,
+    registrationUrl: cleanRegistrationUrl,
     sourceUrlStatus:
       (row.sourceUrlStatus as SourceUrlVerificationStatus) || 'unverified',
     minTeamSize: row.minTeamSize ?? null,
     maxTeamSize: row.maxTeamSize ?? null,
     eligibilityNotes: row.eligibilityNotes ?? null,
     sourceType: resolvedSourceType,
-    sourceIds: [row.slug],
+    sourceIds,
     fieldProvenance: parsedProv,
-    suggestedByCount: 1,
+    suggestedByCount: Math.max(1, allSourceUrls.length || 1),
     classification: {
-      category: (row.eventType as EventType) || 'hackathon',
-      ruleGatePassed: row.ruleGatePassed,
-      mlConfidenceScore: row.ruleGatePassed ? 1 : 0,
-      reason: row.classificationReason || 'Verified event entry.',
+      category: resolvedEventType,
+      ruleGatePassed: resolvedMatchable,
+      mlConfidenceScore: resolvedMatchable ? 1 : 0,
+      reason: resolvedReason,
     },
     lastVerifiedAt:
       parsedProv?._meta?.verifiedAt ?? row.createdAt.toISOString(),
@@ -1437,11 +1531,23 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
       }
     }
 
-    const hackathons = hackathonRows.map(mapDbHackathonToDomain);
+    const allMappedHackathons = hackathonRows.map(mapDbHackathonToDomain);
     const hackathonBySlug = new Map<string, Hackathon>();
-    for (const h of hackathons) {
+    for (const h of allMappedHackathons) {
       hackathonBySlug.set(h.id, h);
     }
+
+    const isTestEnv =
+      process.env.QUACKATHON_TEST_MODE === 'true' ||
+      process.env.NODE_ENV === 'test';
+
+    const eligibleHackathons = allMappedHackathons.filter((h) => {
+      if (!isTestEnv && isSyntheticTestHackathonRecord(h)) {
+        return false;
+      }
+      return isEligibleTeamHackathonCatalogEvent(h);
+    });
+    const hackathons = deduplicateHackathonCatalog(eligibleHackathons);
 
     // Only expose staged eventCandidates to admins or the student who submitted them
     const eventCandidates = candidateRows
@@ -1808,7 +1914,9 @@ export async function createEventCandidateRecord(
         areEventsSameRealWorldEvent(
           {
             title: hRow.name,
+            description: hRow.description,
             startAt: hRow.startAt,
+            endAt: hRow.endAt,
             organizer: hRow.organizer,
             verifiedCanonicalUrl: hRow.verifiedCanonicalUrl,
             originalSubmissionUrl: hRow.originalSubmissionUrl,
@@ -1816,7 +1924,9 @@ export async function createEventCandidateRecord(
           },
           {
             title: candidate.title,
+            description: candidate.description,
             startAt: candidate.startAt,
+            endAt: candidate.endAt,
             organizer: candidate.organizer,
             verifiedCanonicalUrl: candidate.verifiedCanonicalUrl,
             originalSubmissionUrl:
@@ -1868,7 +1978,9 @@ export async function createEventCandidateRecord(
           areEventsSameRealWorldEvent(
             {
               title: c.title,
+              description: c.description,
               startAt: c.startAt,
+              endAt: c.endAt,
               organizer: c.organizer,
               verifiedCanonicalUrl: c.verifiedCanonicalUrl,
               originalSubmissionUrl: c.originalSubmissionUrl ?? c.sourceUrl,
@@ -1876,7 +1988,9 @@ export async function createEventCandidateRecord(
             },
             {
               title: candidate.title,
+              description: candidate.description,
               startAt: candidate.startAt,
+              endAt: candidate.endAt,
               organizer: candidate.organizer,
               verifiedCanonicalUrl: candidate.verifiedCanonicalUrl,
               originalSubmissionUrl:
@@ -2097,7 +2211,9 @@ export async function approveEventCandidateRecord(params: {
         areEventsSameRealWorldEvent(
           {
             title: h.name,
+            description: h.description,
             startAt: h.startAt,
+            endAt: h.endAt,
             organizer: h.organizer,
             verifiedCanonicalUrl: h.verifiedCanonicalUrl,
             originalSubmissionUrl: h.originalSubmissionUrl,
@@ -2105,7 +2221,9 @@ export async function approveEventCandidateRecord(params: {
           },
           {
             title: cand.title,
+            description: cand.description,
             startAt: cand.startAt,
+            endAt: cand.endAt,
             organizer: cand.organizer,
             verifiedCanonicalUrl: cand.verifiedCanonicalUrl,
             originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
@@ -2128,12 +2246,40 @@ export async function approveEventCandidateRecord(params: {
       const ex = existingRows[0];
 
       if (ex) {
+        const exProv = safeJsonParse<Record<string, any>>(
+          ex.fieldProvenanceJson,
+          {}
+        );
+        const existingSourceUrls = Array.isArray(exProv?._meta?.allSourceUrls)
+          ? (exProv._meta.allSourceUrls as string[])
+          : [];
+        const mergedSourceUrls = Array.from(
+          new Set(
+            [
+              ...existingSourceUrls,
+              ex.verifiedCanonicalUrl,
+              cand.verifiedCanonicalUrl,
+              cand.originalSubmissionUrl,
+              cand.sourceUrl,
+            ].filter((u): u is string => Boolean(u && u.trim()))
+          )
+        );
+        const mergedProv = {
+          ...exProv,
+          ...provenanceWithMeta,
+          _meta: {
+            ...(exProv._meta ?? {}),
+            ...provenanceWithMeta._meta,
+            allSourceUrls: mergedSourceUrls,
+          },
+        };
+
         const [updatedHack] = await db
           .update(schema.hackathons)
           .set({
-            name: cand.title || ex.name,
-            organizer: cand.organizer || ex.organizer,
-            description: cand.description || ex.description,
+            name: cleanHtmlToText(cand.title || ex.name),
+            organizer: cleanHtmlToText(cand.organizer || ex.organizer),
+            description: cleanHtmlToText(cand.description || ex.description),
             eventType: finalType,
             matchable: finalMatchable,
             campus: finalCampus ?? ex.campus,
@@ -2143,11 +2289,11 @@ export async function approveEventCandidateRecord(params: {
             registrationDeadline:
               cand.registrationDeadline ?? ex.registrationDeadline,
             verifiedCanonicalUrl:
-              cand.verifiedCanonicalUrl ?? ex.verifiedCanonicalUrl,
+              ex.verifiedCanonicalUrl ?? cand.verifiedCanonicalUrl,
             registrationUrl: cand.registrationUrl ?? ex.registrationUrl,
             minTeamSize: finalMin ?? ex.minTeamSize,
             maxTeamSize: finalMax ?? ex.maxTeamSize,
-            fieldProvenanceJson: JSON.stringify(provenanceWithMeta),
+            fieldProvenanceJson: JSON.stringify(mergedProv),
             verificationStatus:
               (finalMin ?? ex.minTeamSize) !== null &&
               (finalMax ?? ex.maxTeamSize) !== null
@@ -2174,9 +2320,9 @@ export async function approveEventCandidateRecord(params: {
         .insert(schema.hackathons)
         .values({
           slug,
-          name: cand.title,
-          organizer: cand.organizer,
-          description: cand.description,
+          name: cleanHtmlToText(cand.title),
+          organizer: cleanHtmlToText(cand.organizer),
+          description: cleanHtmlToText(cand.description),
           eventType: finalType,
           matchable: finalMatchable,
           themesJson: cand.themesJson,
@@ -2200,7 +2346,7 @@ export async function approveEventCandidateRecord(params: {
             finalMin !== null && finalMax !== null
               ? 'verified'
               : 'unconfirmed_constraints',
-          status: 'published',
+          status: finalMatchable ? 'published' : 'archived',
           createdByUid: params.actorUid,
         })
         .returning();
@@ -2209,7 +2355,10 @@ export async function approveEventCandidateRecord(params: {
 
     const [updatedCand] = await db
       .update(schema.eventCandidates)
-      .set({ reviewStatus: 'approved' })
+      .set({
+        reviewStatus: 'approved',
+        duplicateOfHackathonSlug: existingTargetSlug ?? hackRow!.slug,
+      })
       .where(eq(schema.eventCandidates.candidateUid, params.candidateUid))
       .returning();
 
@@ -2265,111 +2414,272 @@ export async function createPublishedHackathonDirect(params: {
   sourceUrlStatus: SourceUrlVerificationStatus;
   sourceType?: EventSourceType;
   extractedAt?: string;
+  classificationReason?: string;
+  status?: EventLifecycleStatus;
   createdByUid: string;
 }): Promise<Hackathon> {
   try {
-    // Check if an existing published hackathon already represents this event
+    const cleanName = cleanHtmlToText(params.name);
+    const cleanOrganizer = cleanHtmlToText(params.organizer);
+    const cleanDesc = cleanHtmlToText(params.description);
+    const cleanVenue = params.venueName
+      ? cleanHtmlToText(params.venueName)
+      : null;
+
+    let cleanRegUrl = params.registrationUrl?.trim() || null;
+    if (cleanRegUrl) {
+      const lowerReg = cleanRegUrl.toLowerCase();
+      if (
+        lowerReg.includes('me-qr.com/page/blog') ||
+        (params.verifiedCanonicalUrl &&
+          cleanRegUrl === params.verifiedCanonicalUrl &&
+          lowerReg.includes('events.pes.edu/'))
+      ) {
+        cleanRegUrl = null;
+      }
+    }
+
+    const eligibleForCatalog = isEligibleTeamHackathonCatalogEvent({
+      name: cleanName,
+      description: cleanDesc,
+      eventType: params.eventType,
+      matchable: params.matchable,
+      themes: params.themes,
+      minTeamSize: params.minTeamSize,
+      maxTeamSize: params.maxTeamSize,
+    });
+
+    const resolvedMatchable = params.matchable && eligibleForCatalog;
+    const resolvedStatus: EventLifecycleStatus =
+      params.status ?? (resolvedMatchable ? 'published' : 'archived');
+
+    // Find all existing rows that match either the same real-world event OR the explicit slug
     const allPublished = await db.select().from(schema.hackathons);
-    const matchingExisting = allPublished.find(
+    const matchingRows = allPublished.filter(
       (h) =>
         (params.slug && h.slug === params.slug) ||
         areEventsSameRealWorldEvent(
           {
             title: h.name,
+            description: h.description,
             startAt: h.startAt,
+            endAt: h.endAt,
             organizer: h.organizer,
             verifiedCanonicalUrl: h.verifiedCanonicalUrl,
             originalSubmissionUrl: h.originalSubmissionUrl,
             registrationUrl: h.registrationUrl,
           },
           {
-            title: params.name,
+            title: cleanName,
+            description: cleanDesc,
             startAt: params.startAt,
-            organizer: params.organizer,
+            endAt: params.endAt,
+            organizer: cleanOrganizer,
             verifiedCanonicalUrl: params.verifiedCanonicalUrl,
-            originalSubmissionUrl: params.registrationUrl,
-            registrationUrl: params.registrationUrl,
+            originalSubmissionUrl: cleanRegUrl ?? params.verifiedCanonicalUrl,
+            registrationUrl: cleanRegUrl,
           }
         )
     );
 
+    // If multiple rows match (e.g. ADCOM 2027 across 11537 and 11523), prefer the one with the canonical conference/hackathon title
+    matchingRows.sort((a, b) => {
+      const aCanonicalTitle = /31st international advanced computing/i.test(
+        a.name
+      )
+        ? 1
+        : 0;
+      const bCanonicalTitle = /31st international advanced computing/i.test(
+        b.name
+      )
+        ? 1
+        : 0;
+      if (aCanonicalTitle !== bCanonicalTitle) {
+        return bCanonicalTitle - aCanonicalTitle;
+      }
+      return a.slug.localeCompare(b.slug);
+    });
+
+    const primaryExisting = matchingRows[0];
+    const secondaryDuplicates = matchingRows.slice(1);
+
     const slug =
-      matchingExisting?.slug ||
+      primaryExisting?.slug ||
       params.slug ||
-      `hack_${params.name
+      `hack_${cleanName
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')
         .slice(0, 32)}_${Date.now().toString(36)}`;
 
+    // Merge all official source URLs across primary, secondary duplicates, and incoming params
+    const existingProv = primaryExisting
+      ? safeJsonParse<Record<string, any>>(
+          primaryExisting.fieldProvenanceJson,
+          {}
+        )
+      : {};
+    const prevUrls = Array.isArray(existingProv?._meta?.allSourceUrls)
+      ? (existingProv._meta.allSourceUrls as string[])
+      : [];
+
+    const allSourceUrls = Array.from(
+      new Set(
+        [
+          ...prevUrls,
+          primaryExisting?.verifiedCanonicalUrl,
+          ...secondaryDuplicates.map((d) => d.verifiedCanonicalUrl),
+          params.verifiedCanonicalUrl,
+        ].filter((u): u is string => Boolean(u && u.trim()))
+      )
+    );
+
+    // Choose the best title & description when consolidating multi-page events
+    const finalName =
+      primaryExisting &&
+      /31st international advanced computing/i.test(primaryExisting.name) &&
+      !/31st international advanced computing/i.test(cleanName)
+        ? cleanHtmlToText(primaryExisting.name)
+        : cleanName;
+
+    const finalDesc =
+      primaryExisting &&
+      cleanHtmlToText(primaryExisting.description).length > cleanDesc.length &&
+      primaryExisting.slug !== params.slug
+        ? cleanHtmlToText(primaryExisting.description)
+        : cleanDesc;
+
+    const finalCanonicalUrl =
+      primaryExisting && primaryExisting.slug !== params.slug
+        ? (primaryExisting.verifiedCanonicalUrl ?? params.verifiedCanonicalUrl)
+        : (params.verifiedCanonicalUrl ?? primaryExisting?.verifiedCanonicalUrl ?? null);
+
+    const finalRegUrl =
+      cleanRegUrl ??
+      (primaryExisting?.registrationUrl &&
+      primaryExisting.registrationUrl !== primaryExisting.verifiedCanonicalUrl &&
+      !primaryExisting.registrationUrl.toLowerCase().includes('me-qr.com/page/blog')
+        ? primaryExisting.registrationUrl
+        : null);
+
     const nowIso = new Date().toISOString();
-    const provenanceJson = JSON.stringify({
+    const provenanceObj: Record<string, any> = {
+      ...existingProv,
       _meta: {
+        ...(existingProv._meta ?? {}),
         sourceType:
           params.sourceType ??
-          (params.verifiedCanonicalUrl?.includes('events.pes.edu')
+          (finalCanonicalUrl?.includes('events.pes.edu')
             ? 'pes_public_events'
             : 'submitted_public_url'),
-        sourceUrl:
-          params.verifiedCanonicalUrl ?? params.registrationUrl ?? 'manual',
+        sourceUrl: finalCanonicalUrl ?? finalRegUrl ?? 'manual',
+        allSourceUrls,
         extractedAt: params.extractedAt ?? nowIso,
         verifiedBy: params.createdByUid,
         verifiedAt: nowIso,
       },
-    });
+    };
+
+    for (const url of allSourceUrls) {
+      const key = `official_source_${url.replace(/[^a-zA-Z0-9]/g, '_').slice(-32)}`;
+      if (!provenanceObj[key]) {
+        provenanceObj[key] = {
+          sourceUrl: url,
+          sourceType: url.includes('events.pes.edu')
+            ? 'pes_public_events'
+            : (params.sourceType ?? 'submitted_public_url'),
+          excerpt: `Verified official event page (${url})`,
+          verifiedAt: nowIso,
+        };
+      }
+    }
+
+    const provenanceJson = JSON.stringify(provenanceObj);
 
     const [row] = await db
       .insert(schema.hackathons)
       .values({
         slug,
-        name: params.name,
-        organizer: params.organizer,
-        description: params.description,
+        name: finalName,
+        organizer: cleanOrganizer,
+        description: finalDesc,
         eventType: params.eventType,
-        matchable: params.matchable,
+        matchable: resolvedMatchable,
         themesJson: JSON.stringify(params.themes),
-        campus: params.campus,
-        venueName: params.venueName,
+        campus: params.campus ?? primaryExisting?.campus ?? null,
+        venueName: cleanVenue ?? primaryExisting?.venueName ?? null,
         format: params.format,
-        startAt: params.startAt,
-        endAt: params.endAt,
-        registrationDeadline: params.registrationDeadline,
-        originalSubmissionUrl: params.registrationUrl,
-        verifiedCanonicalUrl: params.verifiedCanonicalUrl,
-        registrationUrl: params.registrationUrl,
+        startAt: params.startAt ?? primaryExisting?.startAt ?? null,
+        endAt: params.endAt ?? primaryExisting?.endAt ?? null,
+        registrationDeadline:
+          params.registrationDeadline ??
+          primaryExisting?.registrationDeadline ??
+          null,
+        originalSubmissionUrl: finalRegUrl ?? finalCanonicalUrl,
+        verifiedCanonicalUrl: finalCanonicalUrl,
+        registrationUrl: finalRegUrl,
         sourceUrlStatus: params.sourceUrlStatus,
-        minTeamSize: params.minTeamSize,
-        maxTeamSize: params.maxTeamSize,
+        minTeamSize: params.minTeamSize ?? primaryExisting?.minTeamSize ?? null,
+        maxTeamSize: params.maxTeamSize ?? primaryExisting?.maxTeamSize ?? null,
         fieldProvenanceJson: provenanceJson,
-        ruleGatePassed: params.matchable,
-        classificationReason: 'Published verified event.',
+        ruleGatePassed: resolvedMatchable,
+        classificationReason:
+          params.classificationReason || 'Published verified event.',
         verificationStatus:
-          params.minTeamSize !== null && params.maxTeamSize !== null
+          (params.minTeamSize ?? primaryExisting?.minTeamSize ?? null) !==
+            null &&
+          (params.maxTeamSize ?? primaryExisting?.maxTeamSize ?? null) !== null
             ? 'verified'
             : 'unconfirmed_constraints',
-        status: 'published',
+        status: resolvedStatus,
         createdByUid: params.createdByUid,
       })
       .onConflictDoUpdate({
         target: schema.hackathons.slug,
         set: {
-          name: params.name,
-          organizer: params.organizer,
-          description: params.description,
+          name: finalName,
+          organizer: cleanOrganizer,
+          description: finalDesc,
           eventType: params.eventType,
-          matchable: params.matchable,
-          campus: params.campus,
-          venueName: params.venueName,
-          startAt: params.startAt,
-          endAt: params.endAt,
-          registrationDeadline: params.registrationDeadline,
-          verifiedCanonicalUrl: params.verifiedCanonicalUrl,
-          registrationUrl: params.registrationUrl,
-          minTeamSize: params.minTeamSize,
-          maxTeamSize: params.maxTeamSize,
+          matchable: resolvedMatchable,
+          themesJson: JSON.stringify(params.themes),
+          campus: params.campus ?? primaryExisting?.campus ?? null,
+          venueName: cleanVenue ?? primaryExisting?.venueName ?? null,
+          format: params.format,
+          startAt: params.startAt ?? primaryExisting?.startAt ?? null,
+          endAt: params.endAt ?? primaryExisting?.endAt ?? null,
+          registrationDeadline:
+            params.registrationDeadline ??
+            primaryExisting?.registrationDeadline ??
+            null,
+          verifiedCanonicalUrl: finalCanonicalUrl,
+          registrationUrl: finalRegUrl,
+          minTeamSize:
+            params.minTeamSize ?? primaryExisting?.minTeamSize ?? null,
+          maxTeamSize:
+            params.maxTeamSize ?? primaryExisting?.maxTeamSize ?? null,
           fieldProvenanceJson: provenanceJson,
+          ruleGatePassed: resolvedMatchable,
+          classificationReason:
+            params.classificationReason || 'Published verified event.',
+          status: resolvedStatus,
         },
       })
       .returning();
+
+    // Archive any secondary duplicate rows in DB so duplicate rows don't remain active
+    for (const dup of secondaryDuplicates) {
+      if (dup.slug !== slug) {
+        await db
+          .update(schema.hackathons)
+          .set({
+            status: 'archived',
+            matchable: false,
+            classificationReason: `Consolidated duplicate into ${slug}`,
+          })
+          .where(eq(schema.hackathons.slug, dup.slug))
+          .catch(() => {});
+      }
+    }
 
     return mapDbHackathonToDomain(row);
   } catch (error) {

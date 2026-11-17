@@ -8,6 +8,11 @@ import {
   extractPublicEventPreview,
 } from '../src/services/adapters.ts';
 
+import {
+  assertIntegrationTestGuard,
+  runTestArtifactsCleanup,
+} from '../src/db/testCleanup.ts';
+
 let serverInstance: http.Server;
 let baseUrl = '';
 
@@ -19,6 +24,7 @@ function createBase64UrlJwt(payload: Record<string, unknown>): string {
 }
 
 test.before(async () => {
+  assertIntegrationTestGuard();
   await new Promise<void>((resolve) => {
     serverInstance = app.listen(0, '127.0.0.1', () => {
       const addr = serverInstance.address();
@@ -35,6 +41,11 @@ test.after(async () => {
   await new Promise<void>((resolve) => {
     serverInstance.close(() => resolve());
   });
+  try {
+    await runTestArtifactsCleanup({ execute: true });
+  } catch (cleanupErr) {
+    console.error('[Integration Test Teardown] Cleanup warning:', cleanupErr);
+  }
   try {
     const { pool } = await import('../src/db/index.ts');
     await pool.end();
@@ -2501,14 +2512,14 @@ test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction,
 
   const mockBrowseHackathonHtml = `
     <div class="tickets-grid">
-      <div class="ticket grid-ticket" data-href="/11629/">
+      <div class="ticket grid-ticket" data-href="/99911/">
         <div class="ticket-status status-upcoming">Upcoming</div>
         <div class="ticket-tags"><span>#Hackathon</span><span>#Technical</span></div>
-        <h3>Kodikon 5.0 — 24-Hour National Hackathon</h3>
+        <h3>QuackTest Sprint — 24-Hour National Hackathon</h3>
         <p>Annual 24-hour national level hackathon at PES University RR Campus.</p>
         <div class="ticket-facts"><span><b>Sat, 07 Nov 2026</b></span></div>
       </div>
-      <div class="ticket grid-ticket" data-href="/11632/">
+      <div class="ticket grid-ticket" data-href="/99912/">
         <div class="ticket-status status-upcoming">Upcoming</div>
         <div class="ticket-tags"><span>#Talks</span><span>#InfoSession</span></div>
         <h3>Expert Talk on Quantum Cryptography &amp; Career Pathways</h3>
@@ -2518,14 +2529,14 @@ test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction,
     </div>
   `;
 
-  const mockDetail11629Html = `
+  const mockDetail99911Html = `
     <html>
       <head>
-        <title>Kodikon 5.0 — 24-Hour National Hackathon | PES Events</title>
-        <link rel="canonical" href="https://events.pes.edu/11629/" />
+        <title>QuackTest Sprint — 24-Hour National Hackathon | PES Events</title>
+        <link rel="canonical" href="https://events.pes.edu/99911/" />
       </head>
       <body>
-        <h1 class="bt-title">Kodikon 5.0 — 24-Hour National Hackathon</h1>
+        <h1 class="bt-title">QuackTest Sprint — 24-Hour National Hackathon</h1>
         <div class="bt-campus-name">PESU RR Campus</div>
         <div class="bt-fact-label">Date</div>
         <div class="bt-fact-value">Sat, 07 Nov 2026 – 08 Nov 2026</div>
@@ -2535,16 +2546,16 @@ test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction,
         <div class="bt-fact-value">Embrione &amp; Department of CSE</div>
         <div id="eventBody">
           <div class="rich-text">
-            Join Kodikon 5.0 for a 24-hour build sprint! Teams of 3 to 4 students are eligible.
+            Join QuackTest Sprint for a 24-hour build sprint! Teams of 3 to 4 students are eligible.
             Registration deadline: 04 Nov 2026.
-            <a href="https://unstop.com/hackathons/kodikon-5-pes-university">Register Here</a>
+            <a href="https://unstop.com/hackathons/quacktest-sprint-pes-university">Register Here</a>
           </div>
         </div>
       </body>
     </html>
   `;
 
-  const mockDetail11632Html = `
+  const mockDetail99912Html = `
     <html>
       <head><title>Expert Talk on Quantum Cryptography | PES Events</title></head>
       <body>
@@ -2579,14 +2590,14 @@ test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction,
           headers: { 'Content-Type': 'text/html' },
         });
       }
-      if (url === 'https://events.pes.edu/11629/') {
-        return new Response(mockDetail11629Html, {
+      if (url === 'https://events.pes.edu/99911/') {
+        return new Response(mockDetail99911Html, {
           status: 200,
           headers: { 'Content-Type': 'text/html' },
         });
       }
-      if (url === 'https://events.pes.edu/11632/') {
-        return new Response(mockDetail11632Html, {
+      if (url === 'https://events.pes.edu/99912/') {
+        return new Response(mockDetail99912Html, {
           status: 200,
           headers: { 'Content-Type': 'text/html' },
         });
@@ -2595,18 +2606,18 @@ test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction,
     },
   });
 
-  // 1. Test direct URL extraction on events.pes.edu/11629/
+  // 1. Test direct URL extraction on events.pes.edu/99911/
   const extractRes = await fetch(`${baseUrl}/api/events/extract-url`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: 'https://events.pes.edu/11629/' }),
+    body: JSON.stringify({ url: 'https://events.pes.edu/99911/' }),
   });
   const extractData = await extractRes.json();
   assert.equal(extractRes.status, 200);
   assert.equal(extractData.ok, true);
   assert.equal(
     extractData.data.title,
-    'Kodikon 5.0 — 24-Hour National Hackathon'
+    'QuackTest Sprint — 24-Hour National Hackathon'
   );
   assert.equal(extractData.data.organizer, 'Embrione & Department of CSE');
   assert.equal(extractData.data.eventType, 'hackathon');
@@ -2619,7 +2630,7 @@ test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction,
   assert.equal(extractData.data.maxTeamSize, 4);
   assert.equal(
     extractData.data.registrationUrl,
-    'https://unstop.com/hackathons/kodikon-5-pes-university'
+    'https://unstop.com/hackathons/quacktest-sprint-pes-university'
   );
 
   // 2. Test sync-pesu-public endpoint
@@ -2632,34 +2643,39 @@ test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction,
   assert.equal(syncRes.status, 200);
   assert.equal(syncData.ok, true);
   assert.equal(syncData.discoveredCount, 2);
-  assert.equal(syncData.publishedOrUpdatedCount, 2);
-
-  const syncedKodikon = syncData.hackathons.find(
-    (h: { id: string }) => h.id === 'pes_event_11629'
-  );
-  const syncedTalk = syncData.hackathons.find(
-    (h: { id: string }) => h.id === 'pes_event_11632'
-  );
-
-  assert.ok(syncedKodikon, 'Kodikon hackathon should be published');
-  assert.equal(syncedKodikon.sourceType, 'pes_public_events');
-  assert.equal(syncedKodikon.eventType, 'hackathon');
-  assert.equal(syncedKodikon.matchable, true);
-  assert.equal(syncedKodikon.startAt, '2026-11-07');
-  assert.equal(syncedKodikon.endAt, '2026-11-08');
-
-  assert.ok(syncedTalk, 'Expert Talk should be recorded with accurate classification');
-  assert.equal(syncedTalk.sourceType, 'pes_public_events');
   assert.equal(
-    syncedTalk.eventType,
-    'tech_talk',
-    'Expert Talk with #Talks/#InfoSession must NEVER be classified as a hackathon'
+    syncData.publishedOrUpdatedCount,
+    1,
+    'Only the eligible team hackathon is published to the student-facing Hackathons catalog'
   );
+
+  const syncedHackathon = syncData.hackathons.find(
+    (h: { id: string }) => h.id === 'pes_event_99911'
+  );
+  const syncedTalkInCatalog = syncData.hackathons.find(
+    (h: { id: string }) => h.id === 'pes_event_99912'
+  );
+
+  assert.ok(syncedHackathon, 'Team hackathon should be published in Hackathons catalog');
+  assert.equal(syncedHackathon.sourceType, 'pes_public_events');
+  assert.equal(syncedHackathon.eventType, 'hackathon');
+  assert.equal(syncedHackathon.matchable, true);
+  assert.equal(syncedHackathon.startAt, '2026-11-07');
+  assert.equal(syncedHackathon.endAt, '2026-11-08');
+
   assert.equal(
-    syncedTalk.matchable,
-    false,
-    'Talks must have matchable = false'
+    syncedTalkInCatalog,
+    undefined,
+    'Expert Talk must be excluded from the student-facing Hackathons catalog'
   );
+
+  const [storedTalkRow] = await db
+    .select()
+    .from(hackathons)
+    .where(eq(hackathons.slug, 'pes_event_99912'));
+  assert.ok(storedTalkRow, 'Expert Talk should be recorded in DB with accurate classification');
+  assert.equal(storedTalkRow.eventType, 'tech_talk');
+  assert.equal(storedTalkRow.matchable, false);
 
   // 3. Test unreachable events.pes.edu handling (never fabricates fake events)
   simulateUnreachable = true;
@@ -2677,16 +2693,16 @@ test('30. Public PESU events (events.pes.edu): HTML listing & detail extraction,
   // Cleanup
   await db
     .delete(hackathons)
-    .where(eq(hackathons.slug, 'pes_event_11629'));
+    .where(eq(hackathons.slug, 'pes_event_99911'));
   await db
     .delete(hackathons)
-    .where(eq(hackathons.slug, 'pes_event_11632'));
+    .where(eq(hackathons.slug, 'pes_event_99912'));
   await db
     .delete(eventCandidates)
-    .where(eq(eventCandidates.candidateUid, 'cand_pes_public_11629'));
+    .where(eq(eventCandidates.candidateUid, 'cand_pes_public_99911'));
   await db
     .delete(eventCandidates)
-    .where(eq(eventCandidates.candidateUid, 'cand_pes_public_11632'));
+    .where(eq(eventCandidates.candidateUid, 'cand_pes_public_99912'));
 });
 
 test('31. Cross-source duplicate & update detection + announcement-to-candidate privacy sanitization & admin approval workflow', async () => {
@@ -4354,9 +4370,336 @@ test('36. PESU Announcements HTML 403 upstream error handling (PROVIDER_UNAVAILA
   }
 });
 
+test('37. Event deduplication, idempotent & concurrent synchronization, conference/summit/talk exclusion, edition preservation, and 5-state registration verification', async () => {
+  const {
+    areEventsSameRealWorldEvent,
+    classifyGroundedEvent,
+    getVerifiableRegistrationStatus,
+    isEligibleTeamHackathonCatalogEvent,
+  } = await import('../src/lib/eventsAndAnnouncements.ts');
+  const { db } = await import('../src/db/index.ts');
+  const { hackathons, eventCandidates } = await import('../src/db/schema.ts');
+  const { inArray } = await import('drizzle-orm');
 
+  // 1. Test startup guard rejects production / missing QUACKATHON_TEST_MODE
+  const prevNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = 'production';
+    assert.throws(
+      () => assertIntegrationTestGuard(),
+      /Refusing to run integration tests in NODE_ENV=production/
+    );
+  } finally {
+    process.env.NODE_ENV = prevNodeEnv;
+  }
 
+  // 2. Verify ADCOM 2027 multi-page conference deduplication & classification
+  const adcom1 = classifyGroundedEvent({
+    title: '30th International Conference on Advanced Computing and Communications (ADCOM 2027)',
+    description: 'Call for papers and conference keynote sessions at PES University.',
+    tags: ['Conferences', 'Technical'],
+  });
+  const adcom2 = classifyGroundedEvent({
+    title: 'ADCOM 2027',
+    description: '30th International Conference on Advanced Computing and Communications.',
+    tags: ['Conferences'],
+  });
+  assert.equal(adcom1.eventType, 'conference');
+  assert.equal(adcom1.matchable, false);
+  assert.equal(adcom2.eventType, 'conference');
+  assert.equal(
+    areEventsSameRealWorldEvent(
+      {
+        title: '30th International Conference on Advanced Computing and Communications (ADCOM 2027)',
+        startAt: '2027-11-19',
+        endAt: '2027-11-21',
+        organizer: 'Department of CSE',
+        verifiedCanonicalUrl: 'https://events.pes.edu/11537/',
+      },
+      {
+        title: 'ADCOM 2027',
+        startAt: '2027-11-19',
+        endAt: '2027-11-21',
+        organizer: 'Department of CSE',
+        verifiedCanonicalUrl: 'https://events.pes.edu/11523/',
+      }
+    ),
+    true,
+    'The two ADCOM 2027 pages must be recognized as the same real-world conference'
+  );
 
+  // 3. Verify separate editions of recurring hackathons are NEVER merged
+  assert.equal(
+    areEventsSameRealWorldEvent(
+      {
+        title: 'Kodikon 5.0',
+        startAt: '2025-11-15',
+        organizer: 'Embrione',
+        verifiedCanonicalUrl: 'https://events.pes.edu/11441/',
+      },
+      {
+        title: 'KODIKON 6.0',
+        startAt: '2026-11-07',
+        organizer: 'Embrione',
+        verifiedCanonicalUrl: 'https://events.pes.edu/11632/',
+      }
+    ),
+    false,
+    'Different editions (Kodikon 5.0 vs KODIKON 6.0) must remain separate events'
+  );
+  assert.equal(
+    areEventsSameRealWorldEvent(
+      {
+        title: 'Nimbus 1000',
+        startAt: '2025-03-14',
+        organizer: 'Cloud Club',
+      },
+      {
+        title: 'Nimbus 2000',
+        startAt: '2026-04-04',
+        organizer: 'Cloud Club',
+      }
+    ),
+    false,
+    'Different editions (Nimbus 1000 vs Nimbus 2000) must remain separate events'
+  );
 
+  // 4. Verify classification & Hackathon-Only catalog eligibility for key PESU events
+  const robofestClass = classifyGroundedEvent({
+    title: 'Robofest 5.0 (ReRo Online Hackathon)',
+    description: '24-hour online robotics & autonomy hackathon for student teams.',
+    tags: ['Hackathon', 'Technical'],
+  });
+  assert.equal(robofestClass.eventType, 'hackathon');
+  assert.equal(robofestClass.matchable, true);
+  assert.equal(
+    isEligibleTeamHackathonCatalogEvent({
+      name: 'Robofest 5.0 (ReRo Online Hackathon)',
+      eventType: robofestClass.eventType,
+      matchable: robofestClass.matchable,
+      minTeamSize: null,
+      maxTeamSize: null,
+    }),
+    true,
+    'Robofest 5.0 (ReRo Online Hackathon) must be included in the Hackathons catalog'
+  );
 
+  const techLawSummit = classifyGroundedEvent({
+    title: 'Technology Law and Intellectual Property Law Summit 2026',
+    description: 'National legal summit and panel discussion.',
+    tags: ['Conferences'],
+  });
+  assert.equal(techLawSummit.eventType, 'conference');
+  assert.equal(techLawSummit.matchable, false);
+  assert.equal(
+    isEligibleTeamHackathonCatalogEvent({
+      name: 'Technology Law and Intellectual Property Law Summit 2026',
+      eventType: techLawSummit.eventType,
+      matchable: techLawSummit.matchable,
+    }),
+    false,
+    'Technology Law Summit must be excluded from the Hackathons catalog'
+  );
 
+  const proofOfThought = classifyGroundedEvent({
+    title: 'Proof of Thought',
+    description: 'An interactive research-focused academic session and seminar.',
+    tags: ['Hackathon', 'Technical'],
+  });
+  assert.equal(proofOfThought.eventType, 'tech_talk');
+  assert.equal(proofOfThought.matchable, false);
+
+  const kalavaibhava = classifyGroundedEvent({
+    title: 'Kalavaibhava',
+    description: 'Classical dance and cultural showcase.',
+    tags: ['Cultural', 'Dance'],
+  });
+  assert.equal(kalavaibhava.eventType, 'other');
+  assert.equal(kalavaibhava.matchable, false);
+
+  // 5. Verify 5 distinct registration status states in getVerifiableRegistrationStatus
+  const nowRefYmd = '2026-04-10';
+  const openConfirmed = getVerifiableRegistrationStatus(
+    {
+      startAt: '2026-05-01',
+      endAt: '2026-05-02',
+      registrationConfirmedOpen: true,
+      registrationUrl: 'https://forms.gle/pesu-hack-reg',
+      verifiedCanonicalUrl: 'https://events.pes.edu/11632/',
+    },
+    nowRefYmd
+  );
+  assert.equal(openConfirmed.status, 'open_confirmed');
+
+  const deadlineKnown = getVerifiableRegistrationStatus(
+    {
+      startAt: '2026-05-01',
+      endAt: '2026-05-02',
+      registrationDeadline: '2026-04-25',
+      registrationUrl: 'https://events.pes.edu/11632/', // Bare PESU page URL is NOT a dedicated form
+      verifiedCanonicalUrl: 'https://events.pes.edu/11632/',
+    },
+    nowRefYmd
+  );
+  assert.equal(deadlineKnown.status, 'deadline_known');
+
+  const linkAvailable = getVerifiableRegistrationStatus(
+    {
+      startAt: '2026-05-01',
+      endAt: '2026-05-02',
+      registrationDeadline: null,
+      registrationUrl: 'https://unstop.com/hackathons/pesu-build',
+      verifiedCanonicalUrl: 'https://events.pes.edu/11632/',
+    },
+    nowRefYmd
+  );
+  assert.equal(linkAvailable.status, 'link_available');
+
+  const detailsUnknown = getVerifiableRegistrationStatus(
+    {
+      startAt: '2026-05-01',
+      endAt: '2026-05-02',
+      registrationDeadline: null,
+      registrationUrl: 'https://events.pes.edu/11632/',
+      verifiedCanonicalUrl: 'https://events.pes.edu/11632/',
+    },
+    nowRefYmd
+  );
+  assert.equal(detailsUnknown.status, 'unknown');
+
+  const closedEvent = getVerifiableRegistrationStatus(
+    {
+      startAt: '2025-11-01',
+      endAt: '2025-11-02',
+      registrationDeadline: '2025-10-28',
+      registrationUrl: 'https://forms.gle/past-event',
+    },
+    nowRefYmd
+  );
+  assert.equal(closedEvent.status, 'ended');
+
+  // 6. Test repeated & concurrent sync idempotency + multi-page consolidation via /api/events/sync-pesu-public
+  const mockListingHtml = `
+    <div class="tickets-grid">
+      <div class="ticket grid-ticket" data-href="/99921/">
+        <div class="ticket-status status-upcoming">Upcoming</div>
+        <div class="ticket-tags"><span>#Hackathon</span></div>
+        <h3>QuackIdempotent Buildathon 2026</h3>
+        <div class="ticket-facts"><span><b>Sat, 14 Nov 2026</b></span></div>
+      </div>
+      <div class="ticket grid-ticket" data-href="/99922/">
+        <div class="ticket-status status-upcoming">Upcoming</div>
+        <div class="ticket-tags"><span>#Hackathon</span></div>
+        <h3>QuackIdempotent Buildathon 2026 (Official Page 2)</h3>
+        <div class="ticket-facts"><span><b>Sat, 14 Nov 2026</b></span></div>
+      </div>
+    </div>
+  `;
+
+  const mockDetailPage = (id: string) => `
+    <html>
+      <head>
+        <title>QuackIdempotent Buildathon 2026 | PES Events</title>
+        <link rel="canonical" href="https://events.pes.edu/${id}/" />
+      </head>
+      <body>
+        <h1 class="bt-title">QuackIdempotent Buildathon 2026</h1>
+        <div class="bt-campus-name">PESU RR Campus</div>
+        <div class="bt-fact-label">Date</div>
+        <div class="bt-fact-value">Sat, 14 Nov 2026 – 15 Nov 2026</div>
+        <div class="bt-fact-label">Hosted by</div>
+        <div class="bt-fact-value">PES Innovation Lab</div>
+        <div id="eventBody">
+          <div class="rich-text">
+            24-hour hardware and software buildathon for teams of 2 to 4 students.
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.startsWith('https://events.pes.edu/browse/')) {
+        return new Response(mockListingHtml, {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      if (url === 'https://events.pes.edu/99921/') {
+        return new Response(mockDetailPage('99921'), {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      if (url === 'https://events.pes.edu/99922/') {
+        return new Response(mockDetailPage('99922'), {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      return new Response('Not Found', { status: 404 });
+    },
+  });
+
+  try {
+    // Run 3 concurrent sync requests followed by another forced sync
+    const [resA, resB, resC] = await Promise.all([
+      fetch(`${baseUrl}/api/events/sync-pesu-public`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceRefresh: true }),
+      }),
+      fetch(`${baseUrl}/api/events/sync-pesu-public`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceRefresh: true }),
+      }),
+      fetch(`${baseUrl}/api/events/sync-pesu-public`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceRefresh: true }),
+      }),
+    ]);
+    assert.equal(resA.status, 200);
+    assert.equal(resB.status, 200);
+    assert.equal(resC.status, 200);
+
+    const resRepeat = await fetch(`${baseUrl}/api/events/sync-pesu-public`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forceRefresh: true }),
+    });
+    const repeatData = await resRepeat.json();
+    assert.equal(resRepeat.status, 200);
+
+    const matchingCards = repeatData.hackathons.filter((h: { name: string }) =>
+      h.name.includes('QuackIdempotent Buildathon 2026')
+    );
+    assert.equal(
+      matchingCards.length,
+      1,
+      'Repeated and concurrent sync of two duplicate official pages must produce exactly 1 published card'
+    );
+    assert.ok(
+      Array.isArray(matchingCards[0].sourceIds) &&
+        matchingCards[0].sourceIds.includes('https://events.pes.edu/99921/') &&
+        matchingCards[0].sourceIds.includes('https://events.pes.edu/99922/'),
+      'Consolidated card must retain both official source URLs in sourceIds'
+    );
+  } finally {
+    resetServerTestOverrides();
+    await db
+      .delete(hackathons)
+      .where(inArray(hackathons.slug, ['pes_event_99921', 'pes_event_99922']));
+    await db
+      .delete(eventCandidates)
+      .where(
+        inArray(eventCandidates.candidateUid, [
+          'cand_pes_public_99921',
+          'cand_pes_public_99922',
+        ])
+      );
+  }
+});

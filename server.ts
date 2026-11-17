@@ -5235,6 +5235,10 @@ app.get(
 // ============================================================================
 const PESU_PUBLIC_SOURCE_URLS = [
   'https://events.pes.edu/browse/?tag=hackathon',
+  'https://events.pes.edu/browse/?q=hackathon',
+  'https://events.pes.edu/browse/?q=ideathon',
+  'https://events.pes.edu/browse/?q=ctf',
+  'https://events.pes.edu/browse/?tag=coding',
   'https://events.pes.edu/browse/?status=upcoming',
   'https://events.pes.edu/browse/?department=computer-science',
 ];
@@ -5349,7 +5353,7 @@ export async function syncPublicPesuEventsCatalog(options?: {
 
     const discoveredCards = Array.from(listingMap.values());
     let publishedOrUpdatedCount = 0;
-    let stagedForReviewCount = 0;
+    const stagedForReviewCount = 0;
     let duplicatesSkippedCount = 0;
 
     // Fetch all discovered detail pages (bounded by MAX_PESU_DETAIL_EVENTS = 60, removing the old 10-event cap)
@@ -5364,7 +5368,9 @@ export async function syncPublicPesuEventsCatalog(options?: {
       const resolvedOrganizer =
         detail?.organizer || card.organizer || 'PES University';
       const resolvedDescription =
-        detail?.description || card.summary || `Official event listed on ${card.detailUrl}`;
+        detail?.description ||
+        card.summary ||
+        `Official event listed on ${card.detailUrl}`;
       const resolvedStartAt = detail?.startAt ?? card.startAt ?? null;
       const resolvedEndAt = detail?.endAt ?? card.endAt ?? resolvedStartAt;
       const resolvedDeadline = detail?.registrationDeadline ?? null;
@@ -5384,8 +5390,13 @@ export async function syncPublicPesuEventsCatalog(options?: {
           : card.tags.length > 0
             ? card.tags.map((t) => t.replace(/^#/, ''))
             : ['PESU Event'];
-      const resolvedRegUrl = detail?.registrationUrl || card.detailUrl;
+      const resolvedRegUrl = detail?.registrationUrl ?? null;
       const canonicalUrl = detail?.canonicalUrl || card.detailUrl;
+      const resolvedReason =
+        detail?.classificationReason ||
+        `Classified from events.pes.edu tags (${card.tags.join(', ') || resolvedEventType}).`;
+
+      const targetSlug = `pes_event_${card.eventId}`;
 
       // Stage record in event_candidates for provenance and admin review auditability
       const staged = await createEventCandidateRecord({
@@ -5436,22 +5447,17 @@ export async function syncPublicPesuEventsCatalog(options?: {
         classification: {
           ruleGatePassed: resolvedMatchable,
           mlScore: resolvedMatchable ? 1 : 0,
-          reason:
-            detail?.classificationReason ||
-            `Classified from events.pes.edu tags (${card.tags.join(', ') || resolvedEventType}).`,
+          reason: resolvedReason,
         },
-        reviewStatus: 'approved',
+        reviewStatus: resolvedMatchable ? 'approved' : 'rejected',
         warnings: [],
         lastSeenAt: fetchedAt,
       });
 
-      if (staged.duplicateOfHackathonId && !staged.updatesExistingHackathonId) {
-        duplicatesSkippedCount++;
-      }
-
       // Publish/update verified official events.pes.edu listing in hackathons table
-      await createPublishedHackathonDirect({
-        slug: `pes_event_${card.eventId}`,
+      // (Non-hackathon events are stored with matchable: false, status: 'archived' so they never pollute the student Hackathons discovery feed)
+      const persisted = await createPublishedHackathonDirect({
+        slug: targetSlug,
         name: resolvedTitle,
         organizer: resolvedOrganizer,
         description: resolvedDescription,
@@ -5476,9 +5482,22 @@ export async function syncPublicPesuEventsCatalog(options?: {
         sourceUrlStatus: 'verified',
         sourceType: 'pes_public_events',
         extractedAt: fetchedAt,
+        classificationReason: resolvedReason,
+        status: resolvedMatchable ? 'published' : 'archived',
         createdByUid: options?.actorUid || 'system_pes_events_sync',
       });
-      publishedOrUpdatedCount++;
+
+      const isCrossPageDuplicate =
+        persisted.id !== targetSlug ||
+        (staged.duplicateOfHackathonId &&
+          staged.duplicateOfHackathonId !== targetSlug &&
+          !staged.updatesExistingHackathonId);
+
+      if (isCrossPageDuplicate) {
+        duplicatesSkippedCount++;
+      } else if (persisted.matchable) {
+        publishedOrUpdatedCount++;
+      }
     }
 
     const syncResponse: PesuPublicEventsSyncResponse = {
@@ -5491,7 +5510,7 @@ export async function syncPublicPesuEventsCatalog(options?: {
       publishedOrUpdatedCount,
       stagedForReviewCount,
       duplicatesSkippedCount,
-      userMessage: `Synced ${publishedOrUpdatedCount} public PESU event(s) from events.pes.edu (${reachablePagesCount}/${checkedBrowseUrls.length} listing pages reachable).`,
+      userMessage: `Synced ${publishedOrUpdatedCount} eligible PESU hackathon(s) from events.pes.edu (${reachablePagesCount}/${checkedBrowseUrls.length} listing pages reachable).`,
       warnings,
     };
 
