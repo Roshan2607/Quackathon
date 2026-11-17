@@ -323,6 +323,10 @@ const CORE_HACKATHON_ROLES = [
   'Cybersecurity / CTF',
 ];
 
+function normalizeControlledTag(tag: string): string {
+  return String(tag || '').toLowerCase().trim();
+}
+
 function normalizeRoleBucket(role: string): string {
   const lower = role.trim().toLowerCase();
   if (/front|react|ui\s*dev|web|next|tailwind/i.test(lower)) return 'Frontend / UI';
@@ -338,32 +342,53 @@ function normalizeRoleBucket(role: string): string {
 
 export function computeTeamCombinedCapabilities(params: {
   viewerUid: string;
+  viewerProfile?: Profile;
   hackathon: Hackathon;
-  profiles: Record<string, Profile>;
+  profiles?: Record<string, Profile>;
+  allProfiles?: Profile[] | Record<string, Profile>;
   participations?: Participation[];
   teams?: Team[];
+  allTeams?: Team[];
   memberships?: Membership[];
+  allMemberships?: Membership[];
 }): {
   activeTeam: Team | undefined;
   teamMemberUids: string[];
+  memberCount: number;
+  maxCapacity: number;
   combinedSkills: string[];
   combinedNormalizedSkills: Set<string>;
   combinedRoles: string[];
   combinedNormalizedRoles: Set<string>;
+  combinedDomains: string[];
   missingRoles: string[];
   desiredCapabilities: string[];
 } {
   const {
     viewerUid,
+    viewerProfile,
     hackathon,
-    profiles,
     participations = [],
-    teams = [],
-    memberships = [],
   } = params;
+  const teams = params.teams ?? params.allTeams ?? [];
+  const memberships = params.memberships ?? params.allMemberships ?? [];
+  const profiles: Record<string, Profile> = params.profiles
+    ? { ...params.profiles }
+    : Array.isArray(params.allProfiles)
+      ? Object.fromEntries(params.allProfiles.map((p) => [p.uid, p]))
+      : { ...(params.allProfiles ?? {}) };
+  if (viewerProfile && viewerUid && !profiles[viewerUid]) {
+    profiles[viewerUid] = viewerProfile;
+  }
 
+  const hackathonTeamIds = new Set(
+    teams.filter((t) => t.hackathonId === hackathon.id).map((t) => t.id)
+  );
   const viewerMembership = memberships.find(
-    (m) => m.hackathonId === hackathon.id && m.uid === viewerUid && m.status === 'active'
+    (m) =>
+      m.uid === viewerUid &&
+      m.status === 'active' &&
+      (m.hackathonId === hackathon.id || (!m.hackathonId && hackathonTeamIds.has(m.teamId)))
   );
   const activeTeam = viewerMembership
     ? teams.find((t) => t.id === viewerMembership.teamId && t.hackathonId === hackathon.id)
@@ -376,12 +401,7 @@ export function computeTeamCombinedCapabilities(params: {
         new Set([
           activeTeam.leaderId,
           ...memberships
-            .filter(
-              (m) =>
-                m.hackathonId === hackathon.id &&
-                m.teamId === activeTeam.id &&
-                m.status === 'active'
-            )
+            .filter((m) => m.teamId === activeTeam.id && m.status === 'active')
             .map((m) => m.uid),
         ])
       )
@@ -391,6 +411,8 @@ export function computeTeamCombinedCapabilities(params: {
   const combinedNormalizedSkills = new Set<string>();
   const combinedRolesList: string[] = [];
   const combinedNormalizedRoles = new Set<string>();
+  const combinedDomainsList: string[] = [];
+  const combinedNormalizedDomains = new Set<string>();
 
   for (const memberUid of teamMemberUids) {
     const prof = profiles[memberUid];
@@ -420,6 +442,18 @@ export function computeTeamCombinedCapabilities(params: {
         combinedRolesList.push(bucket);
       }
     }
+
+    const memberDomains = [
+      ...(prof?.interestTags ?? []),
+      ...(prof?.projectDomains ?? []),
+    ];
+    for (const d of memberDomains) {
+      const normD = normalizeControlledTag(d);
+      if (normD && !combinedNormalizedDomains.has(normD)) {
+        combinedNormalizedDomains.add(normD);
+        combinedDomainsList.push(d.trim());
+      }
+    }
   }
 
   // Determine missing roles & desired capabilities for the hackathon + team
@@ -429,7 +463,7 @@ export function computeTeamCombinedCapabilities(params: {
     'AI / ML',
     'Product & UI/UX',
   ]);
-  for (const theme of hackathon.themes) {
+  for (const theme of hackathon.themes ?? []) {
     if (/ai|ml|data|llm/i.test(theme)) targetRoles.add('AI / ML');
     if (/iot|hardware|robot/i.test(theme)) targetRoles.add('Hardware / IoT');
     if (/cyber|ctf|security/i.test(theme)) targetRoles.add('Cybersecurity / CTF');
@@ -437,7 +471,7 @@ export function computeTeamCombinedCapabilities(params: {
     if (/mobile|app/i.test(theme)) targetRoles.add('Mobile');
   }
   if (activeTeam) {
-    for (const needed of activeTeam.rolesNeeded) {
+    for (const needed of activeTeam.rolesNeeded ?? []) {
       targetRoles.add(normalizeRoleBucket(needed));
     }
   }
@@ -456,14 +490,28 @@ export function computeTeamCombinedCapabilities(params: {
     ])
   );
 
+  const eventMax =
+    hackathon.maxTeamSize && hackathon.maxTeamSize > 0
+      ? Math.min(4, hackathon.maxTeamSize)
+      : 4;
+  const maxCapacity = activeTeam
+    ? Math.min(eventMax, activeTeam.targetSize || eventMax)
+    : eventMax;
+
   return {
     activeTeam,
     teamMemberUids,
+    memberCount: activeTeam ? Math.max(activeTeam.memberCount, teamMemberUids.length) : 1,
+    maxCapacity,
     combinedSkills: combinedSkillsList,
     combinedNormalizedSkills,
     combinedRoles: combinedRolesList,
     combinedNormalizedRoles,
-    missingRoles: missingRoles.length > 0 ? missingRoles : CORE_HACKATHON_ROLES.filter((r) => !combinedNormalizedRoles.has(r.toLowerCase())).slice(0, 3),
+    combinedDomains: combinedDomainsList,
+    missingRoles:
+      missingRoles.length > 0
+        ? missingRoles
+        : CORE_HACKATHON_ROLES.filter((r) => !combinedNormalizedRoles.has(r.toLowerCase())).slice(0, 3),
     desiredCapabilities,
   };
 }
@@ -511,12 +559,22 @@ function getEligibleCandidateUsers(params: {
     hackathon.maxTeamSize && hackathon.maxTeamSize > 0 ? hackathon.maxTeamSize : 4
   );
 
+  const teamById = new Map<string, Team>();
+  for (const t of teams) {
+    if (t.hackathonId === hackathon.id) {
+      teamById.set(t.id, t);
+    }
+  }
+
   // Check if viewer is already in an active team for this hackathon
   const viewerMembership = memberships.find(
-    (m) => m.hackathonId === hackathon.id && m.uid === viewerUid && m.status === 'active'
+    (m) =>
+      m.uid === viewerUid &&
+      m.status === 'active' &&
+      (m.hackathonId === hackathon.id || (!m.hackathonId && teamById.has(m.teamId)))
   );
   const viewerTeam = viewerMembership
-    ? teams.find((t) => t.id === viewerMembership.teamId && t.hackathonId === hackathon.id)
+    ? teamById.get(viewerMembership.teamId)
     : teams.find(
         (t) => t.hackathonId === hackathon.id && t.leaderId === viewerUid && t.status !== 'locked'
       );
@@ -536,12 +594,7 @@ function getEligibleCandidateUsers(params: {
       ? [
           viewerTeam.leaderId,
           ...memberships
-            .filter(
-              (m) =>
-                m.hackathonId === hackathon.id &&
-                m.teamId === viewerTeam.id &&
-                m.status === 'active'
-            )
+            .filter((m) => m.teamId === viewerTeam.id && m.status === 'active')
             .map((m) => m.uid),
         ]
       : [viewerUid]
@@ -570,15 +623,11 @@ function getEligibleCandidateUsers(params: {
 
   const activeMembershipByUid = new Map<string, Membership>();
   for (const m of memberships) {
-    if (m.hackathonId === hackathon.id && m.status === 'active') {
+    if (
+      m.status === 'active' &&
+      (m.hackathonId === hackathon.id || (!m.hackathonId && teamById.has(m.teamId)))
+    ) {
       activeMembershipByUid.set(m.uid, m);
-    }
-  }
-
-  const teamById = new Map<string, Team>();
-  for (const t of teams) {
-    if (t.hackathonId === hackathon.id) {
-      teamById.set(t.id, t);
     }
   }
 
@@ -934,12 +983,12 @@ export function rankPeopleForHackathon(params: {
     return [
       prof.headline,
       prof.about,
-      prof.skillTags.join(' '),
-      prof.interestTags.join(' '),
-      prof.projectDomains.join(' '),
-      prof.topicsToExplore.join(' '),
+      (prof.skillTags ?? []).join(' '),
+      (prof.interestTags ?? []).join(' '),
+      (prof.projectDomains ?? []).join(' '),
+      (prof.topicsToExplore ?? []).join(' '),
       projText,
-      part ? part.skillsOffered.join(' ') : '',
+      part ? (part.skillsOffered ?? []).join(' ') : '',
     ].join(' ');
   };
 
@@ -961,9 +1010,9 @@ export function rankPeopleForHackathon(params: {
   const viewerAbstract = [
     combinedMemberAbstracts,
     viewerTeam
-      ? `${viewerTeam.name} ${viewerTeam.pitch} ${viewerTeam.projectIdea ?? ''} ${viewerTeam.desiredDomains.join(' ')} ${viewerTeam.rolesNeeded.join(' ')} ${(viewerTeam.customSpecializations ?? []).join(' ')}`
+      ? `${viewerTeam.name} ${viewerTeam.pitch ?? ''} ${viewerTeam.projectIdea ?? ''} ${(viewerTeam.desiredDomains ?? []).join(' ')} ${(viewerTeam.rolesNeeded ?? []).join(' ')} ${(viewerTeam.customSpecializations ?? []).join(' ')}`
       : '',
-    hackathon.themes.join(' '),
+    (hackathon.themes ?? []).join(' '),
   ]
     .filter(Boolean)
     .join(' ');
@@ -985,7 +1034,7 @@ export function rankPeopleForHackathon(params: {
         ...(profiles[uid]?.topicsToExplore ?? []),
       ]),
       ...(viewerTeam?.desiredDomains ?? []),
-      ...hackathon.themes,
+      ...(hackathon.themes ?? []),
     ])
   );
 
@@ -1226,6 +1275,7 @@ export function rankPeopleForHackathon(params: {
           availabilitySim: Math.round((viewerAvail.length > 0 ? availSim : 0.75) * 100),
           collabOrSkillSim: Math.round(swipeAffinity.score * 100),
           coldStartRedistributed,
+          skillComplementarity: Math.round(skillComplementarityScore * 100),
           skillComplementarityScore: Math.round(skillComplementarityScore * 100),
           sharedInterestsScore: Math.round(sharedInterestsScore * 100),
           pastSwipeAffinityScore: Math.round(swipeAffinity.score * 100),
@@ -1245,7 +1295,70 @@ export function rankPeopleForHackathon(params: {
   };
 }
 
-export const rankStudentsForHackathon = rankPeopleForHackathon;
+export function rankStudentsForHackathon(params: {
+  viewerUid?: string;
+  currentUser?: User;
+  currentProfile?: Profile;
+  hackathon: Hackathon;
+  users?: User[];
+  allUsers?: User[];
+  profiles?: Record<string, Profile>;
+  allProfiles?: Record<string, Profile>;
+  participations: Participation[];
+  teams: Team[];
+  memberships: Membership[];
+  interests?: Interest[];
+  existingInterests?: Interest[];
+  blocks: BlockRecord[];
+  activeCircleTags?: string[];
+  roleFilter?: string;
+  onlyFirstTimeHackers?: boolean;
+  searchQuery?: string;
+}): Array<
+  CandidateCard & {
+    overallScore: number;
+    reasons: string[];
+  }
+> & {
+  cards: CandidateCard[];
+  internalScores: Map<string, number>;
+} {
+  const viewerUid = params.viewerUid ?? params.currentUser?.uid ?? '';
+  const users = params.users ?? params.allUsers ?? [];
+  const baseProfiles = params.profiles ?? params.allProfiles ?? {};
+  const profiles: Record<string, Profile> =
+    params.currentProfile && viewerUid && !baseProfiles[viewerUid]
+      ? { ...baseProfiles, [viewerUid]: params.currentProfile }
+      : baseProfiles;
+  const interests = params.interests ?? params.existingInterests ?? [];
+
+  const { cards, internalScores } = rankPeopleForHackathon({
+    viewerUid,
+    hackathon: params.hackathon,
+    users,
+    profiles,
+    participations: params.participations,
+    teams: params.teams,
+    memberships: params.memberships,
+    interests,
+    blocks: params.blocks,
+    activeCircleTags: params.activeCircleTags,
+    roleFilter: params.roleFilter,
+    onlyFirstTimeHackers: params.onlyFirstTimeHackers,
+    searchQuery: params.searchQuery,
+  });
+
+  const enriched = cards.map((card) => ({
+    ...card,
+    overallScore: internalScores.get(card.id) ?? card.featureBreakdown.totalScore ?? 0,
+    reasons: card.compatibilityReasons.slice(0, 2),
+  }));
+
+  return Object.assign(enriched, {
+    cards,
+    internalScores,
+  });
+}
 
 
 /**

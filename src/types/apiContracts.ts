@@ -338,6 +338,8 @@ export interface PesuAnnouncementsResponse {
   fetchedAt?: string;
   cached?: boolean;
   grantedScopes?: string[];
+  homepageBannersSupported?: boolean;
+  homepageBannersNote?: string;
   errorCode?: PesuAnnouncementsErrorCode;
   requiresOptIn?: boolean;
   requiresScopeGrant?: boolean;

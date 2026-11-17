@@ -12,6 +12,8 @@ import {
   EventType,
   ParticipationIntent,
   Profile,
+  TeamRegistration,
+  TeamRegistrationStatus,
   User,
 } from './src/types/domain.ts';
 import {
@@ -33,35 +35,53 @@ import {
   VerifyUrlResponse,
 } from './src/types/apiContracts.ts';
 import {
+  extractPesuEventsPaginationLinks,
   normalizePesuAnnouncementPayload,
   parseDateRangeFromText,
   parsePesuEventDetailHtml,
   parsePesuEventsHtmlListing,
+  PESU_HOMEPAGE_BANNERS_NOTE,
   sanitizeTextForPublicCandidate,
 } from './src/lib/eventsAndAnnouncements.ts';
 import {
+  computeTeamCombinedCapabilities,
+  countEligiblePeopleForHackathon,
+  rankStudentsForHackathon,
+} from './src/services/matchingEngine.ts';
+import {
   approveEventCandidateRecord,
+  blockUserRecord,
   claimOrInspectOAuthTransactionRecord,
   completeOAuthTransactionRecord,
+  computeTeamRegistrationReadiness,
   consumeOAuthTransactionRecord,
   createEventCandidateRecord,
   createMessageRecord,
   createOAuthSessionRecord,
   createOAuthTransactionRecord,
   createPublishedHackathonDirect,
+  createTeamMessageRecord,
+  createTeamProposalRecord,
   createTeamWithLeaderRecord,
+  getShortlistForUserRecord,
+  getTeamMessagesRecord,
   getUserAndProfileByUid,
   getValidOAuthSessionByInitiatingSessionId,
   getValidOAuthSessionRecord,
+  leaveTeamRecord,
   loadBootstrapData,
   recordSwipeAndProcessMatchRecord,
   rejectEventCandidateRecord,
   resetPassedSwipesForHackathon,
   resolveJoinRequestRecord,
+  respondToTeamProposalRecord,
   revokeOAuthSessionRecord,
+  updateTeamDetailsRecord,
+  updateTeamRegistrationRecord,
   updateUserProfileAndPrivacy,
   upsertParticipationRecord,
   upsertUserAndProfile,
+  voteOnTeamProposalRecord,
   waitForOAuthTransactionCompletion,
 } from './src/db/repository.ts';
 import {
@@ -4956,7 +4976,30 @@ app.get(
           }
           clearTimeout(timer);
 
-          const rawBody = await upstreamResp.json().catch(() => null);
+          const contentType =
+            (typeof upstreamResp.headers?.get === 'function'
+              ? upstreamResp.headers.get('content-type')
+              : '') || '';
+          let rawBody: unknown = null;
+          let rawTextSnippet = '';
+          if (
+            typeof upstreamResp.text === 'function' &&
+            contentType.toLowerCase().includes('text/html')
+          ) {
+            const txt = await upstreamResp.text().catch(() => '');
+            rawTextSnippet = txt.slice(0, 240);
+          } else if (typeof upstreamResp.json === 'function') {
+            rawBody = await upstreamResp.json().catch(async () => {
+              if (typeof upstreamResp.text === 'function') {
+                const txt = await upstreamResp.text().catch(() => '');
+                rawTextSnippet = txt.slice(0, 240);
+              }
+              return null;
+            });
+          }
+          const isHtmlUpstream =
+            contentType.toLowerCase().includes('text/html') ||
+            /^\s*<!doctype html|^\s*<html/i.test(rawTextSnippet);
 
           if (!upstreamResp.ok) {
             const errObj =
@@ -4980,6 +5023,8 @@ app.get(
                   errorCode: 'TOKEN_EXPIRED_OR_REVOKED',
                   requiresReauth: true,
                   grantedScopes: oauthSess.scopes,
+                  homepageBannersSupported: false,
+                  homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
                   userMessage:
                     upstreamDesc ||
                     'Your PESU OAuth2 access token expired or was rejected by the provider. Please sign in again.',
@@ -5007,6 +5052,8 @@ app.get(
                   requiresScopeGrant: true,
                   requiresReauth: true,
                   grantedScopes: oauthSess.scopes,
+                  homepageBannersSupported: false,
+                  homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
                   userMessage:
                     upstreamDesc ||
                     'Delegated PESU Academy credentials are required on the PESU-Dev provider to fetch announcements. Please re-connect and authorize delegated access.',
@@ -5023,8 +5070,11 @@ app.get(
             }
 
             if (
-              upstreamResp.status === 403 ||
-              upstreamError === 'insufficient_scope'
+              upstreamError === 'insufficient_scope' ||
+              (upstreamResp.status === 403 &&
+                !isHtmlUpstream &&
+                rawBody !== null &&
+                upstreamDesc.toLowerCase().includes('scope'))
             ) {
               return {
                 status: 403,
@@ -5033,6 +5083,8 @@ app.get(
                   errorCode: 'MISSING_ANNOUNCEMENTS_SCOPE',
                   requiresScopeGrant: true,
                   grantedScopes: oauthSess.scopes,
+                  homepageBannersSupported: false,
+                  homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
                   userMessage:
                     upstreamDesc ||
                     'The PESU OAuth2 provider rejected the request because announcements:read scope is missing.',
@@ -5048,6 +5100,29 @@ app.get(
               };
             }
 
+            if (upstreamResp.status === 403 && (isHtmlUpstream || rawBody === null)) {
+              return {
+                status: 502,
+                payload: {
+                  ok: false,
+                  errorCode: 'PROVIDER_UNAVAILABLE',
+                  grantedScopes: oauthSess.scopes,
+                  homepageBannersSupported: false,
+                  homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
+                  userMessage:
+                    'The upstream PESU Academy provider returned an HTML 403 error page (gateway/proxy block). Your announcements:read permission is intact — please retry shortly or use Public PESU Events / Submit Event Link.',
+                  error: 'UPSTREAM_HTML_403',
+                  diagnostics: {
+                    serviceName: 'pesu_oauth2',
+                    httpStatus: 403,
+                    errorCategory: 'TRANSIENT_UNAVAILABLE',
+                    retryAttempts: 0,
+                    durationMs: Date.now() - startTime,
+                  },
+                },
+              };
+            }
+
             const statusOut =
               upstreamResp.status >= 500 ? 502 : upstreamResp.status;
             return {
@@ -5056,6 +5131,8 @@ app.get(
                 ok: false,
                 errorCode: 'PROVIDER_UNAVAILABLE',
                 grantedScopes: oauthSess.scopes,
+                homepageBannersSupported: false,
+                homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
                 userMessage:
                   upstreamDesc ||
                   `PESU Academy announcements provider returned HTTP ${upstreamResp.status}.`,
@@ -5079,6 +5156,8 @@ app.get(
                 ok: false,
                 errorCode: 'MALFORMED_PROVIDER_PAYLOAD',
                 grantedScopes: oauthSess.scopes,
+                homepageBannersSupported: false,
+                homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
                 userMessage:
                   'PESU Academy provider returned a malformed response payload.',
                 error: 'Invalid announcements JSON envelope.',
@@ -5106,6 +5185,8 @@ app.get(
             })),
             fetchedAt: normalized.fetchedAt,
             grantedScopes: oauthSess.scopes,
+            homepageBannersSupported: false,
+            homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
             userMessage:
               normalized.announcements.length > 0
                 ? `Retrieved ${normalized.announcements.length} announcement(s) from PESU Academy.`
@@ -5140,6 +5221,8 @@ app.get(
       res.status(502).json({
         ok: false,
         errorCode: 'NETWORK_ERROR',
+        homepageBannersSupported: false,
+        homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
         userMessage:
           'PESU Academy announcement retrieval encountered an unexpected error.',
       } satisfies PesuAnnouncementsResponse);
@@ -5155,6 +5238,9 @@ const PESU_PUBLIC_SOURCE_URLS = [
   'https://events.pes.edu/browse/?status=upcoming',
   'https://events.pes.edu/browse/?department=computer-science',
 ];
+
+const MAX_PESU_BROWSE_PAGES = 15;
+const MAX_PESU_DETAIL_EVENTS = 60;
 
 let inFlightPesuPublicSync: Promise<PesuPublicEventsSyncResponse> | null = null;
 let lastPesuPublicSyncResult: {
@@ -5193,7 +5279,19 @@ export async function syncPublicPesuEventsCatalog(options?: {
       ReturnType<typeof parsePesuEventsHtmlListing>[number]
     >();
 
-    for (const browseUrl of PESU_PUBLIC_SOURCE_URLS) {
+    const browseQueue: string[] = [...PESU_PUBLIC_SOURCE_URLS];
+    const visitedBrowseUrls = new Set<string>();
+    const checkedBrowseUrls: string[] = [];
+
+    while (
+      browseQueue.length > 0 &&
+      visitedBrowseUrls.size < MAX_PESU_BROWSE_PAGES
+    ) {
+      const browseUrl = browseQueue.shift()!;
+      if (visitedBrowseUrls.has(browseUrl)) continue;
+      visitedBrowseUrls.add(browseUrl);
+      checkedBrowseUrls.push(browseUrl);
+
       const res = await safeFetchFollowRedirects(browseUrl);
       if (!res.ok || !res.bodyText) {
         warnings.push(
@@ -5214,6 +5312,22 @@ export async function syncPublicPesuEventsCatalog(options?: {
           }
         }
       }
+
+      // Discover and enqueue bounded pagination links (?page=2, etc.)
+      const paginationUrls = extractPesuEventsPaginationLinks(
+        res.bodyText,
+        browseUrl,
+        4
+      );
+      for (const nextUrl of paginationUrls) {
+        if (
+          !visitedBrowseUrls.has(nextUrl) &&
+          !browseQueue.includes(nextUrl) &&
+          visitedBrowseUrls.size + browseQueue.length < MAX_PESU_BROWSE_PAGES
+        ) {
+          browseQueue.push(nextUrl);
+        }
+      }
     }
 
     if (reachablePagesCount === 0) {
@@ -5221,7 +5335,7 @@ export async function syncPublicPesuEventsCatalog(options?: {
         ok: false,
         live: true,
         fetchedAt,
-        sourcePagesChecked: PESU_PUBLIC_SOURCE_URLS,
+        sourcePagesChecked: checkedBrowseUrls,
         reachablePagesCount: 0,
         discoveredCount: 0,
         publishedOrUpdatedCount: 0,
@@ -5238,8 +5352,8 @@ export async function syncPublicPesuEventsCatalog(options?: {
     let stagedForReviewCount = 0;
     let duplicatesSkippedCount = 0;
 
-    // Fetch up to 10 detail pages for grounded metadata (venue, hosted by, full date range, registration link)
-    for (const card of discoveredCards.slice(0, 10)) {
+    // Fetch all discovered detail pages (bounded by MAX_PESU_DETAIL_EVENTS = 60, removing the old 10-event cap)
+    for (const card of discoveredCards.slice(0, MAX_PESU_DETAIL_EVENTS)) {
       const detailFetch = await safeFetchFollowRedirects(card.detailUrl);
       const detail =
         detailFetch.ok && detailFetch.bodyText
@@ -5371,13 +5485,13 @@ export async function syncPublicPesuEventsCatalog(options?: {
       ok: true,
       live: true,
       fetchedAt,
-      sourcePagesChecked: PESU_PUBLIC_SOURCE_URLS,
+      sourcePagesChecked: checkedBrowseUrls,
       reachablePagesCount,
       discoveredCount: discoveredCards.length,
       publishedOrUpdatedCount,
       stagedForReviewCount,
       duplicatesSkippedCount,
-      userMessage: `Synced ${publishedOrUpdatedCount} public PESU event(s) from events.pes.edu (${reachablePagesCount}/${PESU_PUBLIC_SOURCE_URLS.length} listing pages reachable).`,
+      userMessage: `Synced ${publishedOrUpdatedCount} public PESU event(s) from events.pes.edu (${reachablePagesCount}/${checkedBrowseUrls.length} listing pages reachable).`,
       warnings,
     };
 
@@ -5903,9 +6017,188 @@ app.post('/api/teams', requireAuth, async (req: AuthenticatedRequest, res) => {
 });
 
 /**
- * Records a Pass or Connect swipe on a Person or Team.
- * - Creates a mutual `direct_match` conversation when two users both swipe 'interested'.
- * - Creates a team `join_request` when a user swipes 'interested' on an open team.
+ * Helper to map structured repository error prefixes to HTTP status codes.
+ */
+function handleRepositoryError(
+  error: unknown,
+  res: express.Response,
+  fallbackMessage: string
+): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message;
+  if (msg.startsWith('FORBIDDEN:') || msg.startsWith('BLOCKED_USER:')) {
+    const clean = msg.replace(/^[A-Z_]+:\s*/, '');
+    res.status(403).json({ ok: false, error: clean, userMessage: clean });
+    return true;
+  }
+  if (msg.startsWith('NOT_FOUND:')) {
+    const clean = msg.replace(/^NOT_FOUND:\s*/, '');
+    res.status(404).json({ ok: false, error: clean, userMessage: clean });
+    return true;
+  }
+  if (
+    msg.startsWith('TEAM_FULL:') ||
+    msg.startsWith('ALREADY_IN_TEAM:') ||
+    msg.startsWith('ALREADY_RESOLVED:') ||
+    msg.startsWith('ALREADY_REGISTERED:') ||
+    msg.startsWith('UNANIMOUS_APPROVAL_REQUIRED:') ||
+    msg.startsWith('TEAM_REGISTERED_LOCKED:') ||
+    msg.startsWith('DUPLICATE_PROPOSAL:') ||
+    msg.startsWith('INELIGIBLE_TEAM_SIZE:')
+  ) {
+    const clean = msg.replace(/^[A-Z_]+:\s*/, '');
+    res.status(409).json({ ok: false, error: clean, userMessage: clean });
+    return true;
+  }
+  if (
+    msg.startsWith('VALIDATION_ERROR:') ||
+    msg.startsWith('SELF_SWIPE:') ||
+    msg.startsWith('INELIGIBLE_EVENT:') ||
+    msg.startsWith('EMPTY_MESSAGE:') ||
+    msg.startsWith('INVALID_BLOCK:') ||
+    msg.startsWith('INVALID_PROPOSAL:')
+  ) {
+    const clean = msg.replace(/^[A-Z_]+:\s*/, '');
+    res.status(400).json({ ok: false, error: clean, userMessage: clean });
+    return true;
+  }
+  console.error(fallbackMessage, error);
+  res.status(500).json({ ok: false, error: fallbackMessage, userMessage: fallbackMessage });
+  return true;
+}
+
+/**
+ * Student-only Discovery Feed (`GET /api/discovery/students`)
+ * Ranks eligible individual students for the selected hackathon using:
+ *  - 45% Skill Complementarity (evaluated against the viewer's solo skills OR combined active team skills)
+ *  - 35% Shared Interests & Project Themes
+ *  - 20% Past Swipe Behavior (or redistributed for cold-start users)
+ */
+app.get(
+  '/api/discovery/students',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const requestedHackathonId =
+        typeof req.query.hackathonId === 'string'
+          ? req.query.hackathonId.trim()
+          : typeof req.query.hackathonSlug === 'string'
+            ? req.query.hackathonSlug.trim()
+            : '';
+      const searchQuery =
+        typeof req.query.q === 'string' ? req.query.q.trim() : '';
+
+      const data = await loadBootstrapData(authUser.uid);
+      const hackathon =
+        data.hackathons.find((h) => h.id === requestedHackathonId) ??
+        data.hackathons.find((h) => h.matchable) ??
+        data.hackathons[0] ??
+        null;
+
+      if (!hackathon) {
+        res.json({
+          ok: true,
+          hackathonId: null,
+          candidates: [],
+          students: [],
+          totalEligibleCount: 0,
+          teamCapabilities: null,
+          activeTeam: null,
+        });
+        return;
+      }
+
+      const currentUser =
+        data.users.find((u) => u.uid === authUser.uid) ?? authUser;
+      const currentProfile = data.profiles[authUser.uid];
+
+      if (!currentProfile) {
+        res.json({
+          ok: true,
+          hackathonId: hackathon.id,
+          candidates: [],
+          students: [],
+          totalEligibleCount: 0,
+          teamCapabilities: null,
+          activeTeam: null,
+        });
+        return;
+      }
+
+      const candidates = rankStudentsForHackathon({
+        viewerUid: authUser.uid,
+        currentProfile,
+        hackathon,
+        users: data.users,
+        profiles: data.profiles,
+        participations: data.participations,
+        teams: data.teams,
+        memberships: data.memberships,
+        interests: data.interests,
+        blocks: data.blocks ?? [],
+        searchQuery,
+      });
+
+      const totalEligibleCount = countEligiblePeopleForHackathon({
+        viewerUid: authUser.uid,
+        hackathon,
+        users: data.users,
+        profiles: data.profiles,
+        participations: data.participations,
+        teams: data.teams,
+        memberships: data.memberships,
+        interests: data.interests,
+        blocks: data.blocks ?? [],
+        searchQuery,
+      });
+
+      const teamCapabilities = computeTeamCombinedCapabilities({
+        viewerUid: authUser.uid,
+        hackathon,
+        profiles: data.profiles,
+        participations: data.participations,
+        teams: data.teams,
+        memberships: data.memberships,
+      });
+
+      res.json({
+        ok: true,
+        hackathonId: hackathon.id,
+        candidates,
+        students: candidates,
+        totalEligibleCount,
+        teamCapabilities: {
+          teamId: teamCapabilities.activeTeam?.id ?? null,
+          memberCount: teamCapabilities.teamMemberUids.length,
+          maxCapacity: Math.min(
+            4,
+            hackathon.maxTeamSize && hackathon.maxTeamSize > 0
+              ? hackathon.maxTeamSize
+              : 4
+          ),
+          combinedSkills: teamCapabilities.combinedSkills,
+          combinedRoles: teamCapabilities.combinedRoles,
+          combinedInterests: teamCapabilities.combinedDomains,
+          missingRoles: teamCapabilities.missingRoles,
+          desiredSkills: [],
+        },
+        activeTeam: teamCapabilities.activeTeam ?? null,
+      });
+    } catch (error) {
+      console.error('Error in GET /api/discovery/students:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to load student discovery recommendations.',
+      });
+    }
+  }
+);
+
+/**
+ * Records a Pass or Interested swipe on a Student (or legacy Team).
+ * - Creates a mutual `direct_match` conversation AND an automatic 2-person team when two un-teamed students mutually swipe right.
+ * - Creates a `team_proposal` with unanimous member voting when a teamed student and a candidate mutually swipe right.
  */
 app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
@@ -5920,15 +6213,16 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
       customNote?: string;
     };
 
+    const targetType = body.targetType ?? 'user';
+
     if (
       !body.hackathonId ||
-      !body.targetType ||
       !body.targetId ||
       !body.decision
     ) {
       res.status(400).json({
         ok: false,
-        error: 'hackathonId, targetType, targetId, and decision are required.',
+        error: 'hackathonId, targetId, and decision are required.',
       });
       return;
     }
@@ -5936,16 +6230,13 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
     const result = await recordSwipeAndProcessMatchRecord({
       hackathonSlug: body.hackathonId,
       fromUid: authUser.uid,
-      targetType: body.targetType,
+      targetType,
       targetId: body.targetId,
       decision: body.decision,
       proposedRole: body.proposedRole,
       note: body.note ?? body.customNote,
     });
 
-    // Response contract used by the student UI: `matchedConversation` for a
-    // mutual person match and `createdJoinRequest` for a team application.
-    // The repository-level names are kept as aliases for compatibility.
     const payload: Record<string, unknown> = {
       ok: true,
       interest: result.interest,
@@ -5953,6 +6244,18 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
     if (result.mutualMatchConversation) {
       payload.matchedConversation = result.mutualMatchConversation;
       payload.mutualMatchConversation = result.mutualMatchConversation;
+    }
+    if (result.autoCreatedTeam) {
+      payload.autoCreatedTeam = result.autoCreatedTeam;
+    }
+    if (result.autoCreatedMemberships) {
+      payload.autoCreatedMemberships = result.autoCreatedMemberships;
+    }
+    if (result.teamRosterConversation) {
+      payload.teamRosterConversation = result.teamRosterConversation;
+    }
+    if (result.teamProposal) {
+      payload.teamProposal = result.teamProposal;
     }
     if (result.joinRequest) {
       payload.createdJoinRequest = result.joinRequest;
@@ -5964,19 +6267,622 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
 
     res.json(payload);
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith('TEAM_FULL:')) {
-      res.status(409).json({
+    if (handleRepositoryError(error, res, 'Failed to record swipe.')) {
+      return;
+    }
+  }
+});
+
+/**
+ * Returns the authenticated student's 3-section Shortlist (`interested`, `interestedInYou`, `mutualMatches`).
+ */
+app.get(
+  '/api/swipes/shortlist',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      let hackathonSlug =
+        typeof req.query.hackathonId === 'string' && req.query.hackathonId.trim()
+          ? req.query.hackathonId.trim()
+          : '';
+      if (!hackathonSlug) {
+        const data = await loadBootstrapData(authUser.uid);
+        hackathonSlug =
+          data.hackathons.find((h) => h.matchable)?.id ??
+          data.hackathons[0]?.id ??
+          '';
+      }
+      const shortlist = await getShortlistForUserRecord({
+        uid: authUser.uid,
+        hackathonSlug,
+      });
+      const enriched = {
+        ...shortlist,
+        incomingInterested: shortlist.interestedInYou,
+      };
+      res.json({
+        ok: true,
+        ...enriched,
+        shortlist: enriched,
+      });
+    } catch (error) {
+      console.error('Error in GET /api/swipes/shortlist:', error);
+      res.status(500).json({
         ok: false,
-        error: error.message.replace('TEAM_FULL: ', ''),
-        userMessage: error.message.replace('TEAM_FULL: ', ''),
+        error: 'Failed to load shortlist.',
+      });
+    }
+  }
+);
+
+/**
+ * Returns the authenticated student's mutual matches, shortlist, and conversations (`GET /api/matches`).
+ */
+app.get('/api/matches', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const data = await loadBootstrapData(authUser.uid);
+    const hackathonSlug =
+      typeof req.query.hackathonId === 'string' && req.query.hackathonId.trim()
+        ? req.query.hackathonId.trim()
+        : data.hackathons.find((h) => h.matchable)?.id ??
+          data.hackathons[0]?.id ??
+          '';
+    const shortlist = await getShortlistForUserRecord({
+      uid: authUser.uid,
+      hackathonSlug,
+    });
+    const conversations =
+      typeof req.query.hackathonId === 'string' && req.query.hackathonId.trim()
+        ? data.conversations.filter((c) => c.hackathonId === hackathonSlug)
+        : data.conversations;
+    const convIds = new Set(conversations.map((c) => c.id));
+    const messages = data.messages.filter((m) => convIds.has(m.conversationId));
+
+    res.json({
+      ok: true,
+      mutualMatches: shortlist.mutualMatches,
+      interested: shortlist.interested,
+      interestedInYou: shortlist.interestedInYou,
+      incomingInterested: shortlist.interestedInYou,
+      conversations,
+      messages,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/matches:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to load matches.',
+    });
+  }
+});
+
+/**
+ * Helper to assemble rich team details for `GET /api/teams/me` and `GET /api/teams/:id`.
+ */
+function buildRichTeamSummary(params: {
+  team: Awaited<ReturnType<typeof loadBootstrapData>>['teams'][number];
+  viewerUid: string;
+  data: Awaited<ReturnType<typeof loadBootstrapData>>;
+}) {
+  const { team, viewerUid, data } = params;
+  const hackathon =
+    data.hackathons.find((h) => h.id === team.hackathonId) ?? null;
+  const activeMemberships = data.memberships.filter(
+    (m) => m.teamId === team.id && m.status === 'active'
+  );
+  const members = activeMemberships.map((m) => {
+    const u = data.users.find((usr) => usr.uid === m.uid);
+    const p = data.profiles[m.uid];
+    return {
+      membership: m,
+      user: u ?? null,
+      profile: p ?? null,
+    };
+  });
+
+  const capabilities = hackathon
+    ? computeTeamCombinedCapabilities({
+        viewerUid,
+        hackathon,
+        profiles: data.profiles,
+        participations: data.participations,
+        teams: data.teams,
+        memberships: data.memberships,
+      })
+    : null;
+
+  const proposals = (data.teamProposals ?? []).filter(
+    (tp) => tp.teamId === team.id
+  );
+
+  const existingRegistration = data.teamRegistrations?.[team.id] ?? null;
+  const readiness = computeTeamRegistrationReadiness({
+    memberCount: activeMemberships.length || team.memberCount,
+    minTeamSize: hackathon?.minTeamSize,
+    maxTeamSize: hackathon?.maxTeamSize ?? team.targetSize,
+    hackathonStatus: hackathon?.status,
+    registrationDeadline: hackathon?.registrationDeadline,
+    matchable: hackathon?.matchable,
+  });
+
+  const teamConversation =
+    data.conversations.find(
+      (c) => c.type === 'team_roster' && c.teamId === team.id
+    ) ?? null;
+
+  const registrationObj: TeamRegistration = existingRegistration ?? {
+    teamId: team.id,
+    hackathonId: team.hackathonId,
+    registrationStatus: readiness.computedStatus,
+    officialRegistrationUrl:
+      hackathon?.registrationUrl ?? hackathon?.verifiedCanonicalUrl ?? null,
+    externalRegistrationReference: null,
+    confirmationNotes: null,
+    registeredByUid: null,
+    registeredAt: null,
+    minRequiredMembers: readiness.minRequiredMembers,
+    maxAllowedMembers: readiness.maxAllowedMembers,
+    currentMemberCount: activeMemberships.length || team.memberCount,
+    isEligibleToRegister: readiness.isEligibleToRegister,
+    readinessReason: readiness.readinessReason,
+    updatedAt: team.createdAt,
+  };
+
+  return {
+    team,
+    hackathon,
+    members,
+    proposals,
+    teamRegistration: registrationObj,
+    registration: registrationObj,
+    capabilities: capabilities
+      ? {
+          combinedSkills: capabilities.combinedSkills,
+          combinedRoles: capabilities.combinedRoles,
+          combinedInterests: capabilities.combinedDomains,
+          missingRoles: capabilities.missingRoles,
+          desiredSkills: [],
+          maxCapacity: Math.min(
+            4,
+            hackathon?.maxTeamSize && hackathon.maxTeamSize > 0
+              ? hackathon.maxTeamSize
+              : 4
+          ),
+        }
+      : null,
+    teamConversationId: teamConversation?.id ?? null,
+  };
+}
+
+/**
+ * Returns the authenticated student's active team(s), pending candidate proposals,
+ * incoming team invitations, and registration readiness (`GET /api/teams/me`).
+ */
+app.get('/api/teams/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const hackathonSlug =
+      typeof req.query.hackathonId === 'string' && req.query.hackathonId.trim()
+        ? req.query.hackathonId.trim()
+        : undefined;
+
+    const data = await loadBootstrapData(authUser.uid);
+    const myActiveMemberships = data.memberships.filter(
+      (m) =>
+        m.uid === authUser.uid &&
+        m.status === 'active' &&
+        (!hackathonSlug || m.hackathonId === hackathonSlug)
+    );
+    const myTeamIds = new Set(myActiveMemberships.map((m) => m.teamId));
+    const myTeams = data.teams
+      .filter((t) => myTeamIds.has(t.id) && t.status !== 'locked')
+      .map((team) =>
+        buildRichTeamSummary({ team, viewerUid: authUser.uid, data })
+      );
+
+    // Also include incoming invitations where the current user is the proposed candidate
+    const incomingProposals = (data.teamProposals ?? []).filter(
+      (tp) =>
+        tp.candidateUid === authUser.uid &&
+        (!hackathonSlug || tp.hackathonId === hackathonSlug)
+    );
+
+    res.json({
+      ok: true,
+      activeTeam: myTeams[0] ?? null,
+      teams: myTeams,
+      incomingProposals,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/teams/me:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to load your team details.',
+    });
+  }
+});
+
+/**
+ * Returns a specific team's details, roster, proposals, and registration state (`GET /api/teams/:id`).
+ */
+app.get('/api/teams/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const teamId = String(req.params.id);
+    const data = await loadBootstrapData(authUser.uid);
+    const team = data.teams.find((t) => t.id === teamId);
+    if (!team) {
+      res.status(404).json({
+        ok: false,
+        error: 'Team not found.',
       });
       return;
     }
-    console.error('Error in POST /api/swipes:', error);
+
+    const summary = buildRichTeamSummary({
+      team,
+      viewerUid: authUser.uid,
+      data,
+    });
+    res.json({
+      ok: true,
+      ...summary,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/teams/:id:', error);
     res.status(500).json({
       ok: false,
-      error: 'Failed to record swipe.',
+      error: 'Failed to load team details.',
     });
+  }
+});
+
+/**
+ * Updates a team's name, pitch, project idea, rolesNeeded, or targetSize (`PATCH /api/teams/:id`).
+ */
+app.patch(
+  '/api/teams/:id',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+      const body = (req.body ?? {}) as {
+        name?: string;
+        pitch?: string;
+        projectIdea?: string | null;
+        rolesNeeded?: string[];
+        customSpecializations?: string[];
+        targetSize?: number;
+      };
+
+      const updated = await updateTeamDetailsRecord({
+        teamSlug,
+        actorUid: authUser.uid,
+        name: body.name,
+        pitch: body.pitch,
+        projectIdea: body.projectIdea,
+        rolesNeeded: body.rolesNeeded,
+        customSpecializations: body.customSpecializations,
+        targetSize: body.targetSize,
+      });
+
+      res.json({
+        ok: true,
+        team: updated,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to update team details.');
+    }
+  }
+);
+
+/**
+ * Proposes a mutually matched student to join the proposer's existing team (`POST /api/teams/proposals`).
+ */
+app.post(
+  '/api/teams/proposals',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const body = (req.body ?? {}) as {
+        hackathonId?: string;
+        teamId?: string;
+        candidateUid?: string;
+        proposedRole?: string;
+        note?: string;
+        message?: string;
+      };
+
+      if (!body.teamId || !body.candidateUid) {
+        res.status(400).json({
+          ok: false,
+          error: 'teamId and candidateUid are required.',
+        });
+        return;
+      }
+
+      const proposal = await createTeamProposalRecord({
+        hackathonSlug: body.hackathonId ?? '',
+        teamSlug: body.teamId,
+        proposerUid: authUser.uid,
+        candidateUid: body.candidateUid,
+        proposedRole: body.proposedRole,
+        message: body.note ?? body.message,
+      });
+
+      res.status(201).json({
+        ok: true,
+        proposal,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to create team proposal.');
+    }
+  }
+);
+
+/**
+ * Records a current team member's vote ('approve' | 'reject') on a pending candidate proposal (`POST /api/teams/proposals/:id/vote`).
+ * - Unanimous approval transitions the proposal to `'invited'`.
+ * - Any single rejection immediately marks the proposal `'rejected'`.
+ */
+app.post(
+  '/api/teams/proposals/:id/vote',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const proposalUid = String(req.params.id);
+      const body = (req.body ?? {}) as {
+        decision?: 'approve' | 'reject';
+        vote?: 'approve' | 'reject';
+        comment?: string;
+      };
+      const decision = body.decision ?? body.vote;
+
+      if (decision !== 'approve' && decision !== 'reject') {
+        res.status(400).json({
+          ok: false,
+          error: 'vote/decision must be "approve" or "reject".',
+        });
+        return;
+      }
+
+      const result = await voteOnTeamProposalRecord({
+        proposalUid,
+        voterUid: authUser.uid,
+        decision,
+        comment: body.comment,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to record vote on team proposal.');
+    }
+  }
+);
+
+/**
+ * Allows an invited candidate to accept or decline a unanimously approved team invitation (`POST /api/teams/proposals/:id/accept`).
+ */
+app.post(
+  '/api/teams/proposals/:id/accept',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const proposalUid = String(req.params.id);
+      const rawDecision = (req.body ?? {}).decision;
+      const decision: 'accept' | 'decline' =
+        rawDecision === 'decline' || rawDecision === 'reject'
+          ? 'decline'
+          : 'accept';
+
+      const result = await respondToTeamProposalRecord({
+        proposalUid,
+        candidateUid: authUser.uid,
+        decision,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      handleRepositoryError(
+        error,
+        res,
+        'Failed to respond to team invitation.'
+      );
+    }
+  }
+);
+
+/**
+ * Allows a team member to leave a team (`POST /api/teams/:id/leave`).
+ * Reopens recruitment if the team was full, reassigns leader if needed, and blocks silent changes if already registered.
+ */
+app.post(
+  '/api/teams/:id/leave',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+
+      const result = await leaveTeamRecord({
+        teamSlug,
+        uid: authUser.uid,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+        remainingMembers: result.remainingMemberUids.length,
+        dissolved: result.remainingMemberUids.length === 0,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to leave team.');
+    }
+  }
+);
+
+/**
+ * Retrieves persistent group chat messages for a team (`GET /api/teams/:id/messages`).
+ * Restricted to active members of the team.
+ */
+app.get(
+  '/api/teams/:id/messages',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+
+      const result = await getTeamMessagesRecord({
+        teamSlug,
+        viewerUid: authUser.uid,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to load team messages.');
+    }
+  }
+);
+
+/**
+ * Sends a persistent message in a team's group chat (`POST /api/teams/:id/messages`).
+ * Restricted to active members of the team.
+ */
+app.post(
+  '/api/teams/:id/messages',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+      const { body } = (req.body ?? {}) as { body?: string };
+
+      if (!body || !body.trim()) {
+        res.status(400).json({
+          ok: false,
+          error: 'Message body cannot be empty.',
+        });
+        return;
+      }
+
+      const message = await createTeamMessageRecord({
+        teamSlug,
+        senderUid: authUser.uid,
+        body: body.trim(),
+      });
+
+      res.status(201).json({
+        ok: true,
+        message,
+        conversationId: message.conversationId,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to send team message.');
+    }
+  }
+);
+
+/**
+ * Updates a team's hackathon registration tracking status (`POST /api/teams/:id/registration`).
+ * Enforces verified team-size bounds (`minTeamSize` .. `maxTeamSize` / 4) before allowing `'ready_to_register'`, `'registration_in_progress'`, or `'registered'`.
+ */
+app.post(
+  '/api/teams/:id/registration',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+      const body = (req.body ?? {}) as {
+        registrationStatus?: TeamRegistrationStatus;
+        status?: TeamRegistrationStatus;
+        externalRegistrationReference?: string | null;
+        confirmationNotes?: string | null;
+      };
+      const status = body.registrationStatus ?? body.status;
+
+      const validStatuses: TeamRegistrationStatus[] = [
+        'forming',
+        'ready_to_register',
+        'registration_in_progress',
+        'registered',
+        'registration_closed',
+      ];
+      if (!status || !validStatuses.includes(status)) {
+        res.status(400).json({
+          ok: false,
+          error:
+            'registrationStatus must be one of forming, ready_to_register, registration_in_progress, registered, registration_closed.',
+        });
+        return;
+      }
+
+      const teamRegistration = await updateTeamRegistrationRecord({
+        teamSlug,
+        actorUid: authUser.uid,
+        status,
+        externalRegistrationReference: body.externalRegistrationReference,
+        confirmationNotes: body.confirmationNotes,
+      });
+
+      res.json({
+        ok: true,
+        teamRegistration,
+        registration: teamRegistration,
+      });
+    } catch (error) {
+      handleRepositoryError(
+        error,
+        res,
+        'Failed to update team registration status.'
+      );
+    }
+  }
+);
+
+/**
+ * Blocks a user so neither user appears in the other's discovery or shortlist (`POST /api/blocks`).
+ */
+app.post('/api/blocks', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const { blockedUid, targetUid, reason } = (req.body ?? {}) as {
+      blockedUid?: string;
+      targetUid?: string;
+      reason?: string;
+    };
+    const finalBlockedUid = (blockedUid ?? targetUid ?? '').trim();
+    if (!finalBlockedUid) {
+      res.status(400).json({
+        ok: false,
+        error: 'blockedUid is required.',
+      });
+      return;
+    }
+    await blockUserRecord({
+      blockerUid: authUser.uid,
+      blockedUid: finalBlockedUid,
+      reason,
+    });
+    res.status(201).json({ ok: true, blockedUid: finalBlockedUid });
+  } catch (error) {
+    handleRepositoryError(error, res, 'Failed to block user.');
   }
 });
 
@@ -6046,41 +6952,9 @@ app.post(
             resolvedTeam.memberCount >= resolvedTeam.targetSize),
       });
     } catch (error) {
-      if (error instanceof Error) {
-        if (error.message.startsWith('FORBIDDEN:')) {
-          res.status(403).json({
-            ok: false,
-            error: error.message.replace('FORBIDDEN: ', ''),
-            userMessage: error.message.replace('FORBIDDEN: ', ''),
-          });
-          return;
-        }
-        if (
-          error.message.startsWith('TEAM_FULL:') ||
-          error.message.startsWith('ALREADY_IN_TEAM:') ||
-          error.message.startsWith('ALREADY_RESOLVED:')
-        ) {
-          const clean = error.message.replace(/^[A-Z_]+:\s*/, '');
-          res.status(409).json({
-            ok: false,
-            error: clean,
-            userMessage: clean,
-          });
-          return;
-        }
-        if (error.message.startsWith('NOT_FOUND:')) {
-          res.status(404).json({
-            ok: false,
-            error: error.message.replace('NOT_FOUND: ', ''),
-          });
-          return;
-        }
+      if (handleRepositoryError(error, res, 'Failed to resolve join request.')) {
+        return;
       }
-      console.error('Error in POST /api/join-requests/:requestUid/resolve:', error);
-      res.status(500).json({
-        ok: false,
-        error: 'Failed to resolve join request.',
-      });
     }
   }
 );
@@ -6117,28 +6991,9 @@ app.post(
         message,
       });
     } catch (error) {
-      if (error instanceof Error) {
-        if (error.message.startsWith('FORBIDDEN:')) {
-          res.status(403).json({
-            ok: false,
-            error: error.message.replace('FORBIDDEN: ', ''),
-            userMessage: error.message.replace('FORBIDDEN: ', ''),
-          });
-          return;
-        }
-        if (error.message.startsWith('NOT_FOUND:')) {
-          res.status(404).json({
-            ok: false,
-            error: error.message.replace('NOT_FOUND: ', ''),
-          });
-          return;
-        }
+      if (handleRepositoryError(error, res, 'Failed to send message.')) {
+        return;
       }
-      console.error('Error in POST /api/conversations/:conversationUid/messages:', error);
-      res.status(500).json({
-        ok: false,
-        error: 'Failed to send message.',
-      });
     }
   }
 );

@@ -3201,6 +3201,1160 @@ test('32. IST (Asia/Kolkata) Date & Time Filtering: Upcoming vs Past, chronologi
   );
 });
 
+test('33. Unified Student-Only Discovery & Explainable Recommendation Scoring (45% skill complementarity, 35% shared interests, 20% past swipe affinity, cold-start redistribution, and block/privacy filtering)', async () => {
+  const { rankStudentsForHackathon } = await import(
+    '../src/services/matchingEngine.ts'
+  );
+
+  const sampleHackathon = {
+    id: 'hack_scoring_test',
+    name: 'PES AI & Systems Hackathon 2026',
+    organizer: 'PES Innovation Lab',
+    eventType: 'hackathon' as const,
+    matchable: true,
+    themes: ['AI / ML', 'Distributed Systems'],
+    description: 'Build production AI systems with FastAPI, React, and PyTorch.',
+    startAt: '2026-12-10',
+    endAt: '2026-12-11',
+    registrationDeadline: '2026-12-08',
+    timezone: 'Asia/Kolkata',
+    venue: { campus: 'RR Campus' as const, name: 'MRD Auditorium' },
+    format: 'onsite' as const,
+    minTeamSize: 2,
+    maxTeamSize: 4,
+    registrationUrl: 'https://events.pes.edu/ai-systems-2026',
+    eligibilityNotes: 'Verified PES students',
+    sourceProvenance: 'verified_public_url' as const,
+    sourceUrl: 'https://events.pes.edu/ai-systems-2026',
+    verificationConfidence: 1,
+    createdAt: new Date().toISOString(),
+  } as unknown as import('../src/types/domain.ts').Hackathon;
+
+  const makeUser = (uid: string, name: string) => ({
+    uid,
+    displayName: name,
+    personaLabel: 'CSE · 2027',
+    campus: 'RR Campus' as const,
+    program: 'B.Tech CSE',
+    graduationYear: 2027,
+    verificationStatus: 'verified_pesu_oidc' as const,
+    pesuOidcSub: `SUB_${uid}`,
+    isAdmin: false,
+    createdAt: new Date().toISOString(),
+    accountStatus: 'active' as const,
+    privacyPreferences: {
+      profileVisible: true,
+      githubConsent: true,
+      aiEnrichmentConsent: false,
+      academyAnnouncementsOptIn: false,
+      academyTimetableOptIn: false,
+    },
+  });
+
+  const userViewer = makeUser('u_viewer', 'Viewer Backend');
+  const userComplementary = makeUser('u_comp', 'Complementary Frontend ML');
+  const userRedundant = makeUser('u_redundant', 'Redundant Backend');
+  const userBlocked = makeUser('u_blocked', 'Blocked Student');
+
+  const profilesMap = {
+    u_viewer: {
+      uid: 'u_viewer',
+      headline: 'Backend Engineer',
+      about: 'Building APIs and databases',
+      interestTags: ['AI / ML', 'Distributed Systems'],
+      skillTags: ['Node.js', 'PostgreSQL', 'Docker'],
+      projectDomains: ['Developer Tools', 'AI Agents'],
+      topicsToExplore: ['Vector Search'],
+      preferredRoles: ['Backend / APIs'],
+      rolesWantToLearn: [],
+      workingStyleTags: ['Fast prototyping'],
+      hackathonGoals: ['Ship a complete MVP'],
+      portfolioLinks: [],
+      featuredProjects: [],
+      visibility: 'public_verified_students' as const,
+      updatedAt: new Date().toISOString(),
+    },
+    u_comp: {
+      uid: 'u_comp',
+      headline: 'Frontend & PyTorch Builder',
+      about: 'React UI + ML inference pipelines',
+      interestTags: ['AI / ML', 'Distributed Systems'],
+      skillTags: ['React', 'TypeScript', 'PyTorch', 'Figma'],
+      projectDomains: ['AI Agents', 'Developer Tools'],
+      topicsToExplore: ['Vector Search'],
+      preferredRoles: ['Frontend / UI', 'ML / AI'],
+      rolesWantToLearn: [],
+      workingStyleTags: ['Fast prototyping'],
+      hackathonGoals: ['Ship a complete MVP'],
+      portfolioLinks: [],
+      featuredProjects: [],
+      visibility: 'public_verified_students' as const,
+      updatedAt: new Date().toISOString(),
+    },
+    u_redundant: {
+      uid: 'u_redundant',
+      headline: 'Backend Developer',
+      about: 'Only Node.js and PostgreSQL',
+      interestTags: ['Gaming'],
+      skillTags: ['Node.js', 'PostgreSQL'],
+      projectDomains: ['Arcade Games'],
+      topicsToExplore: ['Game Physics'],
+      preferredRoles: ['Backend / APIs'],
+      rolesWantToLearn: [],
+      workingStyleTags: [],
+      hackathonGoals: [],
+      portfolioLinks: [],
+      featuredProjects: [],
+      visibility: 'public_verified_students' as const,
+      updatedAt: new Date().toISOString(),
+    },
+    u_blocked: {
+      uid: 'u_blocked',
+      headline: 'Should be filtered out',
+      about: '',
+      interestTags: ['AI / ML'],
+      skillTags: ['React', 'PyTorch'],
+      projectDomains: [],
+      topicsToExplore: [],
+      preferredRoles: ['Frontend / UI'],
+      rolesWantToLearn: [],
+      workingStyleTags: [],
+      hackathonGoals: [],
+      portfolioLinks: [],
+      featuredProjects: [],
+      visibility: 'public_verified_students' as const,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+
+  // 1. Cold-start ranking (no prior swipes) excludes self and blocked users, and ranks complementary student higher
+  const coldStartRanked = rankStudentsForHackathon({
+    currentUser: userViewer,
+    currentProfile: profilesMap.u_viewer,
+    hackathon: sampleHackathon,
+    allUsers: [userViewer, userComplementary, userRedundant, userBlocked],
+    allProfiles: profilesMap,
+    participations: [],
+    teams: [],
+    memberships: [],
+    existingInterests: [],
+    blocks: [
+      {
+        id: 'b1',
+        blockerUid: 'u_viewer',
+        blockedUid: 'u_blocked',
+        createdAt: new Date().toISOString(),
+      },
+    ],
+  });
+
+  assert.equal(coldStartRanked.length, 2, 'Must exclude viewer and blocked user');
+  assert.equal(
+    coldStartRanked[0].id,
+    'u_comp',
+    'Complementary student with missing Frontend + ML roles and shared AI themes must rank #1'
+  );
+  assert.ok(
+    coldStartRanked[0].overallScore > coldStartRanked[1].overallScore,
+    'Complementary candidate score must exceed redundant candidate score'
+  );
+  assert.ok(
+    coldStartRanked[0].reasons.length >= 1 && coldStartRanked[0].reasons.length <= 2,
+    'Each card must display 1-2 grounded recommendation reasons'
+  );
+
+  // 2. When viewer is in a 3-person team (A + B + C), skill complementarity is computed against combined team skills
+  const userFrontendTeammate = makeUser('u_teammate_fe', 'Teammate Frontend');
+  const userDataTeammate = makeUser('u_teammate_ml', 'Teammate ML');
+  const userSystemsCandidate = makeUser('u_cand_sys', 'Candidate Cloud & Pitch');
+
+  const extendedProfiles = {
+    ...profilesMap,
+    u_teammate_fe: {
+      ...profilesMap.u_comp,
+      uid: 'u_teammate_fe',
+      skillTags: ['React', 'TypeScript', 'Tailwind'],
+      preferredRoles: ['Frontend / UI'],
+    },
+    u_teammate_ml: {
+      ...profilesMap.u_comp,
+      uid: 'u_teammate_ml',
+      skillTags: ['Python', 'PyTorch'],
+      preferredRoles: ['ML / AI'],
+    },
+    u_cand_sys: {
+      ...profilesMap.u_comp,
+      uid: 'u_cand_sys',
+      skillTags: ['Kubernetes', 'AWS', 'Figma', 'Product Pitch'],
+      preferredRoles: ['Product / Pitch', 'Systems / Embedded'],
+    },
+  };
+
+  const team3Members = {
+    id: 'team_3p',
+    hackathonId: 'hack_scoring_test',
+    name: 'Trio Builders',
+    leaderId: 'u_viewer',
+    pitch: 'Building AI infra',
+    projectIdea: 'Agentic observability',
+    rolesNeeded: ['Product / Pitch', 'Systems / Embedded'],
+    customSpecializations: [],
+    targetSize: 4,
+    memberCount: 3,
+    status: 'open' as const,
+    createdAt: new Date().toISOString(),
+  } as unknown as import('../src/types/domain.ts').Team;
+
+  const memberships3 = [
+    {
+      id: 'm1',
+      hackathonId: 'hack_scoring_test',
+      teamId: 'team_3p',
+      uid: 'u_viewer',
+      role: 'Backend / APIs',
+      status: 'active' as const,
+      joinedAt: new Date().toISOString(),
+    },
+    {
+      id: 'm2',
+      hackathonId: 'hack_scoring_test',
+      teamId: 'team_3p',
+      uid: 'u_teammate_fe',
+      role: 'Frontend / UI',
+      status: 'active' as const,
+      joinedAt: new Date().toISOString(),
+    },
+    {
+      id: 'm3',
+      hackathonId: 'hack_scoring_test',
+      teamId: 'team_3p',
+      uid: 'u_teammate_ml',
+      role: 'ML / AI',
+      status: 'active' as const,
+      joinedAt: new Date().toISOString(),
+    },
+  ];
+
+  const teamContextRanked = rankStudentsForHackathon({
+    currentUser: userViewer,
+    currentProfile: extendedProfiles.u_viewer,
+    hackathon: sampleHackathon,
+    allUsers: [
+      userViewer,
+      userFrontendTeammate,
+      userDataTeammate,
+      userComplementary,
+      userSystemsCandidate,
+    ],
+    allProfiles: extendedProfiles,
+    participations: [],
+    teams: [team3Members],
+    memberships: memberships3,
+    existingInterests: [],
+    blocks: [],
+  });
+
+  // Teammates on the same team must be excluded from swipe feed
+  assert.ok(
+    !teamContextRanked.some(
+      (c) => c.id === 'u_teammate_fe' || c.id === 'u_teammate_ml'
+    ),
+    'Existing teammates must not appear in student discovery feed'
+  );
+  // Candidate with Product/Pitch + Systems/Cloud skills (which the 3-person team still lacks) should score higher complementarity than another Frontend/ML candidate whose skills the team already has
+  const sysCand = teamContextRanked.find((c) => c.id === 'u_cand_sys')!;
+  const dupFeMlCand = teamContextRanked.find((c) => c.id === 'u_comp')!;
+  assert.ok(
+    (sysCand.featureBreakdown.skillComplementarity ?? 0) >
+      (dupFeMlCand.featureBreakdown.skillComplementarity ?? 0),
+    '3-member team complementarity must evaluate against combined roster (A+B+C) and favor missing Product/Pitch & Cloud capabilities'
+  );
+});
+
+test('34. End-to-End Student Matching, Automatic 2-Person Team Creation, Unanimous Team Growth (2->3->4), Full Capacity Lock, Team Chat, Registration Lock, and Leave Team', async () => {
+  const { upsertUserAndProfile, createOAuthSessionRecord } = await import(
+    '../src/db/repository.ts'
+  );
+
+  const ts = Date.now();
+  const uidA = `stu_a_${ts}`;
+  const uidB = `stu_b_${ts}`;
+  const uidC = `stu_c_${ts}`;
+  const uidD = `stu_d_${ts}`;
+  const uidE = `stu_e_${ts}`;
+
+  const tokA = `pesu_tok_a_${ts}`;
+  const tokB = `pesu_tok_b_${ts}`;
+  const tokC = `pesu_tok_c_${ts}`;
+  const tokD = `pesu_tok_d_${ts}`;
+  const tokE = `pesu_tok_e_${ts}`;
+  const expiresAt = new Date(Date.now() + 3600_000);
+
+  const students = [
+    { uid: uidA, tok: tokA, name: 'Aarav Backend', sub: `PES_A_${ts}`, isAdmin: true },
+    { uid: uidB, tok: tokB, name: 'Bhavya Frontend', sub: `PES_B_${ts}`, isAdmin: false },
+    { uid: uidC, tok: tokC, name: 'Chirag ML', sub: `PES_C_${ts}`, isAdmin: false },
+    { uid: uidD, tok: tokD, name: 'Divya Systems', sub: `PES_D_${ts}`, isAdmin: false },
+    { uid: uidE, tok: tokE, name: 'Eshan Extra', sub: `PES_E_${ts}`, isAdmin: false },
+  ];
+
+  for (const s of students) {
+    await upsertUserAndProfile({
+      uid: s.uid,
+      email: `${s.uid}@pesu.pes.edu`,
+      displayName: s.name,
+      pesuOidcSub: s.sub,
+      isAdmin: s.isAdmin,
+    });
+    await createOAuthSessionRecord({
+      sessionToken: s.tok,
+      uid: s.uid,
+      pesuSub: s.sub,
+      accessToken: `acc_${s.uid}`,
+      refreshToken: null,
+      scopes: ['openid', 'profile', 'email'],
+      expiresAt,
+    });
+  }
+
+  // Publish a hackathon with minTeamSize = 2, maxTeamSize = 4
+  const candRes = await fetch(`${baseUrl}/api/hackathons/candidates`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokA}`,
+    },
+    body: JSON.stringify({
+      source: 'submitted_public_url',
+      sourceUrl: `https://events.pes.edu/quack-overhaul-${ts}`,
+      originalSubmissionUrl: `https://events.pes.edu/quack-overhaul-${ts}`,
+      verifiedCanonicalUrl: `https://events.pes.edu/quack-overhaul-${ts}`,
+      sourceUrlStatus: 'verified',
+      externalFingerprint: `pes__quack_overhaul_${ts}`,
+      title: `PES Flagship Hackathon ${ts}`,
+      organizer: 'PES Innovation Lab',
+      eventType: 'hackathon',
+      matchable: true,
+      themes: ['AI & Systems'],
+      description: '36-hour flagship buildathon.',
+      startAt: '2026-12-22',
+      endAt: '2026-12-23',
+      registrationDeadline: '2026-12-20',
+      timezone: 'Asia/Kolkata',
+      venue: { campus: 'RR Campus', name: 'MRD Auditorium' },
+      format: 'onsite',
+      teamSize: { min: 2, max: 4 },
+      registrationUrl: `https://events.pes.edu/quack-overhaul-${ts}/register`,
+      eligibilityNotes: '2 to 4 students per team',
+      fieldEvidence: {},
+      classification: { ruleGatePassed: true, mlScore: 1, reason: 'Hackathon' },
+      warnings: [],
+    }),
+  });
+  const candData = await candRes.json();
+  assert.equal(candRes.status, 201);
+
+  const approveRes = await fetch(
+    `${baseUrl}/api/admin/candidates/${candData.candidate.id}/approve`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokA}`,
+      },
+      body: JSON.stringify({
+        minTeamSize: 2,
+        maxTeamSize: 4,
+        eventType: 'hackathon',
+        matchable: true,
+        campus: 'RR Campus',
+      }),
+    }
+  );
+  const approveData = await approveRes.json();
+  assert.equal(approveRes.status, 200);
+  const hackathonId = approveData.hackathon.id;
+
+  // 1. Verify GET /api/discovery/students returns only student profiles (never teams)
+  const discRes = await fetch(
+    `${baseUrl}/api/discovery/students?hackathonId=${encodeURIComponent(hackathonId)}`,
+    { headers: { Authorization: `Bearer ${tokA}` } }
+  );
+  const discData = await discRes.json();
+  assert.equal(discRes.status, 200);
+  assert.equal(discData.ok, true);
+  assert.ok(Array.isArray(discData.students));
+  assert.ok(discData.students.every((c: { type: string }) => c.type === 'person'));
+  assert.ok(!discData.students.some((c: { id: string }) => c.id === uidA));
+
+  // 2. Student A swipes right on Student B -> added to A's shortlist ("Interested"), no team yet
+  const swipeAB = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokA}`,
+    },
+    body: JSON.stringify({
+      hackathonId,
+      targetType: 'user',
+      targetId: uidB,
+      decision: 'interested',
+      proposedRole: 'Frontend / UI',
+    }),
+  });
+  const swipeABData = await swipeAB.json();
+  assert.equal(swipeAB.status, 200);
+  assert.equal(swipeABData.autoCreatedTeam, undefined);
+
+  // Check B's shortlist -> A appears under "incomingInterested" (Interested in You)
+  const shortlistB1 = await fetch(
+    `${baseUrl}/api/swipes/shortlist?hackathonId=${encodeURIComponent(hackathonId)}`,
+    { headers: { Authorization: `Bearer ${tokB}` } }
+  );
+  const shortlistB1Data = await shortlistB1.json();
+  assert.equal(shortlistB1.status, 200);
+  assert.ok(
+    shortlistB1Data.shortlist.incomingInterested.some(
+      (e: { uid: string }) => e.uid === uidA
+    ),
+    'Student A must appear in Student B incomingInterested shortlist'
+  );
+
+  // 3. Student B swipes right on Student A -> Mutual Match automatically creates a 2-person team!
+  const swipeBA = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokB}`,
+    },
+    body: JSON.stringify({
+      hackathonId,
+      targetType: 'user',
+      targetId: uidA,
+      decision: 'interested',
+      proposedRole: 'Backend / APIs',
+    }),
+  });
+  const swipeBAData = await swipeBA.json();
+  assert.equal(swipeBA.status, 200);
+  assert.ok(
+    swipeBAData.autoCreatedTeam,
+    'Mutual right-swipe between two solo students must automatically create a 2-person team'
+  );
+  assert.equal(swipeBAData.autoCreatedTeam.memberCount, 2);
+  assert.equal(swipeBAData.autoCreatedTeam.targetSize, 4);
+  assert.equal(swipeBAData.autoCreatedMemberships.length, 2);
+  assert.ok(swipeBAData.matchedConversation);
+  assert.ok(swipeBAData.teamRosterConversation);
+
+  const autoTeamId = swipeBAData.autoCreatedTeam.id;
+
+  // Verify GET /api/teams/me returns the newly formed 2-person team for both A and B
+  const myTeamARes = await fetch(
+    `${baseUrl}/api/teams/me?hackathonId=${encodeURIComponent(hackathonId)}`,
+    { headers: { Authorization: `Bearer ${tokA}` } }
+  );
+  const myTeamAData = await myTeamARes.json();
+  assert.equal(myTeamARes.status, 200);
+  assert.equal(myTeamAData.teams.length, 1);
+  assert.equal(myTeamAData.teams[0].team.id, autoTeamId);
+  assert.equal(myTeamAData.teams[0].members.length, 2);
+  assert.equal(
+    myTeamAData.teams[0].registration.registrationStatus,
+    'ready_to_register',
+    '2-person team meets minTeamSize=2 and should be ready_to_register'
+  );
+
+  // 4. Growing the existing 2-person team (A + B) to 3 members (adding C) via unanimous vote + candidate consent
+  // Member A swipes right on Student C
+  const swipeAC = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokA}`,
+    },
+    body: JSON.stringify({
+      hackathonId,
+      targetType: 'user',
+      targetId: uidC,
+      decision: 'interested',
+      proposedRole: 'ML / AI',
+    }),
+  });
+  assert.equal(swipeAC.status, 200);
+
+  // Student C swipes right on Member A -> creates a team_proposal (status: 'pending_team_vote' because B hasn't voted yet)
+  const swipeCA = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokC}`,
+    },
+    body: JSON.stringify({
+      hackathonId,
+      targetType: 'user',
+      targetId: uidA,
+      decision: 'interested',
+      proposedRole: 'Backend / APIs',
+    }),
+  });
+  const swipeCAData = await swipeCA.json();
+  assert.equal(swipeCA.status, 200);
+  assert.ok(
+    swipeCAData.teamProposal,
+    'Mutual interest with a student already in a team must create a team_proposal'
+  );
+  assert.equal(swipeCAData.teamProposal.status, 'pending_votes');
+  assert.equal(swipeCAData.teamProposal.candidateUid, uidC);
+  const proposalCId = swipeCAData.teamProposal.id;
+
+  // Candidate C CANNOT accept the proposal before all current team members (A and B) approve
+  const prematureAccept = await fetch(
+    `${baseUrl}/api/teams/proposals/${proposalCId}/accept`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokC}`,
+      },
+      body: JSON.stringify({ decision: 'accept' }),
+    }
+  );
+  assert.equal(
+    prematureAccept.status,
+    409,
+    'Candidate cannot accept before unanimous approval from all current team members'
+  );
+
+  // Teammate B votes to approve C -> unanimous approval achieved! Proposal transitions to 'invited'
+  const voteBForC = await fetch(
+    `${baseUrl}/api/teams/proposals/${proposalCId}/vote`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokB}`,
+      },
+      body: JSON.stringify({ vote: 'approve' }),
+    }
+  );
+  const voteBForCData = await voteBForC.json();
+  assert.equal(voteBForC.status, 200);
+  assert.equal(voteBForCData.unanimouslyApproved, true);
+  assert.equal(voteBForCData.proposal.status, 'invited');
+
+  // Candidate C now accepts the invitation -> joins team (3/4 members)
+  const acceptC = await fetch(
+    `${baseUrl}/api/teams/proposals/${proposalCId}/accept`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokC}`,
+      },
+      body: JSON.stringify({ decision: 'accept' }),
+    }
+  );
+  const acceptCData = await acceptC.json();
+  assert.equal(acceptC.status, 200);
+  assert.equal(acceptCData.proposal.status, 'accepted');
+  assert.equal(acceptCData.team.memberCount, 3);
+  assert.equal(acceptCData.team.status, 'open');
+
+  // 5. Grow from 3/4 to 4/4 (adding D) and verify full capacity lock + pending proposal expiration
+  // First create a pending proposal for Student E as well so we can verify it auto-expires when D fills the 4th slot
+  await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokA}`,
+    },
+    body: JSON.stringify({
+      hackathonId,
+      targetType: 'user',
+      targetId: uidE,
+      decision: 'interested',
+    }),
+  });
+  const swipeEA = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokE}`,
+    },
+    body: JSON.stringify({
+      hackathonId,
+      targetType: 'user',
+      targetId: uidA,
+      decision: 'interested',
+    }),
+  });
+  const swipeEAData = await swipeEA.json();
+  const proposalEId = swipeEAData.teamProposal.id;
+
+  // Now A and D match -> B and C both vote approve -> D accepts -> team reaches 4/4!
+  await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokA}`,
+    },
+    body: JSON.stringify({
+      hackathonId,
+      targetType: 'user',
+      targetId: uidD,
+      decision: 'interested',
+    }),
+  });
+  const swipeDA = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokD}`,
+    },
+    body: JSON.stringify({
+      hackathonId,
+      targetType: 'user',
+      targetId: uidA,
+      decision: 'interested',
+    }),
+  });
+  const swipeDAData = await swipeDA.json();
+  const proposalDId = swipeDAData.teamProposal.id;
+
+  // B votes approve (still waiting on C since team has 3 members: A, B, C)
+  const voteBForD = await fetch(
+    `${baseUrl}/api/teams/proposals/${proposalDId}/vote`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokB}`,
+      },
+      body: JSON.stringify({ vote: 'approve' }),
+    }
+  );
+  const voteBForDData = await voteBForD.json();
+  assert.equal(
+    voteBForDData.unanimouslyApproved,
+    false,
+    'With 3 current team members (A, B, C), B voting alone is not yet unanimous'
+  );
+
+  // C votes approve -> now all 3 members (A, B, C) have approved!
+  const voteCForD = await fetch(
+    `${baseUrl}/api/teams/proposals/${proposalDId}/vote`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokC}`,
+      },
+      body: JSON.stringify({ vote: 'approve' }),
+    }
+  );
+  const voteCForDData = await voteCForD.json();
+  assert.equal(voteCForDData.unanimouslyApproved, true);
+  assert.equal(voteCForDData.proposal.status, 'invited');
+
+  // D accepts -> team reaches 4/4 ('full') and proposalE auto-expires!
+  const acceptD = await fetch(
+    `${baseUrl}/api/teams/proposals/${proposalDId}/accept`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokD}`,
+      },
+      body: JSON.stringify({ decision: 'accept' }),
+    }
+  );
+  const acceptDData = await acceptD.json();
+  assert.equal(acceptD.status, 200);
+  assert.equal(acceptDData.team.memberCount, 4);
+  assert.equal(acceptDData.team.status, 'full');
+
+  // Verify proposalE was automatically expired when team reached 4/4
+  const teamDetailsFull = await fetch(`${baseUrl}/api/teams/${autoTeamId}`, {
+    headers: { Authorization: `Bearer ${tokA}` },
+  });
+  const teamDetailsFullData = await teamDetailsFull.json();
+  const expiredPropE = teamDetailsFullData.proposals.find(
+    (p: { id: string }) => p.id === proposalEId
+  );
+  assert.equal(
+    expiredPropE.status,
+    'expired',
+    'Pending proposals must auto-expire when team reaches max capacity (4/4)'
+  );
+
+  // 6. Team Chat: members can post and read messages; non-member E gets 403
+  const postChatRes = await fetch(
+    `${baseUrl}/api/teams/${autoTeamId}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokC}`,
+      },
+      body: JSON.stringify({
+        body: 'Hey team, excited to build together as a 4-person squad!',
+      }),
+    }
+  );
+  assert.equal(postChatRes.status, 201);
+
+  const getChatRes = await fetch(
+    `${baseUrl}/api/teams/${autoTeamId}/messages`,
+    { headers: { Authorization: `Bearer ${tokA}` } }
+  );
+  const getChatData = await getChatRes.json();
+  assert.equal(getChatRes.status, 200);
+  assert.ok(
+    getChatData.messages.some(
+      (m: { senderUid: string; body: string }) =>
+        m.senderUid === uidC && m.body.includes('4-person squad')
+    )
+  );
+
+  const nonMemberChatRes = await fetch(
+    `${baseUrl}/api/teams/${autoTeamId}/messages`,
+    { headers: { Authorization: `Bearer ${tokE}` } }
+  );
+  assert.equal(
+    nonMemberChatRes.status,
+    403,
+    'Non-member must receive 403 when accessing team chat'
+  );
+
+  // 7. Hackathon Registration: mark team as 'registered' with reference ID -> blocks silent roster changes
+  const regRes = await fetch(
+    `${baseUrl}/api/teams/${autoTeamId}/registration`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokA}`,
+      },
+      body: JSON.stringify({
+        registrationStatus: 'registered',
+        externalRegistrationReference: 'PES-REG-9988',
+        confirmationNotes: 'Submitted on official PES portal',
+      }),
+    }
+  );
+  const regData = await regRes.json();
+  assert.equal(regRes.status, 200);
+  assert.equal(regData.registration.registrationStatus, 'registered');
+  assert.equal(
+    regData.registration.externalRegistrationReference,
+    'PES-REG-9988'
+  );
+
+  // Leaving a registered team is blocked with 409 until registration status is amended
+  const blockedLeaveRes = await fetch(
+    `${baseUrl}/api/teams/${autoTeamId}/leave`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tokD}` },
+    }
+  );
+  assert.equal(
+    blockedLeaveRes.status,
+    409,
+    'Cannot silently leave a team that is already marked as registered'
+  );
+
+  // Amend registration back to 'ready_to_register' -> Leader A leaves team -> leaderId reassigns and status reopens to 'open' (3/4)
+  await fetch(`${baseUrl}/api/teams/${autoTeamId}/registration`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokA}`,
+    },
+    body: JSON.stringify({
+      registrationStatus: 'ready_to_register',
+    }),
+  });
+
+  const leaveARes = await fetch(`${baseUrl}/api/teams/${autoTeamId}/leave`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${tokA}` },
+  });
+  const leaveAData = await leaveARes.json();
+  assert.equal(leaveARes.status, 200);
+  assert.equal(leaveAData.remainingMembers, 3);
+  assert.equal(leaveAData.dissolved, false);
+
+  const afterLeaveTeam = await fetch(`${baseUrl}/api/teams/${autoTeamId}`, {
+    headers: { Authorization: `Bearer ${tokB}` },
+  });
+  const afterLeaveData = await afterLeaveTeam.json();
+  assert.equal(afterLeaveData.team.memberCount, 3);
+  assert.equal(
+    afterLeaveData.team.status,
+    'open',
+    'Leaving a full 4/4 team must reopen recruitment status to open (3/4)'
+  );
+  assert.notEqual(
+    afterLeaveData.team.leaderId,
+    uidA,
+    'Leader must be reassigned to a remaining active member when previous leader leaves'
+  );
+});
+
+test('35. Edge Cases: Single member rejection blocks invitation, and accepting one team invitation atomically invalidates competing invitations in the same hackathon', async () => {
+  const { upsertUserAndProfile, createOAuthSessionRecord } = await import(
+    '../src/db/repository.ts'
+  );
+
+  const ts = Date.now();
+  const uidT1A = `t1a_${ts}`;
+  const uidT1B = `t1b_${ts}`;
+  const uidT2A = `t2a_${ts}`;
+  const uidT2B = `t2b_${ts}`;
+  const uidCand = `cand_${ts}`;
+  const uidRejected = `rej_${ts}`;
+
+  const tokT1A = `pesu_tok_t1a_${ts}`;
+  const tokT1B = `pesu_tok_t1b_${ts}`;
+  const tokT2A = `pesu_tok_t2a_${ts}`;
+  const tokT2B = `pesu_tok_t2b_${ts}`;
+  const tokCand = `pesu_tok_cand_${ts}`;
+  const tokRejected = `pesu_tok_rej_${ts}`;
+  const expiresAt = new Date(Date.now() + 3600_000);
+
+  for (const u of [
+    { uid: uidT1A, tok: tokT1A, name: 'Team1 Alpha', isAdmin: true },
+    { uid: uidT1B, tok: tokT1B, name: 'Team1 Beta', isAdmin: false },
+    { uid: uidT2A, tok: tokT2A, name: 'Team2 Alpha', isAdmin: false },
+    { uid: uidT2B, tok: tokT2B, name: 'Team2 Beta', isAdmin: false },
+    { uid: uidCand, tok: tokCand, name: 'Sought-After Candidate', isAdmin: false },
+    { uid: uidRejected, tok: tokRejected, name: 'Rejected Candidate', isAdmin: false },
+  ]) {
+    await upsertUserAndProfile({
+      uid: u.uid,
+      email: `${u.uid}@pesu.pes.edu`,
+      displayName: u.name,
+      pesuOidcSub: `SUB_${u.uid}`,
+      isAdmin: u.isAdmin,
+    });
+    await createOAuthSessionRecord({
+      sessionToken: u.tok,
+      uid: u.uid,
+      pesuSub: `SUB_${u.uid}`,
+      accessToken: `acc_${u.uid}`,
+      refreshToken: null,
+      scopes: ['openid', 'profile', 'email'],
+      expiresAt,
+    });
+  }
+
+  // Publish hackathon
+  const candRes = await fetch(`${baseUrl}/api/hackathons/candidates`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokT1A}`,
+    },
+    body: JSON.stringify({
+      source: 'submitted_public_url',
+      sourceUrl: `https://events.pes.edu/competing-teams-${ts}`,
+      originalSubmissionUrl: `https://events.pes.edu/competing-teams-${ts}`,
+      verifiedCanonicalUrl: `https://events.pes.edu/competing-teams-${ts}`,
+      sourceUrlStatus: 'verified',
+      externalFingerprint: `pes__competing_${ts}`,
+      title: `Competing Teams Hackathon ${ts}`,
+      organizer: 'PES University',
+      eventType: 'hackathon',
+      matchable: true,
+      themes: ['Systems'],
+      description: 'Hackathon for testing competing team invitations.',
+      startAt: '2026-12-24',
+      endAt: '2026-12-25',
+      registrationDeadline: '2026-12-22',
+      timezone: 'Asia/Kolkata',
+      venue: { campus: 'EC Campus', name: 'Main Auditorium' },
+      format: 'onsite',
+      teamSize: { min: 2, max: 4 },
+      registrationUrl: `https://events.pes.edu/competing-teams-${ts}`,
+      eligibilityNotes: 'Open to all',
+      fieldEvidence: {},
+      classification: { ruleGatePassed: true, mlScore: 1, reason: 'Hackathon' },
+      warnings: [],
+    }),
+  });
+  const candData = await candRes.json();
+  const approveRes = await fetch(
+    `${baseUrl}/api/admin/candidates/${candData.candidate.id}/approve`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokT1A}`,
+      },
+      body: JSON.stringify({
+        minTeamSize: 2,
+        maxTeamSize: 4,
+        eventType: 'hackathon',
+        matchable: true,
+        campus: 'EC Campus',
+      }),
+    }
+  );
+  const hackathonId = (await approveRes.json()).hackathon.id;
+
+  // Form Team 1 (uidT1A + uidT1B) and Team 2 (uidT2A + uidT2B) via mutual right swipes
+  await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT1A}` },
+    body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidT1B, decision: 'interested' }),
+  });
+  const t1Match = await (
+    await fetch(`${baseUrl}/api/swipes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT1B}` },
+      body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidT1A, decision: 'interested' }),
+    })
+  ).json();
+  const team1Id = t1Match.autoCreatedTeam.id;
+
+  await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT2A}` },
+    body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidT2B, decision: 'interested' }),
+  });
+  const t2Match = await (
+    await fetch(`${baseUrl}/api/swipes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT2B}` },
+      body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidT2A, decision: 'interested' }),
+    })
+  ).json();
+  const team2Id = t2Match.autoCreatedTeam.id;
+
+  // Case 1: uidT1A matches with uidRejected -> uidT1B votes REJECT -> proposal immediately marked 'rejected'
+  await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT1A}` },
+    body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidRejected, decision: 'interested' }),
+  });
+  const rejPropRes = await (
+    await fetch(`${baseUrl}/api/swipes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokRejected}` },
+      body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidT1A, decision: 'interested' }),
+    })
+  ).json();
+  const rejPropId = rejPropRes.teamProposal.id;
+
+  const rejectVoteRes = await fetch(
+    `${baseUrl}/api/teams/proposals/${rejPropId}/vote`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT1B}` },
+      body: JSON.stringify({ vote: 'reject' }),
+    }
+  );
+  const rejectVoteData = await rejectVoteRes.json();
+  assert.equal(rejectVoteRes.status, 200);
+  assert.equal(rejectVoteData.proposal.status, 'rejected');
+
+  // Case 2: uidCand matches with BOTH Team 1 and Team 2, and both teams unanimously approve -> uidCand receives 2 competing invitations
+  await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT1A}` },
+    body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidCand, decision: 'interested' }),
+  });
+  const prop1Data = await (
+    await fetch(`${baseUrl}/api/swipes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokCand}` },
+      body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidT1A, decision: 'interested' }),
+    })
+  ).json();
+  const prop1Id = prop1Data.teamProposal.id;
+
+  await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT2A}` },
+    body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidCand, decision: 'interested' }),
+  });
+  const prop2Data = await (
+    await fetch(`${baseUrl}/api/swipes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokCand}` },
+      body: JSON.stringify({ hackathonId, targetType: 'user', targetId: uidT2A, decision: 'interested' }),
+    })
+  ).json();
+  const prop2Id = prop2Data.teamProposal.id;
+
+  // Both Team 1 (uidT1B) and Team 2 (uidT2B) vote approve -> both proposals transition to 'invited'
+  await fetch(`${baseUrl}/api/teams/proposals/${prop1Id}/vote`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT1B}` },
+    body: JSON.stringify({ vote: 'approve' }),
+  });
+  await fetch(`${baseUrl}/api/teams/proposals/${prop2Id}/vote`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokT2B}` },
+    body: JSON.stringify({ vote: 'approve' }),
+  });
+
+  // Candidate accepts Team 1 -> joins Team 1 (3/4) AND Team 2's invitation is atomically expired
+  const acceptTeam1 = await fetch(
+    `${baseUrl}/api/teams/proposals/${prop1Id}/accept`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokCand}` },
+      body: JSON.stringify({ decision: 'accept' }),
+    }
+  );
+  assert.equal(acceptTeam1.status, 200);
+
+  // Attempting to also accept Team 2 must fail with 409
+  const acceptTeam2 = await fetch(
+    `${baseUrl}/api/teams/proposals/${prop2Id}/accept`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokCand}` },
+      body: JSON.stringify({ decision: 'accept' }),
+    }
+  );
+  assert.equal(
+    acceptTeam2.status,
+    409,
+    'Candidate cannot join a second team in the same hackathon after accepting Team 1'
+  );
+
+  // Verify Team 2 still has only 2 members and prop2 status is 'expired'
+  const team2Inspect = await (
+    await fetch(`${baseUrl}/api/teams/${team2Id}`, {
+      headers: { Authorization: `Bearer ${tokT2A}` },
+    })
+  ).json();
+  assert.equal(team2Inspect.team.memberCount, 2);
+  const prop2After = team2Inspect.proposals.find(
+    (p: { id: string }) => p.id === prop2Id
+  );
+  assert.equal(prop2After.status, 'expired');
+  assert.notEqual(team1Id, team2Id);
+});
+
+test('36. PESU Announcements HTML 403 upstream error handling (PROVIDER_UNAVAILABLE 502 + homepageBannersSupported=false) and public events.pes.edu pagination extraction', async () => {
+  const {
+    upsertUserAndProfile,
+    updateUserProfileAndPrivacy,
+    createOAuthSessionRecord,
+  } = await import('../src/db/repository.ts');
+  const { extractPesuEventsPaginationLinks } = await import(
+    '../src/lib/eventsAndAnnouncements.ts'
+  );
+
+  // 1. Verify extractPesuEventsPaginationLinks discovers ?page=2, ?page=3 links on events.pes.edu/browse/...
+  const sampleBrowseHtml = `
+    <html>
+      <body>
+        <div class="events-list">
+          <a href="/events/hack-1">Hack 1</a>
+        </div>
+        <nav class="pagination">
+          <a href="/browse/7?page=1">1</a>
+          <a href="/browse/7?page=2">2</a>
+          <a href="https://events.pes.edu/browse/7?page=3">3</a>
+          <a href="/browse/99?page=2">Different Category</a>
+        </nav>
+      </body>
+    </html>
+  `;
+  const pageLinks = extractPesuEventsPaginationLinks(
+    sampleBrowseHtml,
+    'https://events.pes.edu/browse/7'
+  );
+  assert.deepEqual(
+    pageLinks,
+    [
+      'https://events.pes.edu/browse/7?page=2',
+      'https://events.pes.edu/browse/7?page=3',
+    ],
+    'Must extract valid pagination links for the current browse category and ignore page 1 or other categories'
+  );
+
+  // 2. Verify GET /api/pesu/announcements?refresh=true returns PROVIDER_UNAVAILABLE (502) and homepageBannersSupported=false when upstream returns an HTML 403 page (even when user has announcements:read)
+  const ts = Date.now();
+  const uidAnn = `pesu_ann_html403_${ts}`;
+  const tokAnn = `pesu_tok_ann_html403_${ts}`;
+
+  const { profile: annProfile } = await upsertUserAndProfile({
+    uid: uidAnn,
+    email: `${uidAnn}@pesu.pes.edu`,
+    displayName: 'Announcement Tester',
+    pesuOidcSub: `SUB_${uidAnn}`,
+    isAdmin: false,
+  });
+  await updateUserProfileAndPrivacy({
+    uid: uidAnn,
+    profile: annProfile,
+    privacyPreferences: {
+      profileVisible: true,
+      githubConsent: false,
+      aiEnrichmentConsent: false,
+      academyAnnouncementsOptIn: true,
+      academyTimetableOptIn: false,
+    },
+  });
+  await createOAuthSessionRecord({
+    sessionToken: tokAnn,
+    uid: uidAnn,
+    pesuSub: `SUB_${uidAnn}`,
+    accessToken: 'valid_token_with_announcements_scope',
+    refreshToken: null,
+    scopes: ['openid', 'profile', 'email', 'announcements:read'],
+    expiresAt: new Date(Date.now() + 3600_000),
+  });
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/api/v1/announcements')) {
+        return new Response(
+          '<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1><p>Upstream Render/Cloudflare block</p></body></html>',
+          {
+            status: 403,
+            headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          }
+        );
+      }
+      return new Response('{}', { status: 200 });
+    },
+  });
+
+  try {
+    const annRes = await fetch(
+      `${baseUrl}/api/pesu/announcements?refresh=true`,
+      {
+        headers: { Authorization: `Bearer ${tokAnn}` },
+      }
+    );
+    const annData = await annRes.json();
+    assert.equal(
+      annRes.status,
+      502,
+      'Upstream HTML 403 proxy error when user already has announcements:read scope must return 502 PROVIDER_UNAVAILABLE, not 403 MISSING_ANNOUNCEMENTS_SCOPE'
+    );
+    assert.equal(annData.errorCode, 'PROVIDER_UNAVAILABLE');
+    assert.equal(annData.homepageBannersSupported, false);
+    assert.ok(
+      typeof annData.homepageBannersNote === 'string' &&
+        annData.homepageBannersNote.includes('homepage carousel banners'),
+      'Response must explicitly document that PESU Academy homepage carousel banners are not exposed by the API'
+    );
+  } finally {
+    resetServerTestOverrides();
+  }
+});
+
+
 
 
 

@@ -1287,6 +1287,23 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
               <strong>delegated mode</strong>, which requires the provider (
               <code className="font-mono text-[11px]">pesu-oauth2.onrender.com</code>) to seal your PESU Academy credentials in an encrypted vault to fetch announcements on your behalf. Quackathon never receives your password, never exposes your Academy access token to the browser, and never publishes your private announcements automatically.
             </p>
+
+            <div className="pt-2 border-t border-amber-200/70 dark:border-amber-800/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
+              <p className="text-slate-600 dark:text-slate-300">
+                <strong>Missing a PESU Academy Homepage Banner Event?</strong>{' '}
+                Homepage carousel banners (e.g., ReRo Online Hackathon, International Hour, The Alumni Playbook, Weekend CTF Workshops) are rendered by a separate portal widget not exposed by{' '}
+                <code className="font-mono text-[11px]">/api/v1/announcements</code>.
+              </p>
+              <button
+                type="button"
+                data-testid="submit-homepage-banner-btn"
+                onClick={() => setShowSubmitModal(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-blue-600 text-white text-xs font-semibold hover:opacity-90 shrink-0 cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Submit Banner / Poster / Event Link</span>
+              </button>
+            </div>
           </div>
 
           {/* State 1: Opt-In Required */}

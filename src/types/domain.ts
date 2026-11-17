@@ -62,6 +62,7 @@ export interface User {
   campus: CampusType;
   program?: string;
   graduationYear?: number;
+  verified?: boolean;
   verificationStatus: 'verified_pesu_oidc' | 'pilot_invite' | 'unverified';
   pesuOidcSub: string;
   isAdmin?: boolean;
@@ -90,6 +91,7 @@ export interface Profile {
   uid: string;
   headline: string;
   about: string;
+  bio?: string;
   skillTags: string[];
   interestTags: string[];
   projectDomains: string[];
@@ -289,7 +291,7 @@ export interface Team {
   workStyleTags: string[];
   targetSize: number;
   memberCount: number;
-  status: 'open' | 'full' | 'locked';
+  status: 'open' | 'full' | 'locked' | 'dissolved';
   visibility: 'public' | 'unlisted';
   createdAt: string;
 }
@@ -311,6 +313,7 @@ export interface Interest {
   targetType: 'user' | 'team';
   targetId: string;
   decision: 'interested' | 'passed';
+  note?: string;
   createdAt: string;
 }
 
@@ -362,8 +365,16 @@ export interface CandidateCard {
   customSpecializations?: string[];
   matchedSpecializations?: string[];
   rolesWantToLearn?: string[];
-  featuredEvidence: { title: string; description: string; url?: string; isCoursework?: boolean }[];
+  featuredEvidence: {
+    title: string;
+    description: string;
+    url?: string;
+    isCoursework?: boolean;
+    tech?: string[];
+  }[];
   compatibilityReasons: string[];
+  overallScore?: number;
+  reasons?: string[];
   remainingSlots?: number;
   targetSize?: number;
   memberCount?: number;
@@ -382,6 +393,7 @@ export interface CandidateCard {
     availabilitySim: number;
     collabOrSkillSim: number;
     coldStartRedistributed: boolean;
+    skillComplementarity?: number;
     skillComplementarityScore?: number;
     sharedInterestsScore?: number;
     pastSwipeAffinityScore?: number;
@@ -421,9 +433,11 @@ export interface TeamProposal {
   candidateHeadline?: string;
   candidateSkills?: string[];
   proposedByUid: string;
+  proposerUid?: string;
   proposedByName?: string;
   proposedRole: string;
   message?: string;
+  note?: string;
   status: TeamProposalStatus;
   resolutionNote?: string;
   votes: TeamProposalVote[];
@@ -447,6 +461,7 @@ export interface TeamRegistration {
   hackathonId: string;
   registrationStatus: TeamRegistrationStatus;
   officialRegistrationUrl: string | null;
+  registrationUrlSnapshot?: string | null;
   externalRegistrationReference?: string | null;
   confirmationNotes?: string | null;
   registeredByUid?: string | null;
@@ -456,6 +471,12 @@ export interface TeamRegistration {
   currentMemberCount: number;
   isEligibleToRegister: boolean;
   readinessReason: string;
+  minTeamSizeSnapshot?: number;
+  maxTeamSizeSnapshot?: number;
+  currentMemberCountSnapshot?: number;
+  memberCountAtCheck?: number;
+  eligibleToRegister?: boolean;
+  eligibilityReason?: string;
   updatedAt: string;
 }
 

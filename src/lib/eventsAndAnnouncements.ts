@@ -1910,3 +1910,53 @@ export function getHackathonSourceLabel(h: Hackathon): {
     sourceType: 'submitted_public_url',
   };
 }
+
+export const PESU_HOMEPAGE_BANNERS_NOTE =
+  'PESU Academy homepage carousel banners (such as ReRo Online Hackathon, International Hour, The Alumni Playbook, or Weekend CTF Workshops) are rendered by a separate portal widget that is not exposed by the PESU OAuth2 /api/v1/announcements endpoint. You can add any homepage banner event directly using "Submit Banner / Poster / Event Link".';
+
+/**
+ * Extracts bounded pagination URLs from an `events.pes.edu/browse/...` HTML listing page.
+ */
+export function extractPesuEventsPaginationLinks(
+  html: string,
+  currentBrowseUrl: string,
+  maxPagesPerCategory = 4
+): string[] {
+  if (!html || typeof html !== 'string') return [];
+  const results: string[] = [];
+  const seen = new Set<string>([currentBrowseUrl]);
+
+  let baseUrl: URL;
+  try {
+    baseUrl = new URL(currentBrowseUrl);
+  } catch {
+    return [];
+  }
+
+  const hrefRegex = /href=["']([^"']*(?:\?|&amp;|&)page=(\d+)[^"']*)["']/gi;
+  let match: RegExpExecArray | null;
+  while ((match = hrefRegex.exec(html)) !== null) {
+    const rawHref = match[1].replace(/&amp;/gi, '&').trim();
+    const pageNum = parseInt(match[2], 10);
+    if (!Number.isFinite(pageNum) || pageNum < 2 || pageNum > maxPagesPerCategory) {
+      continue;
+    }
+    try {
+      const resolved = new URL(rawHref, baseUrl);
+      if (resolved.hostname.toLowerCase() !== 'events.pes.edu') continue;
+      if (resolved.pathname.replace(/\/+$/, '') !== baseUrl.pathname.replace(/\/+$/, '')) {
+        continue;
+      }
+      const full = resolved.toString();
+      if (!seen.has(full)) {
+        seen.add(full);
+        results.push(full);
+      }
+    } catch {
+      // Ignore malformed hrefs
+    }
+  }
+
+  return results;
+}
+
