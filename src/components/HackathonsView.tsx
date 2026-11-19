@@ -82,6 +82,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
       null
     );
     const [isFetchingAcademy, setIsFetchingAcademy] = useState(false);
+    const [scopeMissing, setScopeMissing] = useState(false);
 
     // Suggest Event Modal state (Requirement #5: no hardcoded fake defaults; unknown fields remain null/empty)
     const [showSuggestModal, setShowSuggestModal] = useState(false);
@@ -183,9 +184,12 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
     const handleFetchAcademyAnnouncements = async () => {
       setIsFetchingAcademy(true);
       setAcademyStatusMsg(null);
+      setScopeMissing(false);
       try {
         const res = await apiFetch<{
           ok: boolean;
+          errorCode?: string;
+          requiresScopeGrant?: boolean;
           announcements?: Array<{
             id: string;
             title: string;
@@ -193,9 +197,11 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
             body: string;
           }>;
           error?: string;
+          userMessage?: string;
         }>('/api/pesu/announcements');
 
         if (res.ok && res.data?.ok) {
+          setScopeMissing(false);
           setLiveAcademyAnnouncements(res.data.announcements ?? []);
           setAcademyStatusMsg(
             res.data.announcements?.length
@@ -203,8 +209,15 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
               : 'No new hackathon announcements found in PESU Academy.'
           );
         } else {
+          const isMissingScope =
+            res.data?.errorCode === 'MISSING_ANNOUNCEMENTS_SCOPE' ||
+            res.data?.requiresScopeGrant ||
+            res.data?.error?.toLowerCase().includes('announcements:read') ||
+            res.errorMessage?.toLowerCase().includes('announcements:read');
+          setScopeMissing(Boolean(isMissingScope));
           setAcademyStatusMsg(
-            res.data?.error ||
+            res.data?.userMessage ||
+              res.data?.error ||
               res.errorMessage ||
               'PESU Academy announcement retrieval is currently unavailable.'
           );
@@ -739,10 +752,36 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
             </div>
 
             {showAcademySection && (
-              <div className="p-4 border-t border-slate-100 dark:border-slate-800 space-y-2.5 text-xs">
+              <div className="p-4 border-t border-slate-100 dark:border-slate-800 space-y-3 text-xs">
                 {academyStatusMsg && (
                   <p className="text-slate-600 dark:text-slate-400">
                     {academyStatusMsg}
+                  </p>
+                )}
+
+                {scopeMissing && onConnectPesuAcademy && (
+                  <div className="p-3.5 bg-blue-50/90 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="space-y-0.5">
+                      <div className="font-semibold text-blue-900 dark:text-blue-200">
+                        Authorize PESU Academy Scope
+                      </div>
+                      <p className="text-blue-700 dark:text-blue-300">
+                        Your PESU sign-in currently has identity-only permissions. Grant <code className="font-mono text-[11px] bg-blue-100 dark:bg-blue-900/60 px-1 py-0.5 rounded">announcements:read</code> to sync campus notices.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onConnectPesuAcademy('redirect')}
+                      className="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs shrink-0 cursor-pointer shadow-sm transition-colors"
+                    >
+                      Authorize via PESU OAuth2
+                    </button>
+                  </div>
+                )}
+
+                {!academyStatusMsg && liveAcademyAnnouncements.length === 0 && myAcademyHints.length === 0 && (
+                  <p className="text-slate-500">
+                    Click &ldquo;Check PESU Academy&rdquo; above to sync your private campus announcements.
                   </p>
                 )}
                 {liveAcademyAnnouncements.map((ann) => (
