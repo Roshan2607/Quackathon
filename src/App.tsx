@@ -154,8 +154,13 @@ const LoginPage: React.FC<{
       )}
       <div className="max-w-md w-full text-center space-y-8 bg-white dark:bg-slate-900 p-8 sm:p-10 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-xl shadow-slate-100 dark:shadow-none">
         {/* Quackathon Logo */}
-        <div className="mx-auto w-16 h-16 rounded-2xl bg-slate-900 dark:bg-blue-600 text-amber-400 dark:text-white flex items-center justify-center font-black text-2xl shadow-md">
-          Q
+        <div className="flex flex-col items-center gap-2">
+          <div className="w-16 h-16 rounded-2xl bg-amber-400 text-slate-950 flex items-center justify-center text-3xl shadow-md select-none border border-amber-300">
+            🦆
+          </div>
+          <span className="text-base font-extrabold tracking-tight text-slate-800 dark:text-slate-200">
+            Quackathon
+          </span>
         </div>
 
         {/* Heading & One-Sentence Description */}
@@ -173,7 +178,7 @@ const LoginPage: React.FC<{
           <button
             type="button"
             disabled={isSigningIn}
-            onClick={onSignInWithPesu}
+            onClick={() => onSignInWithPesu()}
             className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <LogIn className="w-4 h-4" />
@@ -609,9 +614,10 @@ export function App() {
   // Authentication Handlers
   const handleSignInWithPesu = useCallback(
     async (
-      mode: 'popup' | 'redirect' = 'redirect',
+      modeInput?: 'popup' | 'redirect' | unknown,
       requestedScopes: string[] = ['openid', 'profile', 'email']
     ) => {
+      const mode: 'popup' | 'redirect' = modeInput === 'popup' ? 'popup' : 'redirect';
       // If full-page redirect mode is requested from inside an embedded iframe,
       // launch the canonical application URL in a top-level tab so cookies are 1st-party.
       if (mode === 'redirect' && isEmbeddedPreview) {
@@ -1590,7 +1596,7 @@ export function App() {
   if (!authenticatedUser) {
     return (
       <LoginPage
-        onSignInWithPesu={handleSignInWithPesu}
+        onSignInWithPesu={() => void handleSignInWithPesu('redirect')}
         isSigningIn={isSigningIn}
         toastMessage={toastMessage}
       />
