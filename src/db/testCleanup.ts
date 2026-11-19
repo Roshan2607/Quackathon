@@ -59,6 +59,7 @@ const TEST_HACKATHON_SLUG_PATTERNS: RegExp[] = [
   /^hack_test_/i,
   /^hack_terrapthon_26$/i,
   /^pes_event_999\d+$/i,
+  /^paasha_.*_999\d+$/i,
 ];
 
 const TEST_EVENT_URL_PATTERNS: RegExp[] = [

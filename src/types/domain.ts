@@ -41,10 +41,21 @@ export type ReviewQueueStatus =
 
 export type EventSourceType =
   | 'pes_public_events'
+  | 'paasha_microservice'
   | 'approved_organizer'
   | 'academy_opt_in_hint'
   | 'submitted_public_url'
   | 'uploaded_brochure_or_poster';
+
+export type RegistrationHighLevelStatus = 'OPEN' | 'CLOSED' | 'UNKNOWN';
+
+export type RegistrationDetailStatus =
+  | 'open_confirmed'
+  | 'deadline_known'
+  | 'link_available'
+  | 'unknown'
+  | 'closed'
+  | 'ended';
 
 export type SourceUrlVerificationStatus =
   | 'verified'
@@ -154,9 +165,15 @@ export interface FieldProvenanceEntry {
 export interface Hackathon {
   id: string;
   name: string;
+  shortDescription?: string;
   description: string;
   eventType: EventType;
+  categoryLabel?: string;
+  isHackathon?: boolean;
+  teamParticipationVerified?: boolean;
+  publicSourceVerified?: boolean;
   matchable: boolean;
+  findTeammatesEligible?: boolean;
   themes: string[];
   venue: {
     name: string | null;
@@ -168,8 +185,12 @@ export interface Hackathon {
   startAt: string | null;
   datePrecision: 'exact_instant' | 'date_only' | 'unknown';
   endAt: string | null;
+  dateDisplay?: string;
   timezone: string;
   registrationDeadline: string | null;
+  registrationStatus?: RegistrationHighLevelStatus;
+  registrationStatusDetail?: RegistrationDetailStatus;
+  registrationStatusLabel?: string;
   // Distinct URL tracking (Requirement #4)
   originalSubmissionUrl?: string | null;
   verifiedCanonicalUrl?: string | null;
@@ -177,9 +198,14 @@ export interface Hackathon {
   sourceUrlStatus?: SourceUrlVerificationStatus;
   minTeamSize: number | null;
   maxTeamSize: number | null;
+  teamSize?: {
+    min: number | null;
+    max: number | null;
+  };
   eligibilityNotes: string | null;
   organizer: string;
   sourceType?: EventSourceType;
+  sources?: (EventSourceType | string)[];
   sourceIds: string[];
   fieldProvenance: Record<string, FieldProvenanceEntry>;
   suggestedByCount: number;

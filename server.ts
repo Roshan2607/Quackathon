@@ -35,14 +35,23 @@ import {
   VerifyUrlResponse,
 } from './src/types/apiContracts.ts';
 import {
+  evaluateHackathonEligibilityAndStates,
   extractPesuEventsPaginationLinks,
+  filterAndSortEventsByTime,
+  formatEventDateDisplayIST,
   normalizePesuAnnouncementPayload,
   parseDateRangeFromText,
   parsePesuEventDetailHtml,
   parsePesuEventsHtmlListing,
   PESU_HOMEPAGE_BANNERS_NOTE,
   sanitizeTextForPublicCandidate,
+  TimeFilterPreset,
 } from './src/lib/eventsAndAnnouncements.ts';
+import {
+  checkPaashaConnectionStatus,
+  fetchPaashaHackathons,
+  setPaashaClientFetchOverride,
+} from './src/services/paashaClient.ts';
 import {
   computeTeamCombinedCapabilities,
   countEligiblePeopleForHackathon,
@@ -68,6 +77,7 @@ import {
   getUserAndProfileByUid,
   getValidOAuthSessionByInitiatingSessionId,
   getValidOAuthSessionRecord,
+  ingestPaashaHackathonsToDatabase,
   leaveTeamRecord,
   loadBootstrapData,
   recordSwipeAndProcessMatchRecord,
@@ -134,12 +144,16 @@ let testOverrides: ServerTestOverrides = {};
 
 export function setServerTestOverrides(overrides: ServerTestOverrides) {
   testOverrides = { ...testOverrides, ...overrides };
+  setPaashaClientFetchOverride(
+    testOverrides.fetchImpl ?? testOverrides.fetchFn ?? null
+  );
   oidcDiscoveryCache = null;
   githubRepoCache.clear();
 }
 
 export function resetServerTestOverrides() {
   testOverrides = {};
+  setPaashaClientFetchOverride(null);
   oidcDiscoveryCache = null;
   githubRepoCache.clear();
 }
@@ -5244,7 +5258,7 @@ const PESU_PUBLIC_SOURCE_URLS = [
 ];
 
 const MAX_PESU_BROWSE_PAGES = 15;
-const MAX_PESU_DETAIL_EVENTS = 60;
+const MAX_PESU_DETAIL_EVENTS = 100;
 
 let inFlightPesuPublicSync: Promise<PesuPublicEventsSyncResponse> | null = null;
 let lastPesuPublicSyncResult: {
@@ -5353,10 +5367,10 @@ export async function syncPublicPesuEventsCatalog(options?: {
 
     const discoveredCards = Array.from(listingMap.values());
     let publishedOrUpdatedCount = 0;
-    const stagedForReviewCount = 0;
+    let stagedForReviewCount = 0;
     let duplicatesSkippedCount = 0;
 
-    // Fetch all discovered detail pages (bounded by MAX_PESU_DETAIL_EVENTS = 60, removing the old 10-event cap)
+    // Fetch all discovered detail pages (bounded by MAX_PESU_DETAIL_EVENTS = 100)
     for (const card of discoveredCards.slice(0, MAX_PESU_DETAIL_EVENTS)) {
       const detailFetch = await safeFetchFollowRedirects(card.detailUrl);
       const detail =
@@ -5382,8 +5396,6 @@ export async function syncPublicPesuEventsCatalog(options?: {
           : card.eventType !== 'unknown'
             ? card.eventType
             : 'other';
-      const resolvedMatchable =
-        detail !== null ? detail.matchable : card.matchable;
       const resolvedThemes =
         detail && detail.themes.length > 0
           ? detail.themes
@@ -5396,7 +5408,33 @@ export async function syncPublicPesuEventsCatalog(options?: {
         detail?.classificationReason ||
         `Classified from events.pes.edu tags (${card.tags.join(', ') || resolvedEventType}).`;
 
+      const evaluated = evaluateHackathonEligibilityAndStates({
+        name: resolvedTitle,
+        description: resolvedDescription,
+        eventType: resolvedEventType,
+        themes: resolvedThemes.filter((t) => t !== 'PESU Event'),
+        minTeamSize: detail?.minTeamSize ?? null,
+        maxTeamSize: detail?.maxTeamSize ?? null,
+        startAt: resolvedStartAt,
+        endAt: resolvedEndAt,
+        registrationDeadline: resolvedDeadline,
+        registrationUrl: resolvedRegUrl,
+        verifiedCanonicalUrl: canonicalUrl,
+        sourceUrlStatus: 'verified',
+        sourceType: 'pes_public_events',
+      });
+
       const targetSlug = `pes_event_${card.eventId}`;
+
+      const candidateReviewStatus = !evaluated.isHackathon
+        ? 'rejected'
+        : evaluated.teamParticipationVerified
+          ? 'approved'
+          : 'needs_confirmation';
+
+      if (candidateReviewStatus === 'needs_confirmation') {
+        stagedForReviewCount++;
+      }
 
       // Stage record in event_candidates for provenance and admin review auditability
       const staged = await createEventCandidateRecord({
@@ -5410,8 +5448,8 @@ export async function syncPublicPesuEventsCatalog(options?: {
         externalFingerprint: `pes_events_${card.eventId}`,
         title: resolvedTitle,
         organizer: resolvedOrganizer,
-        eventType: resolvedEventType,
-        matchable: resolvedMatchable,
+        eventType: evaluated.eventType,
+        matchable: evaluated.matchable,
         themes: resolvedThemes,
         description: resolvedDescription,
         startAt: resolvedStartAt,
@@ -5429,8 +5467,8 @@ export async function syncPublicPesuEventsCatalog(options?: {
               ? 'online'
               : 'onsite',
         teamSize: {
-          min: detail?.minTeamSize ?? null,
-          max: detail?.maxTeamSize ?? null,
+          min: evaluated.minTeamSize,
+          max: evaluated.maxTeamSize,
         },
         registrationUrl: resolvedRegUrl,
         eligibilityNotes: null,
@@ -5445,24 +5483,27 @@ export async function syncPublicPesuEventsCatalog(options?: {
           ],
         },
         classification: {
-          ruleGatePassed: resolvedMatchable,
-          mlScore: resolvedMatchable ? 1 : 0,
+          ruleGatePassed: evaluated.matchable,
+          mlScore: evaluated.matchable ? 1 : 0,
           reason: resolvedReason,
         },
-        reviewStatus: resolvedMatchable ? 'approved' : 'rejected',
-        warnings: [],
+        reviewStatus: candidateReviewStatus,
+        warnings: evaluated.teamParticipationVerified
+          ? []
+          : [evaluated.teamEligibilityReason],
         lastSeenAt: fetchedAt,
       });
 
       // Publish/update verified official events.pes.edu listing in hackathons table
-      // (Non-hackathon events are stored with matchable: false, status: 'archived' so they never pollute the student Hackathons discovery feed)
+      // (Non-hackathon events are stored with matchable: false, status: 'archived';
+      //  hackathons with unknown team size are stored with matchable: false, teamParticipationVerified: false)
       const persisted = await createPublishedHackathonDirect({
         slug: targetSlug,
         name: resolvedTitle,
         organizer: resolvedOrganizer,
         description: resolvedDescription,
-        eventType: resolvedEventType,
-        matchable: resolvedMatchable,
+        eventType: evaluated.eventType,
+        matchable: evaluated.matchable,
         themes: resolvedThemes,
         campus: resolvedCampus,
         venueName: resolvedVenueName,
@@ -5475,15 +5516,15 @@ export async function syncPublicPesuEventsCatalog(options?: {
         startAt: resolvedStartAt,
         endAt: resolvedEndAt,
         registrationDeadline: resolvedDeadline,
-        minTeamSize: detail?.minTeamSize ?? null,
-        maxTeamSize: detail?.maxTeamSize ?? null,
+        minTeamSize: evaluated.minTeamSize,
+        maxTeamSize: evaluated.maxTeamSize,
         registrationUrl: resolvedRegUrl,
         verifiedCanonicalUrl: canonicalUrl,
         sourceUrlStatus: 'verified',
         sourceType: 'pes_public_events',
         extractedAt: fetchedAt,
         classificationReason: resolvedReason,
-        status: resolvedMatchable ? 'published' : 'archived',
+        status: evaluated.isHackathon ? 'published' : 'archived',
         createdByUid: options?.actorUid || 'system_pes_events_sync',
       });
 
@@ -5495,7 +5536,7 @@ export async function syncPublicPesuEventsCatalog(options?: {
 
       if (isCrossPageDuplicate) {
         duplicatesSkippedCount++;
-      } else if (persisted.matchable) {
+      } else if (persisted.isHackathon) {
         publishedOrUpdatedCount++;
       }
     }
@@ -5528,6 +5569,141 @@ export async function syncPublicPesuEventsCatalog(options?: {
 
   return inFlightPesuPublicSync;
 }
+
+export async function syncPaashaHackathonsCatalog(options?: {
+  actorUid?: string;
+  includeUnverified?: boolean;
+}) {
+  const paashaRes = await fetchPaashaHackathons({
+    matchableOnly: false,
+    includeUnverified: options?.includeUnverified ?? true,
+  });
+
+  if (!paashaRes.ok) {
+    return {
+      ok: false,
+      paashaReachable: false,
+      statusCode: paashaRes.statusCode,
+      errorCode: paashaRes.errorCode ?? 'PAASHA_UNAVAILABLE',
+      userMessage: paashaRes.userMessage,
+      fetchedAt: paashaRes.fetchedAt,
+      totalFromPaasha: 0,
+      ingestion: null,
+    };
+  }
+
+  const ingestion = await ingestPaashaHackathonsToDatabase({
+    items: paashaRes.items,
+    actorUid: options?.actorUid ?? 'system_paasha_sync',
+  });
+
+  return {
+    ok: true,
+    paashaReachable: true,
+    statusCode: 200,
+    errorCode: undefined,
+    userMessage: `Synced ${paashaRes.items.length} record(s) from PAASHA microservice (${ingestion.publishedCount} newly published, ${ingestion.mergedWithExistingCount} merged with existing events, ${ingestion.heldForReviewCount} held for review, ${ingestion.excludedNonHackathonCount} non-hackathons excluded).`,
+    fetchedAt: paashaRes.fetchedAt,
+    totalFromPaasha: paashaRes.total,
+    ingestion,
+  };
+}
+
+app.get('/api/events/paasha/status', async (_req, res) => {
+  try {
+    const status = await checkPaashaConnectionStatus();
+    res.status(200).json({
+      ok: status.ok,
+      configured: status.configured,
+      reachable: status.reachable,
+      authenticated: status.authenticated,
+      serviceUrl: status.serviceUrl,
+      statusCode: status.statusCode,
+      errorCode: status.errorCode,
+      userMessage: status.userMessage,
+      upstreamStatus: status.upstreamStatus,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/events/paasha/status:', error);
+    res.status(200).json({
+      ok: false,
+      configured: false,
+      reachable: false,
+      authenticated: false,
+      statusCode: 503,
+      errorCode: 'PAASHA_UNAVAILABLE',
+      userMessage: 'Failed to inspect PAASHA microservice connection status.',
+    });
+  }
+});
+
+app.post('/api/events/sync-paasha', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const paashaSync = await syncPaashaHackathonsCatalog({
+      actorUid: authUser?.uid,
+      includeUnverified: true,
+    });
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    res.status(paashaSync.ok ? 200 : paashaSync.statusCode || 503).json({
+      ...paashaSync,
+      hackathons: data.hackathons,
+    });
+  } catch (error) {
+    console.error('Error in POST /api/events/sync-paasha:', error);
+    const data = await loadBootstrapData(null).catch(() => ({ hackathons: [] }));
+    res.status(503).json({
+      ok: false,
+      paashaReachable: false,
+      errorCode: 'PAASHA_UNAVAILABLE',
+      userMessage:
+        'PAASHA microservice sync failed; continuing with existing Quackathon catalog.',
+      hackathons: data.hackathons,
+    });
+  }
+});
+
+app.post('/api/events/sync-all', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const forceRefresh = Boolean(req.body?.forceRefresh);
+
+    const pesuSync = await syncPublicPesuEventsCatalog({
+      forceRefresh,
+      actorUid: authUser?.uid,
+    });
+    const paashaSync = await syncPaashaHackathonsCatalog({
+      actorUid: authUser?.uid,
+      includeUnverified: true,
+    });
+
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    const anySourceSucceeded = pesuSync.ok || paashaSync.ok;
+    const degradedSources: string[] = [];
+    if (!pesuSync.ok) degradedSources.push('pes_public_events');
+    if (!paashaSync.ok) degradedSources.push('paasha_microservice');
+
+    res.status(anySourceSucceeded ? 200 : 502).json({
+      ok: anySourceSucceeded,
+      degradedSources,
+      pesuPublic: pesuSync,
+      paasha: paashaSync,
+      hackathons: data.hackathons,
+      userMessage:
+        degradedSources.length === 0
+          ? 'Synchronized hackathons from both events.pes.edu and PAASHA microservice.'
+          : anySourceSucceeded
+            ? `Synchronized hackathons using available source(s); degraded source(s): ${degradedSources.join(', ')}.`
+            : 'Both events.pes.edu and PAASHA microservice are currently unavailable.',
+    });
+  } catch (error) {
+    console.error('Error in POST /api/events/sync-all:', error);
+    res.status(500).json({
+      ok: false,
+      userMessage: 'Failed to run unified hackathon synchronization.',
+    });
+  }
+});
 
 app.post('/api/events/sync-pesu-public', async (req: AuthenticatedRequest, res) => {
   try {
@@ -5604,45 +5780,316 @@ app.get('/api/bootstrap', async (req: AuthenticatedRequest, res) => {
   }
 });
 
+function formatTeamSizeDisplayLabel(
+  min?: number | null,
+  max?: number | null
+): string {
+  if (
+    typeof min === 'number' &&
+    typeof max === 'number' &&
+    Number.isFinite(min) &&
+    Number.isFinite(max)
+  ) {
+    if (min === max) {
+      return `${min} member${min === 1 ? '' : 's'}`;
+    }
+    return `${min}–${max} members`;
+  }
+  if (typeof max === 'number' && Number.isFinite(max)) {
+    return `Up to ${max} members`;
+  }
+  return 'Team size not specified';
+}
+
 /**
- * Server-side paginated hackathons catalog endpoint backed by PostgreSQL (zero synthetic data).
+ * Phase 6 Normalized Hackathons Discovery Endpoint (`GET /api/hackathons`):
+ * - Returns unique, deduplicated, team-eligible hackathon records (`isHackathon === true && teamParticipationVerified === true` by default).
+ * - Supports time filtering (`time` / `preset` / `filter`: `UPCOMING` default, `THIS_WEEK`, `THIS_MONTH`, `PAST`, `ALL`, `CUSTOM`).
+ * - Never fabricates today's date when event dates are missing (`startAt: null`, `dateDisplay: "Date TBA"`).
+ * - Never marks unknown registration status as `OPEN` (`OPEN` | `CLOSED` | `UNKNOWN`).
+ * - Never marks unknown team eligibility as `matchable: true`.
+ * - Keeps raw fieldProvenance out of card-list responses unless `includeProvenance=true` is requested.
  */
 app.get('/api/hackathons', async (req, res) => {
   try {
     const data = await loadBootstrapData(null);
     const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
     const filter = typeof req.query.filter === 'string' ? req.query.filter : 'all';
+    const includeUnverifiedTeamSize =
+      req.query.includeUnverifiedTeamSize === 'true';
+    const matchableOnly =
+      req.query.matchableOnly === 'true' || filter === 'matchable';
     const campus = typeof req.query.campus === 'string' ? req.query.campus : 'ALL';
-    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+    const q =
+      typeof req.query.q === 'string'
+        ? req.query.q.trim().toLowerCase()
+        : typeof req.query.search === 'string'
+          ? req.query.search.trim().toLowerCase()
+          : '';
+    const includeProvenance = req.query.includeProvenance === 'true';
 
-    const filtered = data.hackathons.filter((h) => {
-      if (filter === 'matchable' && !h.matchable) return false;
-      if (filter === 'non_matchable' && h.matchable) return false;
-      if (campus !== 'ALL' && h.venue.campus !== campus) return false;
-      if (q) {
-        const hay = `${h.name} ${h.organizer} ${h.themes.join(' ')}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
+    const validPresets = new Set<TimeFilterPreset>([
+      'UPCOMING',
+      'THIS_WEEK',
+      'THIS_MONTH',
+      'PAST',
+      'ALL',
+      'CUSTOM',
+    ]);
+    const filterUpper = filter.trim().toUpperCase();
+    const rawTimeParam = (
+      (typeof req.query.time === 'string'
+        ? req.query.time
+        : typeof req.query.preset === 'string'
+          ? req.query.preset
+          : validPresets.has(filterUpper as TimeFilterPreset)
+            ? filterUpper
+            : 'UPCOMING') || 'UPCOMING'
+    )
+      .trim()
+      .toUpperCase();
+
+    const preset: TimeFilterPreset = validPresets.has(
+      rawTimeParam as TimeFilterPreset
+    )
+      ? (rawTimeParam as TimeFilterPreset)
+      : 'UPCOMING';
+
+    const refDateStr =
+      typeof req.query.referenceDate === 'string' &&
+      /^\d{4}-\d{2}-\d{2}$/.test(req.query.referenceDate.trim())
+        ? req.query.referenceDate.trim()
+        : null;
+    const referenceDate = refDateStr
+      ? new Date(`${refDateStr}T12:00:00+05:30`)
+      : new Date();
+
+    const customStart =
+      typeof req.query.customStart === 'string' ? req.query.customStart : null;
+    const customEnd =
+      typeof req.query.customEnd === 'string' ? req.query.customEnd : null;
+    const openRegistrationOnly = req.query.openRegistrationOnly === 'true';
+
+    // Re-evaluate states against referenceDate when provided and filter by campus / search / team eligibility
+    const preFiltered = data.hackathons
+      .map((h) => {
+        if (!refDateStr) return h;
+        const reeval = evaluateHackathonEligibilityAndStates({
+          name: h.name,
+          description: h.description,
+          eventType: h.eventType,
+          themes: h.themes,
+          minTeamSize: h.minTeamSize,
+          maxTeamSize: h.maxTeamSize,
+          startAt: h.startAt,
+          endAt: h.endAt,
+          registrationDeadline: h.registrationDeadline,
+          registrationUrl: h.registrationUrl,
+          verifiedCanonicalUrl: h.verifiedCanonicalUrl,
+          originalSubmissionUrl: h.originalSubmissionUrl,
+          sourceUrlStatus: h.sourceUrlStatus,
+          sourceType: h.sourceType,
+          status: h.status,
+          todayIstYmd: refDateStr,
+        });
+        return {
+          ...h,
+          isHackathon: reeval.isHackathon,
+          teamParticipationVerified: reeval.teamParticipationVerified,
+          publicSourceVerified: reeval.publicSourceVerified,
+          matchable: reeval.matchable,
+          findTeammatesEligible: reeval.findTeammatesEligible,
+          registrationStatus: reeval.registrationStatus,
+          registrationStatusDetail: reeval.registrationStatusDetail,
+          registrationStatusLabel: reeval.registrationStatusLabel,
+        };
+      })
+      .filter((h) => {
+        if (!h.isHackathon) return false;
+        // Per confirmed product rule: show only verified team-eligible hackathons in the catalog by default
+        if (!includeUnverifiedTeamSize && !h.teamParticipationVerified) {
+          return false;
+        }
+        if (matchableOnly && !h.matchable) return false;
+        if (filter === 'non_matchable' && h.matchable) return false;
+        if (campus !== 'ALL' && h.venue.campus !== campus) return false;
+        if (q) {
+          const hay =
+            `${h.name} ${h.organizer} ${h.description} ${h.themes.join(' ')}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+
+    const timeFiltered = filterAndSortEventsByTime(preFiltered, {
+      preset,
+      customStart,
+      customEnd,
+      openRegistrationOnly,
+      referenceDate,
     });
 
     const startIndex = (page - 1) * limit;
-    const items = filtered.slice(startIndex, startIndex + limit);
+    const sliced = timeFiltered.slice(startIndex, startIndex + limit);
+
+    const items = sliced.map((h) => {
+      const cardItem: Record<string, unknown> = {
+        id: h.id,
+        title: h.name,
+        name: h.name,
+        organizer: h.organizer,
+        shortDescription: h.shortDescription ?? h.description.slice(0, 220),
+        description: h.description,
+        eventType: h.eventType,
+        categoryLabel: h.categoryLabel,
+        isHackathon: Boolean(h.isHackathon),
+        teamParticipationVerified: Boolean(h.teamParticipationVerified),
+        publicSourceVerified: Boolean(h.publicSourceVerified),
+        startAt: h.startAt ?? null,
+        endAt: h.endAt ?? null,
+        dateDisplay: h.dateDisplay ?? formatEventDateDisplayIST(h),
+        campus: h.venue?.campus ?? null,
+        venue: {
+          campus: h.venue?.campus ?? null,
+          name: h.venue?.name ?? null,
+        },
+        format: h.format,
+        registrationDeadline: h.registrationDeadline ?? null,
+        registrationStatus: h.registrationStatus ?? 'UNKNOWN',
+        registrationStatusDetail: h.registrationStatusDetail ?? 'unknown',
+        registrationStatusLabel:
+          h.registrationStatusLabel ?? 'Registration Status Unknown',
+        teamSize: {
+          min: h.minTeamSize ?? null,
+          max: h.maxTeamSize ?? null,
+          label: formatTeamSizeDisplayLabel(h.minTeamSize, h.maxTeamSize),
+        },
+        minTeamSize: h.minTeamSize ?? null,
+        maxTeamSize: h.maxTeamSize ?? null,
+        registrationUrl: h.registrationUrl ?? null,
+        verifiedCanonicalUrl: h.verifiedCanonicalUrl ?? null,
+        matchable: Boolean(h.matchable),
+        findTeammatesEligible: Boolean(h.findTeammatesEligible),
+        sourceType: h.sourceType ?? 'pes_public_events',
+        sources: h.sources ?? h.sourceIds ?? [],
+        sourceIds: h.sourceIds ?? [],
+        themes: h.themes,
+      };
+      if (includeProvenance) {
+        cardItem.fieldProvenance = h.fieldProvenance;
+      }
+      return cardItem;
+    });
 
     res.json({
       ok: true,
+      preset,
       page,
       limit,
-      total: filtered.length,
-      hasMore: startIndex + limit < filtered.length,
+      total: timeFiltered.length,
+      hasMore: startIndex + limit < timeFiltered.length,
       items,
+      hackathons: items,
     });
   } catch (error) {
     console.error('Error in GET /api/hackathons:', error);
     res.status(500).json({
       ok: false,
       error: 'Failed to query hackathons.',
+    });
+  }
+});
+
+/**
+ * Phase 6 Separate Hackathon Detail Endpoint (`GET /api/hackathons/:id`):
+ * Exposes full event description, provenance, source URLs, verification details, and team constraints.
+ */
+app.get('/api/hackathons/:id', async (req, res, next) => {
+  const requestedId = String(req.params.id || '').trim();
+  // Delegate static sub-routes like `/api/hackathons/candidates` to their dedicated handlers
+  if (requestedId === 'candidates') {
+    next();
+    return;
+  }
+  try {
+    const data = await loadBootstrapData(null);
+    const hackathon = data.hackathons.find((h) => h.id === requestedId);
+    if (!hackathon || !hackathon.isHackathon) {
+      res.status(404).json({
+        ok: false,
+        errorCode: 'HACKATHON_NOT_FOUND',
+        userMessage: `Hackathon "${requestedId}" was not found in the active catalog.`,
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      hackathon: {
+        id: hackathon.id,
+        title: hackathon.name,
+        name: hackathon.name,
+        organizer: hackathon.organizer,
+        shortDescription:
+          hackathon.shortDescription ?? hackathon.description.slice(0, 220),
+        description: hackathon.description,
+        eventType: hackathon.eventType,
+        categoryLabel: hackathon.categoryLabel,
+        isHackathon: Boolean(hackathon.isHackathon),
+        teamParticipationVerified: Boolean(hackathon.teamParticipationVerified),
+        publicSourceVerified: Boolean(hackathon.publicSourceVerified),
+        startAt: hackathon.startAt ?? null,
+        endAt: hackathon.endAt ?? null,
+        dateDisplay:
+          hackathon.dateDisplay ?? formatEventDateDisplayIST(hackathon),
+        campus: hackathon.venue?.campus ?? null,
+        venue: {
+          campus: hackathon.venue?.campus ?? null,
+          name: hackathon.venue?.name ?? null,
+        },
+        format: hackathon.format,
+        registrationDeadline: hackathon.registrationDeadline ?? null,
+        registrationStatus: hackathon.registrationStatus ?? 'UNKNOWN',
+        registrationStatusDetail:
+          hackathon.registrationStatusDetail ?? 'unknown',
+        registrationStatusLabel:
+          hackathon.registrationStatusLabel ?? 'Registration Status Unknown',
+        teamSize: {
+          min: hackathon.minTeamSize ?? null,
+          max: hackathon.maxTeamSize ?? null,
+          label: formatTeamSizeDisplayLabel(
+            hackathon.minTeamSize,
+            hackathon.maxTeamSize
+          ),
+        },
+        minTeamSize: hackathon.minTeamSize ?? null,
+        maxTeamSize: hackathon.maxTeamSize ?? null,
+        registrationUrl: hackathon.registrationUrl ?? null,
+        verifiedCanonicalUrl: hackathon.verifiedCanonicalUrl ?? null,
+        matchable: Boolean(hackathon.matchable),
+        findTeammatesEligible: Boolean(hackathon.findTeammatesEligible),
+        sourceType: hackathon.sourceType ?? 'pes_public_events',
+        sources: hackathon.sources ?? hackathon.sourceIds ?? [],
+        sourceIds: hackathon.sourceIds ?? [],
+        themes: hackathon.themes,
+        fieldProvenance: hackathon.fieldProvenance,
+        provenance: {
+          sources: hackathon.sources ?? hackathon.sourceIds ?? [],
+          sourceIds: hackathon.sourceIds ?? [],
+          fieldProvenance: hackathon.fieldProvenance,
+        },
+        classification: hackathon.classification,
+        verificationStatus: hackathon.verificationStatus,
+        lastVerifiedAt: hackathon.lastVerifiedAt,
+        extractedAt: hackathon.extractedAt,
+      },
+    });
+  } catch (error) {
+    console.error('Error in GET /api/hackathons/:id:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to load hackathon details.',
     });
   }
 });

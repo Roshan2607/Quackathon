@@ -44,7 +44,10 @@ import {
   cleanHtmlToText,
   computeProposedEventDiffs,
   deduplicateHackathonCatalog,
+  evaluateHackathonEligibilityAndStates,
+  formatEventDateDisplayIST,
   isEligibleTeamHackathonCatalogEvent,
+  validateAndTransformPaashaHackathon,
 } from '../lib/eventsAndAnnouncements.ts';
 import { isSyntheticTestHackathonRecord } from './testCleanup.ts';
 
@@ -191,37 +194,15 @@ export function mapDbHackathonToDomain(
   const cleanOrganizer = cleanHtmlToText(row.organizer || '');
   const cleanDescription = cleanHtmlToText(row.description || '');
   const rawThemes = safeJsonParse<string[]>(row.themesJson, []);
-  const { themes: cleanedThemes, hadNavbarPollution } =
-    cleanStoredEventThemes(rawThemes);
+  const { themes: cleanedThemes } = cleanStoredEventThemes(rawThemes);
 
-  let resolvedEventType = (row.eventType as EventType) || 'hackathon';
-  let resolvedMatchable = row.matchable;
-  let resolvedReason = row.classificationReason || 'Verified event entry.';
-
-  // Re-evaluate classification when a PESU public event row had polluted navbar tags or needs conference/cultural disambiguation
-  if (
-    resolvedSourceType === 'pes_public_events' ||
-    hadNavbarPollution ||
-    row.slug.startsWith('pes_event_')
-  ) {
-    const reclassified = classifyGroundedEvent({
-      title: cleanName,
-      description: cleanDescription,
-      tags: cleanedThemes.filter((t) => t !== 'PESU Event'),
-    });
-    if (reclassified.eventType !== 'unknown') {
-      resolvedEventType = reclassified.eventType;
-      resolvedMatchable = reclassified.matchable;
-      resolvedReason = reclassified.reason;
-    }
-  }
-
-  // Strip bogus QR-generator blog links or bare events.pes.edu canonical duplicates from registrationUrl
+  // Strip bogus QR-generator blog links, private pesuacademy.com URLs, or bare events.pes.edu canonical duplicates from registrationUrl
   let cleanRegistrationUrl = row.registrationUrl ?? null;
   if (cleanRegistrationUrl) {
     const lowerReg = cleanRegistrationUrl.toLowerCase();
     if (
       lowerReg.includes('me-qr.com/page/blog') ||
+      lowerReg.includes('pesuacademy.com') ||
       (row.verifiedCanonicalUrl &&
         cleanRegistrationUrl === row.verifiedCanonicalUrl &&
         lowerReg.includes('events.pes.edu/'))
@@ -230,14 +211,70 @@ export function mapDbHackathonToDomain(
     }
   }
 
+  let cleanCanonicalUrl = row.verifiedCanonicalUrl ?? null;
+  if (
+    cleanCanonicalUrl &&
+    cleanCanonicalUrl.toLowerCase().includes('pesuacademy.com')
+  ) {
+    cleanCanonicalUrl = null;
+  }
+
+  const states = evaluateHackathonEligibilityAndStates({
+    name: cleanName,
+    description: cleanDescription,
+    eventType: (row.eventType as EventType) || 'hackathon',
+    themes: cleanedThemes.filter((t) => t !== 'PESU Event'),
+    minTeamSize: row.minTeamSize,
+    maxTeamSize: row.maxTeamSize,
+    startAt: row.startAt,
+    endAt: row.endAt,
+    registrationDeadline: row.registrationDeadline,
+    registrationUrl: cleanRegistrationUrl,
+    verifiedCanonicalUrl: cleanCanonicalUrl,
+    originalSubmissionUrl: row.originalSubmissionUrl,
+    sourceUrlStatus: row.sourceUrlStatus,
+    sourceType: resolvedSourceType,
+    status: row.status,
+  });
+
+  const resolvedEventType = states.eventType;
+  const resolvedMatchable = states.matchable;
+  const resolvedReason =
+    row.classificationReason ||
+    states.classificationReason ||
+    'Verified event entry.';
+
   const allSourceUrls = Array.isArray(parsedProv?._meta?.allSourceUrls)
-    ? (parsedProv._meta.allSourceUrls as string[])
+    ? (parsedProv._meta.allSourceUrls as string[]).filter(
+        (u) => typeof u === 'string' && !u.toLowerCase().includes('pesuacademy.com')
+      )
     : [];
   const sourceIds = Array.from(
     new Set(
       [
         row.slug,
-        row.verifiedCanonicalUrl,
+        cleanCanonicalUrl,
+        ...allSourceUrls,
+      ].filter((v): v is string => Boolean(v && v.trim()))
+    )
+  );
+
+  const hasPesEventsSource =
+    row.slug.startsWith('pes_event_') ||
+    resolvedSourceType === 'pes_public_events' ||
+    sourceIds.some((s) => s.toLowerCase().includes('events.pes.edu'));
+  const hasPaashaSource =
+    row.slug.startsWith('paasha_') ||
+    resolvedSourceType === 'paasha_microservice' ||
+    sourceIds.some((s) => s.toLowerCase().startsWith('paasha:'));
+
+  const sources = Array.from(
+    new Set(
+      [
+        hasPesEventsSource ? 'events.pes.edu' : null,
+        hasPaashaSource ? 'PAASHA' : null,
+        cleanCanonicalUrl,
+        cleanRegistrationUrl,
         ...allSourceUrls,
       ].filter((v): v is string => Boolean(v && v.trim()))
     )
@@ -248,8 +285,14 @@ export function mapDbHackathonToDomain(
     name: cleanName,
     organizer: cleanOrganizer,
     description: cleanDescription,
+    shortDescription: cleanDescription.slice(0, 220),
     eventType: resolvedEventType,
+    categoryLabel: states.categoryLabel,
+    isHackathon: states.isHackathon,
+    teamParticipationVerified: states.teamParticipationVerified,
+    publicSourceVerified: states.publicSourceVerified,
     matchable: resolvedMatchable,
+    findTeammatesEligible: states.findTeammatesEligible,
     themes: cleanedThemes,
     venue: {
       name: row.venueName ? cleanHtmlToText(row.venueName) : null,
@@ -264,18 +307,30 @@ export function mapDbHackathonToDomain(
         : 'date_only'
       : 'unknown',
     endAt: row.endAt ?? null,
+    dateDisplay: formatEventDateDisplayIST({
+      startAt: row.startAt,
+      endAt: row.endAt,
+    }),
     timezone: 'Asia/Kolkata',
     registrationDeadline: row.registrationDeadline ?? null,
+    registrationStatus: states.registrationStatus,
+    registrationStatusDetail: states.registrationStatusDetail,
+    registrationStatusLabel: states.registrationStatusLabel,
     originalSubmissionUrl: row.originalSubmissionUrl ?? null,
-    verifiedCanonicalUrl: row.verifiedCanonicalUrl ?? null,
+    verifiedCanonicalUrl: cleanCanonicalUrl,
     registrationUrl: cleanRegistrationUrl,
     sourceUrlStatus:
       (row.sourceUrlStatus as SourceUrlVerificationStatus) || 'unverified',
-    minTeamSize: row.minTeamSize ?? null,
-    maxTeamSize: row.maxTeamSize ?? null,
+    minTeamSize: states.minTeamSize,
+    maxTeamSize: states.maxTeamSize,
+    teamSize: {
+      min: states.minTeamSize,
+      max: states.maxTeamSize,
+    },
     eligibilityNotes: row.eligibilityNotes ?? null,
     sourceType: resolvedSourceType,
     sourceIds,
+    sources,
     fieldProvenance: parsedProv,
     suggestedByCount: Math.max(1, allSourceUrls.length || 1),
     classification: {
@@ -289,9 +344,11 @@ export function mapDbHackathonToDomain(
     extractedAt:
       parsedProv?._meta?.extractedAt ?? row.createdAt.toISOString(),
     verificationStatus:
-      row.verificationStatus === 'unconfirmed_constraints'
-        ? 'unconfirmed_constraints'
-        : 'verified',
+      states.teamParticipationVerified &&
+      states.minTeamSize !== null &&
+      states.maxTeamSize !== null
+        ? 'verified'
+        : 'unconfirmed_constraints',
     status: (row.status as EventLifecycleStatus) || 'published',
     createdBy: row.createdByUid,
   };
@@ -2393,6 +2450,67 @@ export async function rejectEventCandidateRecord(
   }
 }
 
+/**
+ * Re-links any teams, memberships, participations, joinRequests, swipes, conversations,
+ * teamProposals, and teamRegistrations from a duplicate `oldSlug` to the canonical `newSlug`
+ * so existing teams and student state remain intact across cross-source deduplication.
+ */
+export async function relinkHackathonForeignKeys(
+  oldSlug: string,
+  newSlug: string
+): Promise<void> {
+  if (!oldSlug || !newSlug || oldSlug === newSlug) return;
+  try {
+    await db
+      .update(schema.teams)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.teams.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.memberships)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.memberships.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.participations)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.participations.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.joinRequests)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.joinRequests.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.swipes)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.swipes.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.conversations)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.conversations.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.teamProposals)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.teamProposals.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.teamRegistrations)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.teamRegistrations.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.eventCandidates)
+      .set({ duplicateOfHackathonSlug: newSlug })
+      .where(eq(schema.eventCandidates.duplicateOfHackathonSlug, oldSlug))
+      .catch(() => {});
+  } catch {
+    // Non-fatal if a composite key already exists on newSlug
+  }
+}
+
 export async function createPublishedHackathonDirect(params: {
   slug?: string;
   name: string;
@@ -2413,6 +2531,8 @@ export async function createPublishedHackathonDirect(params: {
   verifiedCanonicalUrl: string | null;
   sourceUrlStatus: SourceUrlVerificationStatus;
   sourceType?: EventSourceType;
+  additionalSources?: string[];
+  additionalProvenance?: Record<string, any>;
   extractedAt?: string;
   classificationReason?: string;
   status?: EventLifecycleStatus;
@@ -2431,6 +2551,7 @@ export async function createPublishedHackathonDirect(params: {
       const lowerReg = cleanRegUrl.toLowerCase();
       if (
         lowerReg.includes('me-qr.com/page/blog') ||
+        lowerReg.includes('pesuacademy.com') ||
         (params.verifiedCanonicalUrl &&
           cleanRegUrl === params.verifiedCanonicalUrl &&
           lowerReg.includes('events.pes.edu/'))
@@ -2439,19 +2560,10 @@ export async function createPublishedHackathonDirect(params: {
       }
     }
 
-    const eligibleForCatalog = isEligibleTeamHackathonCatalogEvent({
-      name: cleanName,
-      description: cleanDesc,
-      eventType: params.eventType,
-      matchable: params.matchable,
-      themes: params.themes,
-      minTeamSize: params.minTeamSize,
-      maxTeamSize: params.maxTeamSize,
-    });
-
-    const resolvedMatchable = params.matchable && eligibleForCatalog;
-    const resolvedStatus: EventLifecycleStatus =
-      params.status ?? (resolvedMatchable ? 'published' : 'archived');
+    let cleanCanonUrl = params.verifiedCanonicalUrl?.trim() || null;
+    if (cleanCanonUrl && cleanCanonUrl.toLowerCase().includes('pesuacademy.com')) {
+      cleanCanonUrl = null;
+    }
 
     // Find all existing rows that match either the same real-world event OR the explicit slug
     const allPublished = await db.select().from(schema.hackathons);
@@ -2475,14 +2587,15 @@ export async function createPublishedHackathonDirect(params: {
             startAt: params.startAt,
             endAt: params.endAt,
             organizer: cleanOrganizer,
-            verifiedCanonicalUrl: params.verifiedCanonicalUrl,
-            originalSubmissionUrl: cleanRegUrl ?? params.verifiedCanonicalUrl,
+            verifiedCanonicalUrl: cleanCanonUrl,
+            originalSubmissionUrl: cleanRegUrl ?? cleanCanonUrl,
             registrationUrl: cleanRegUrl,
           }
         )
     );
 
-    // If multiple rows match (e.g. ADCOM 2027 across 11537 and 11523), prefer the one with the canonical conference/hackathon title
+    // If multiple rows match (e.g. ADCOM 2027 across 11537 and 11523, or PES Public + PAASHA),
+    // prefer official events.pes.edu slugs and canonical conference/hackathon titles
     matchingRows.sort((a, b) => {
       const aCanonicalTitle = /31st international advanced computing/i.test(
         a.name
@@ -2496,6 +2609,11 @@ export async function createPublishedHackathonDirect(params: {
         : 0;
       if (aCanonicalTitle !== bCanonicalTitle) {
         return bCanonicalTitle - aCanonicalTitle;
+      }
+      const aPesOfficial = a.slug.startsWith('pes_event_') ? 1 : 0;
+      const bPesOfficial = b.slug.startsWith('pes_event_') ? 1 : 0;
+      if (aPesOfficial !== bPesOfficial) {
+        return bPesOfficial - aPesOfficial;
       }
       return a.slug.localeCompare(b.slug);
     });
@@ -2528,18 +2646,28 @@ export async function createPublishedHackathonDirect(params: {
           ...prevUrls,
           primaryExisting?.verifiedCanonicalUrl,
           ...secondaryDuplicates.map((d) => d.verifiedCanonicalUrl),
-          params.verifiedCanonicalUrl,
-        ].filter((u): u is string => Boolean(u && u.trim()))
+          cleanCanonUrl,
+          cleanRegUrl,
+          ...(params.additionalSources ?? []),
+        ].filter(
+          (u): u is string =>
+            Boolean(u && u.trim() && !u.toLowerCase().includes('pesuacademy.com'))
+        )
       )
     );
 
-    // Choose the best title & description when consolidating multi-page events
+    // Choose the best title & description when consolidating multi-page or cross-source events
     const finalName =
       primaryExisting &&
       /31st international advanced computing/i.test(primaryExisting.name) &&
       !/31st international advanced computing/i.test(cleanName)
         ? cleanHtmlToText(primaryExisting.name)
-        : cleanName;
+        : primaryExisting &&
+            primaryExisting.slug.startsWith('pes_event_') &&
+            params.sourceType === 'paasha_microservice' &&
+            cleanHtmlToText(primaryExisting.name).length >= 3
+          ? cleanHtmlToText(primaryExisting.name)
+          : cleanName;
 
     const finalDesc =
       primaryExisting &&
@@ -2549,28 +2677,92 @@ export async function createPublishedHackathonDirect(params: {
         : cleanDesc;
 
     const finalCanonicalUrl =
-      primaryExisting && primaryExisting.slug !== params.slug
-        ? (primaryExisting.verifiedCanonicalUrl ?? params.verifiedCanonicalUrl)
-        : (params.verifiedCanonicalUrl ?? primaryExisting?.verifiedCanonicalUrl ?? null);
+      primaryExisting &&
+      primaryExisting.verifiedCanonicalUrl?.includes('events.pes.edu')
+        ? primaryExisting.verifiedCanonicalUrl
+        : primaryExisting && primaryExisting.slug !== params.slug
+          ? (primaryExisting.verifiedCanonicalUrl ?? cleanCanonUrl)
+          : (cleanCanonUrl ?? primaryExisting?.verifiedCanonicalUrl ?? null);
 
     const finalRegUrl =
       cleanRegUrl ??
       (primaryExisting?.registrationUrl &&
       primaryExisting.registrationUrl !== primaryExisting.verifiedCanonicalUrl &&
-      !primaryExisting.registrationUrl.toLowerCase().includes('me-qr.com/page/blog')
+      !primaryExisting.registrationUrl.toLowerCase().includes('me-qr.com/page/blog') &&
+      !primaryExisting.registrationUrl.toLowerCase().includes('pesuacademy.com')
         ? primaryExisting.registrationUrl
         : null);
+
+    // Confidence-aware field merging: prefer verified dates from events.pes.edu when merging PAASHA,
+    // and fill missing fields (like minTeamSize/maxTeamSize/registrationUrl/registrationDeadline/venue)
+    const isIncomingPaashaOntoPesPublic =
+      params.sourceType === 'paasha_microservice' &&
+      Boolean(primaryExisting?.verifiedCanonicalUrl?.includes('events.pes.edu'));
+
+    const mergedStartAt = isIncomingPaashaOntoPesPublic
+      ? (primaryExisting?.startAt ?? params.startAt ?? null)
+      : (params.startAt ?? primaryExisting?.startAt ?? null);
+    const mergedEndAt = isIncomingPaashaOntoPesPublic
+      ? (primaryExisting?.endAt ?? params.endAt ?? mergedStartAt)
+      : (params.endAt ?? primaryExisting?.endAt ?? mergedStartAt);
+    const mergedDeadline =
+      params.registrationDeadline ??
+      primaryExisting?.registrationDeadline ??
+      null;
+    const mergedCampus =
+      (isIncomingPaashaOntoPesPublic
+        ? (primaryExisting?.campus as CampusType | null) ?? params.campus
+        : params.campus ?? (primaryExisting?.campus as CampusType | null)) ??
+      null;
+    const mergedVenue =
+      (isIncomingPaashaOntoPesPublic
+        ? primaryExisting?.venueName ?? cleanVenue
+        : cleanVenue ?? primaryExisting?.venueName) ?? null;
+
+    const rawMinTeam = params.minTeamSize ?? primaryExisting?.minTeamSize ?? null;
+    const rawMaxTeam = params.maxTeamSize ?? primaryExisting?.maxTeamSize ?? null;
+
+    const states = evaluateHackathonEligibilityAndStates({
+      name: finalName,
+      description: finalDesc,
+      eventType: params.eventType,
+      themes: params.themes,
+      minTeamSize: rawMinTeam,
+      maxTeamSize: rawMaxTeam,
+      startAt: mergedStartAt,
+      endAt: mergedEndAt,
+      registrationDeadline: mergedDeadline,
+      registrationUrl: finalRegUrl,
+      verifiedCanonicalUrl: finalCanonicalUrl,
+      sourceUrlStatus: params.sourceUrlStatus,
+      sourceType:
+        params.sourceType ??
+        (finalCanonicalUrl?.includes('events.pes.edu')
+          ? 'pes_public_events'
+          : 'submitted_public_url'),
+    });
+
+    // Events with unknown team eligibility must NEVER be marked matchable: true
+    const resolvedMatchable =
+      params.matchable !== false && states.matchable;
+    const resolvedStatus: EventLifecycleStatus =
+      params.status ??
+      (states.isHackathon && states.publicSourceVerified
+        ? 'published'
+        : 'archived');
 
     const nowIso = new Date().toISOString();
     const provenanceObj: Record<string, any> = {
       ...existingProv,
+      ...(params.additionalProvenance ?? {}),
       _meta: {
         ...(existingProv._meta ?? {}),
         sourceType:
-          params.sourceType ??
-          (finalCanonicalUrl?.includes('events.pes.edu')
+          finalCanonicalUrl?.includes('events.pes.edu')
             ? 'pes_public_events'
-            : 'submitted_public_url'),
+            : (params.sourceType ??
+              existingProv?._meta?.sourceType ??
+              'submitted_public_url'),
         sourceUrl: finalCanonicalUrl ?? finalRegUrl ?? 'manual',
         allSourceUrls,
         extractedAt: params.extractedAt ?? nowIso,
@@ -2586,8 +2778,10 @@ export async function createPublishedHackathonDirect(params: {
           sourceUrl: url,
           sourceType: url.includes('events.pes.edu')
             ? 'pes_public_events'
-            : (params.sourceType ?? 'submitted_public_url'),
-          excerpt: `Verified official event page (${url})`,
+            : url.startsWith('paasha:')
+              ? 'paasha_microservice'
+              : (params.sourceType ?? 'submitted_public_url'),
+          excerpt: `Verified source reference (${url})`,
           verifiedAt: nowIso,
         };
       }
@@ -2600,34 +2794,36 @@ export async function createPublishedHackathonDirect(params: {
       .values({
         slug,
         name: finalName,
-        organizer: cleanOrganizer,
+        organizer: cleanOrganizer || primaryExisting?.organizer || 'PES University',
         description: finalDesc,
-        eventType: params.eventType,
+        eventType: states.eventType,
         matchable: resolvedMatchable,
         themesJson: JSON.stringify(params.themes),
-        campus: params.campus ?? primaryExisting?.campus ?? null,
-        venueName: cleanVenue ?? primaryExisting?.venueName ?? null,
-        format: params.format,
-        startAt: params.startAt ?? primaryExisting?.startAt ?? null,
-        endAt: params.endAt ?? primaryExisting?.endAt ?? null,
-        registrationDeadline:
-          params.registrationDeadline ??
-          primaryExisting?.registrationDeadline ??
-          null,
+        campus: mergedCampus,
+        venueName: mergedVenue,
+        format:
+          params.format !== 'unknown'
+            ? params.format
+            : (primaryExisting?.format as any) || 'unknown',
+        startAt: mergedStartAt,
+        endAt: mergedEndAt,
+        registrationDeadline: mergedDeadline,
         originalSubmissionUrl: finalRegUrl ?? finalCanonicalUrl,
         verifiedCanonicalUrl: finalCanonicalUrl,
         registrationUrl: finalRegUrl,
         sourceUrlStatus: params.sourceUrlStatus,
-        minTeamSize: params.minTeamSize ?? primaryExisting?.minTeamSize ?? null,
-        maxTeamSize: params.maxTeamSize ?? primaryExisting?.maxTeamSize ?? null,
+        minTeamSize: states.minTeamSize,
+        maxTeamSize: states.maxTeamSize,
         fieldProvenanceJson: provenanceJson,
         ruleGatePassed: resolvedMatchable,
         classificationReason:
-          params.classificationReason || 'Published verified event.',
+          params.classificationReason ||
+          states.classificationReason ||
+          'Published verified event.',
         verificationStatus:
-          (params.minTeamSize ?? primaryExisting?.minTeamSize ?? null) !==
-            null &&
-          (params.maxTeamSize ?? primaryExisting?.maxTeamSize ?? null) !== null
+          states.teamParticipationVerified &&
+          states.minTeamSize !== null &&
+          states.maxTeamSize !== null
             ? 'verified'
             : 'unconfirmed_constraints',
         status: resolvedStatus,
@@ -2637,38 +2833,46 @@ export async function createPublishedHackathonDirect(params: {
         target: schema.hackathons.slug,
         set: {
           name: finalName,
-          organizer: cleanOrganizer,
+          organizer:
+            cleanOrganizer || primaryExisting?.organizer || 'PES University',
           description: finalDesc,
-          eventType: params.eventType,
+          eventType: states.eventType,
           matchable: resolvedMatchable,
           themesJson: JSON.stringify(params.themes),
-          campus: params.campus ?? primaryExisting?.campus ?? null,
-          venueName: cleanVenue ?? primaryExisting?.venueName ?? null,
-          format: params.format,
-          startAt: params.startAt ?? primaryExisting?.startAt ?? null,
-          endAt: params.endAt ?? primaryExisting?.endAt ?? null,
-          registrationDeadline:
-            params.registrationDeadline ??
-            primaryExisting?.registrationDeadline ??
-            null,
+          campus: mergedCampus,
+          venueName: mergedVenue,
+          format:
+            params.format !== 'unknown'
+              ? params.format
+              : (primaryExisting?.format as any) || 'unknown',
+          startAt: mergedStartAt,
+          endAt: mergedEndAt,
+          registrationDeadline: mergedDeadline,
           verifiedCanonicalUrl: finalCanonicalUrl,
           registrationUrl: finalRegUrl,
-          minTeamSize:
-            params.minTeamSize ?? primaryExisting?.minTeamSize ?? null,
-          maxTeamSize:
-            params.maxTeamSize ?? primaryExisting?.maxTeamSize ?? null,
+          minTeamSize: states.minTeamSize,
+          maxTeamSize: states.maxTeamSize,
           fieldProvenanceJson: provenanceJson,
           ruleGatePassed: resolvedMatchable,
           classificationReason:
-            params.classificationReason || 'Published verified event.',
+            params.classificationReason ||
+            states.classificationReason ||
+            'Published verified event.',
+          verificationStatus:
+            states.teamParticipationVerified &&
+            states.minTeamSize !== null &&
+            states.maxTeamSize !== null
+              ? 'verified'
+              : 'unconfirmed_constraints',
           status: resolvedStatus,
         },
       })
       .returning();
 
-    // Archive any secondary duplicate rows in DB so duplicate rows don't remain active
+    // Re-link foreign keys and archive any secondary duplicate rows in DB
     for (const dup of secondaryDuplicates) {
       if (dup.slug !== slug) {
+        await relinkHackathonForeignKeys(dup.slug, slug);
         await db
           .update(schema.hackathons)
           .set({
@@ -2686,6 +2890,486 @@ export async function createPublishedHackathonDirect(params: {
     console.error('Database error in createPublishedHackathonDirect:', error);
     throw new Error('Failed to create hackathon.', { cause: error });
   }
+}
+
+export interface PaashaIngestionSummary {
+  receivedCount: number;
+  publishedCount: number;
+  mergedWithExistingCount: number;
+  heldForReviewCount: number;
+  excludedNonHackathonCount: number;
+  publishedIds: string[];
+  heldCandidateIds: string[];
+}
+
+/**
+ * Ingests validated PAASHA microservice records into Quackathon's PostgreSQL pipeline:
+ * - Stages candidate records in `event_candidates` with sanitized provenance.
+ * - Excludes non-hackathons (`isHackathon === false`).
+ * - Holds events with missing public proof (`publicSourceVerified === false`) or unknown team
+ *   participation (`teamParticipationVerified === false`) in `needs_confirmation` unless they
+ *   enrich an already-published official `events.pes.edu` hackathon.
+ * - Cross-source deduplicates against existing `hackathons` rows (`events.pes.edu` + PAASHA)
+ *   without changing existing `hackathon.id` slugs or breaking linked teams/participations.
+ */
+export async function ingestPaashaHackathonsToDatabase(params: {
+  items: import('../services/paashaClient').PaashaHackathonItem[];
+  actorUid?: string;
+}): Promise<PaashaIngestionSummary> {
+  const actorUid = params.actorUid ?? 'system_paasha_sync';
+  const summary: PaashaIngestionSummary = {
+    receivedCount: params.items.length,
+    publishedCount: 0,
+    mergedWithExistingCount: 0,
+    heldForReviewCount: 0,
+    excludedNonHackathonCount: 0,
+    publishedIds: [],
+    heldCandidateIds: [],
+  };
+
+  for (const rawItem of params.items) {
+    const validated = validateAndTransformPaashaHackathon(rawItem);
+    const candidateUid = `cand_paasha_${validated.paashaId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48)}`;
+
+    // Check if an existing published hackathon already represents this real-world event
+    const existingHacks = await db.select().from(schema.hackathons);
+    const matchedExisting = existingHacks.find((h) =>
+      areEventsSameRealWorldEvent(
+        {
+          title: h.name,
+          description: h.description,
+          startAt: h.startAt,
+          endAt: h.endAt,
+          organizer: h.organizer,
+          verifiedCanonicalUrl: h.verifiedCanonicalUrl,
+          originalSubmissionUrl: h.originalSubmissionUrl,
+          registrationUrl: h.registrationUrl,
+        },
+        {
+          title: validated.title,
+          description: validated.description,
+          startAt: validated.startAt,
+          endAt: validated.endAt,
+          organizer: validated.organizer,
+          verifiedCanonicalUrl: validated.verifiedCanonicalUrl,
+          originalSubmissionUrl:
+            validated.registrationUrl ?? validated.verifiedCanonicalUrl,
+          registrationUrl: validated.registrationUrl,
+        }
+      )
+    );
+
+    const canEnrichExistingHackathon =
+      Boolean(matchedExisting) &&
+      validated.isHackathon &&
+      matchedExisting!.status !== 'archived';
+
+    const shouldPublishOrMerge =
+      validated.shouldPublishToCatalog || canEnrichExistingHackathon;
+
+    let linkedSlug: string | null = matchedExisting?.slug ?? null;
+
+    if (!validated.isHackathon) {
+      summary.excludedNonHackathonCount += 1;
+    } else if (shouldPublishOrMerge) {
+      const wasExisting = Boolean(matchedExisting);
+      const cleanPaashaIdSlug = validated.paashaId
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .slice(0, 48);
+      const defaultPaashaSlug = cleanPaashaIdSlug.startsWith('paasha_')
+        ? cleanPaashaIdSlug
+        : `paasha_${cleanPaashaIdSlug.slice(0, 40)}`;
+      const published = await createPublishedHackathonDirect({
+        slug: matchedExisting?.slug ?? defaultPaashaSlug,
+        name: validated.title,
+        organizer: validated.organizer,
+        description: validated.description,
+        eventType: validated.eventType,
+        matchable: validated.matchable || Boolean(matchedExisting?.matchable),
+        themes: validated.themes,
+        campus: validated.campus,
+        venueName: validated.venueName,
+        format: validated.format,
+        startAt: validated.startAt,
+        endAt: validated.endAt,
+        registrationDeadline: validated.registrationDeadline,
+        minTeamSize: validated.minTeamSize,
+        maxTeamSize: validated.maxTeamSize,
+        registrationUrl: validated.registrationUrl ?? null,
+        verifiedCanonicalUrl: validated.verifiedCanonicalUrl ?? null,
+        sourceUrlStatus: validated.publicSourceVerified ? 'verified' : 'unverified',
+        sourceType: 'paasha_microservice',
+        additionalSources: validated.sources,
+        additionalProvenance: validated.fieldProvenance,
+        classificationReason: validated.rejectionOrHoldReason,
+        createdByUid: actorUid,
+      });
+      linkedSlug = published.id;
+      if (wasExisting) {
+        summary.mergedWithExistingCount += 1;
+      } else {
+        summary.publishedCount += 1;
+      }
+      if (!summary.publishedIds.includes(published.id)) {
+        summary.publishedIds.push(published.id);
+      }
+    } else {
+      summary.heldForReviewCount += 1;
+      summary.heldCandidateIds.push(candidateUid);
+    }
+
+    const candReviewStatus = !validated.isHackathon
+      ? 'rejected'
+      : shouldPublishOrMerge
+        ? 'approved'
+        : 'needs_confirmation';
+
+    await db
+      .insert(schema.eventCandidates)
+      .values({
+        candidateUid,
+        source: 'paasha_microservice',
+        sourceUrl:
+          validated.verifiedCanonicalUrl ??
+          validated.registrationUrl ??
+          null,
+        originalSubmissionUrl:
+          validated.registrationUrl ??
+          validated.verifiedCanonicalUrl ??
+          null,
+        verifiedCanonicalUrl: validated.verifiedCanonicalUrl,
+        sourceUrlStatus: validated.publicSourceVerified
+          ? 'verified'
+          : 'unverified',
+        externalFingerprint: validated.externalFingerprint,
+        duplicateOfHackathonSlug: linkedSlug,
+        updatesExistingHackathonSlug: matchedExisting?.slug ?? null,
+        title: validated.title,
+        organizer: validated.organizer,
+        eventType: validated.eventType,
+        matchable: validated.matchable,
+        themesJson: JSON.stringify(validated.themes),
+        description: validated.description,
+        startAt: validated.startAt,
+        endAt: validated.endAt,
+        registrationDeadline: validated.registrationDeadline,
+        campus: validated.campus,
+        venueName: validated.venueName,
+        format: validated.format,
+        minTeamSize: validated.minTeamSize,
+        maxTeamSize: validated.maxTeamSize,
+        registrationUrl: validated.registrationUrl,
+        fieldEvidenceJson: JSON.stringify({
+          paasha: [
+            {
+              sourceUrl:
+                validated.verifiedCanonicalUrl ??
+                `paasha://hackathon/${validated.paashaId}`,
+              excerpt: validated.rejectionOrHoldReason,
+            },
+          ],
+        }),
+        ruleGatePassed: validated.matchable,
+        classificationReason: validated.rejectionOrHoldReason,
+        reviewStatus: candReviewStatus,
+        warningsJson: JSON.stringify(
+          validated.shouldPublishToCatalog
+            ? []
+            : [validated.rejectionOrHoldReason]
+        ),
+      })
+      .onConflictDoUpdate({
+        target: schema.eventCandidates.candidateUid,
+        set: {
+          duplicateOfHackathonSlug: linkedSlug,
+          updatesExistingHackathonSlug: matchedExisting?.slug ?? null,
+          title: validated.title,
+          organizer: validated.organizer,
+          eventType: validated.eventType,
+          matchable: validated.matchable,
+          description: validated.description,
+          startAt: validated.startAt,
+          endAt: validated.endAt,
+          registrationDeadline: validated.registrationDeadline,
+          campus: validated.campus,
+          venueName: validated.venueName,
+          minTeamSize: validated.minTeamSize,
+          maxTeamSize: validated.maxTeamSize,
+          registrationUrl: validated.registrationUrl,
+          verifiedCanonicalUrl: validated.verifiedCanonicalUrl,
+          ruleGatePassed: validated.matchable,
+          classificationReason: validated.rejectionOrHoldReason,
+          reviewStatus: candReviewStatus,
+        },
+      });
+  }
+
+  return summary;
+}
+
+export interface DatabaseReconciliationReport {
+  executed: boolean;
+  totalRowsInspected: number;
+  duplicateRowsConsolidated: Array<{
+    removedOrArchivedSlug: string;
+    mergedIntoSlug: string;
+    title: string;
+  }>;
+  verifiedTeamHackathons: Array<{
+    slug: string;
+    name: string;
+    eventType: EventType;
+    minTeamSize: number | null;
+    maxTeamSize: number | null;
+  }>;
+  unknownTeamEligibilityHackathons: Array<{
+    slug: string;
+    name: string;
+    eventType: EventType;
+  }>;
+  nonHackathonRecords: Array<{
+    slug: string;
+    name: string;
+    eventType: EventType;
+  }>;
+  rowsUpdatedCount: number;
+}
+
+/**
+ * Audits and reconciles all rows in `schema.hackathons` (with dry-run support when `execute: false`):
+ * 1. Consolidates multi-page duplicates (`ADCOM 2027` across `pes_event_11537` and `pes_event_11523`,
+ *    and duplicate `Triverse Ideathon` pages) while preserving foreign keys.
+ * 2. Extracts grounded team sizes from descriptions (`MarTechHack26`, `Hackathon 2026`,
+ *    `Nimbus 1000 Hackathon`, `HEAL-A-Thon 2026`, `Agentathon 2025`, `Algomania 2.0`, etc.).
+ * 3. Ensures events with unknown team eligibility (`teamParticipationVerified === false`) are
+ *    marked `matchable: false` and `verificationStatus: 'unconfirmed_constraints'`.
+ * 4. Ensures all non-hackathon records (`tech_talk`, `workshop`, `conference`, `other`) have
+ *    accurate `eventType`, `matchable: false`, and `status: 'archived'`.
+ */
+export async function reconcileExistingHackathonsDatabase(options: {
+  execute: boolean;
+}): Promise<DatabaseReconciliationReport> {
+  const allRows = await db
+    .select()
+    .from(schema.hackathons)
+    .orderBy(schema.hackathons.id);
+
+  const duplicateRowsConsolidated: DatabaseReconciliationReport['duplicateRowsConsolidated'] =
+    [];
+  const verifiedTeamHackathons: DatabaseReconciliationReport['verifiedTeamHackathons'] =
+    [];
+  const unknownTeamEligibilityHackathons: DatabaseReconciliationReport['unknownTeamEligibilityHackathons'] =
+    [];
+  const nonHackathonRecords: DatabaseReconciliationReport['nonHackathonRecords'] =
+    [];
+  let rowsUpdatedCount = 0;
+
+  // Group rows by real-world event identity
+  const canonicalGroups: Array<{
+    primary: typeof schema.hackathons.$inferSelect;
+    duplicates: Array<typeof schema.hackathons.$inferSelect>;
+  }> = [];
+
+  for (const row of allRows) {
+    const existingGroup = canonicalGroups.find((g) =>
+      areEventsSameRealWorldEvent(
+        {
+          title: g.primary.name,
+          description: g.primary.description,
+          startAt: g.primary.startAt,
+          endAt: g.primary.endAt,
+          organizer: g.primary.organizer,
+          verifiedCanonicalUrl: g.primary.verifiedCanonicalUrl,
+          originalSubmissionUrl: g.primary.originalSubmissionUrl,
+          registrationUrl: g.primary.registrationUrl,
+        },
+        {
+          title: row.name,
+          description: row.description,
+          startAt: row.startAt,
+          endAt: row.endAt,
+          organizer: row.organizer,
+          verifiedCanonicalUrl: row.verifiedCanonicalUrl,
+          originalSubmissionUrl: row.originalSubmissionUrl,
+          registrationUrl: row.registrationUrl,
+        }
+      )
+    );
+
+    if (!existingGroup) {
+      canonicalGroups.push({ primary: row, duplicates: [] });
+    } else {
+      // Prefer `pes_event_11537` for ADCOM 2027 ("31st International Advanced Computing and Communication Conference")
+      if (
+        /31st international advanced computing/i.test(row.name) &&
+        !/31st international advanced computing/i.test(existingGroup.primary.name)
+      ) {
+        existingGroup.duplicates.push(existingGroup.primary);
+        existingGroup.primary = row;
+      } else {
+        existingGroup.duplicates.push(row);
+      }
+    }
+  }
+
+  for (const group of canonicalGroups) {
+    const primary = group.primary;
+    const dups = group.duplicates;
+
+    const cleanName = cleanHtmlToText(primary.name);
+    const cleanDesc = cleanHtmlToText(primary.description);
+    const rawThemes = safeJsonParse<string[]>(primary.themesJson, []);
+    const { themes: cleanedThemes } = cleanStoredEventThemes(rawThemes);
+
+    let cleanRegUrl = primary.registrationUrl ?? null;
+    if (cleanRegUrl) {
+      const lower = cleanRegUrl.toLowerCase();
+      if (
+        lower.includes('me-qr.com/page/blog') ||
+        lower.includes('pesuacademy.com') ||
+        (primary.verifiedCanonicalUrl &&
+          cleanRegUrl === primary.verifiedCanonicalUrl &&
+          lower.includes('events.pes.edu/'))
+      ) {
+        cleanRegUrl = null;
+      }
+    }
+
+    const states = evaluateHackathonEligibilityAndStates({
+      name: cleanName,
+      description: cleanDesc,
+      eventType: primary.eventType,
+      themes: cleanedThemes.filter((t) => t !== 'PESU Event'),
+      minTeamSize: primary.minTeamSize,
+      maxTeamSize: primary.maxTeamSize,
+      startAt: primary.startAt,
+      endAt: primary.endAt,
+      registrationDeadline: primary.registrationDeadline,
+      registrationUrl: cleanRegUrl,
+      verifiedCanonicalUrl: primary.verifiedCanonicalUrl,
+      originalSubmissionUrl: primary.originalSubmissionUrl,
+      sourceUrlStatus: primary.sourceUrlStatus,
+      sourceType: primary.slug.startsWith('pes_event_')
+        ? 'pes_public_events'
+        : undefined,
+      status: 'published', // Evaluate intrinsic hackathon status regardless of previous archived state
+    });
+
+    if (!states.isHackathon) {
+      nonHackathonRecords.push({
+        slug: primary.slug,
+        name: cleanName,
+        eventType: states.eventType,
+      });
+    } else if (states.teamParticipationVerified) {
+      verifiedTeamHackathons.push({
+        slug: primary.slug,
+        name: cleanName,
+        eventType: states.eventType,
+        minTeamSize: states.minTeamSize,
+        maxTeamSize: states.maxTeamSize,
+      });
+    } else {
+      unknownTeamEligibilityHackathons.push({
+        slug: primary.slug,
+        name: cleanName,
+        eventType: states.eventType,
+      });
+    }
+
+    const existingProv = safeJsonParse<Record<string, any>>(
+      primary.fieldProvenanceJson,
+      {}
+    );
+    const prevUrls = Array.isArray(existingProv?._meta?.allSourceUrls)
+      ? (existingProv._meta.allSourceUrls as string[])
+      : [];
+    const mergedSourceUrls = Array.from(
+      new Set(
+        [
+          ...prevUrls,
+          primary.verifiedCanonicalUrl,
+          ...dups.map((d) => d.verifiedCanonicalUrl),
+        ].filter((u): u is string => Boolean(u && u.trim()))
+      )
+    );
+
+    const targetStatus: EventLifecycleStatus = states.isHackathon
+      ? 'published'
+      : 'archived';
+    const targetVerificationStatus =
+      states.teamParticipationVerified &&
+      states.minTeamSize !== null &&
+      states.maxTeamSize !== null
+        ? 'verified'
+        : 'unconfirmed_constraints';
+
+    const needsUpdate =
+      primary.eventType !== states.eventType ||
+      primary.matchable !== states.matchable ||
+      primary.minTeamSize !== states.minTeamSize ||
+      primary.maxTeamSize !== states.maxTeamSize ||
+      primary.registrationUrl !== cleanRegUrl ||
+      primary.status !== targetStatus ||
+      primary.verificationStatus !== targetVerificationStatus ||
+      dups.length > 0;
+
+    if (needsUpdate) {
+      rowsUpdatedCount += 1;
+      if (options.execute) {
+        const updatedProv = {
+          ...existingProv,
+          _meta: {
+            ...(existingProv._meta ?? {}),
+            allSourceUrls: mergedSourceUrls,
+            verifiedAt: new Date().toISOString(),
+          },
+        };
+        await db
+          .update(schema.hackathons)
+          .set({
+            name: cleanName,
+            description: cleanDesc,
+            eventType: states.eventType,
+            matchable: states.matchable,
+            themesJson: JSON.stringify(cleanedThemes),
+            minTeamSize: states.minTeamSize,
+            maxTeamSize: states.maxTeamSize,
+            registrationUrl: cleanRegUrl,
+            ruleGatePassed: states.matchable,
+            classificationReason: states.classificationReason,
+            verificationStatus: targetVerificationStatus,
+            status: targetStatus,
+            fieldProvenanceJson: JSON.stringify(updatedProv),
+          })
+          .where(eq(schema.hackathons.slug, primary.slug));
+      }
+    }
+
+    for (const dup of dups) {
+      duplicateRowsConsolidated.push({
+        removedOrArchivedSlug: dup.slug,
+        mergedIntoSlug: primary.slug,
+        title: cleanHtmlToText(dup.name),
+      });
+      if (options.execute) {
+        await relinkHackathonForeignKeys(dup.slug, primary.slug);
+        await db
+          .delete(schema.hackathons)
+          .where(eq(schema.hackathons.slug, dup.slug));
+      }
+    }
+  }
+
+  return {
+    executed: options.execute,
+    totalRowsInspected: allRows.length,
+    duplicateRowsConsolidated,
+    verifiedTeamHackathons,
+    unknownTeamEligibilityHackathons,
+    nonHackathonRecords,
+    rowsUpdatedCount,
+  };
 }
 
 export function computeTeamRegistrationReadiness(params: {

@@ -4393,15 +4393,15 @@ test('37. Event deduplication, idempotent & concurrent synchronization, conferen
     process.env.NODE_ENV = prevNodeEnv;
   }
 
-  // 2. Verify ADCOM 2027 multi-page conference deduplication & classification
+  // 2. Verify ADCOM 2027 multi-page conference deduplication & classification (31st edition, June 10–11, 2027)
   const adcom1 = classifyGroundedEvent({
-    title: '30th International Conference on Advanced Computing and Communications (ADCOM 2027)',
-    description: 'Call for papers and conference keynote sessions at PES University.',
+    title: '31st International Conference on Advanced Computing and Communications (ADCOM 2027)',
+    description: 'ADCOM 2027: Multi-Agent Systems and Decentralized Intelligence. Call for papers and conference keynote sessions at PES University.',
     tags: ['Conferences', 'Technical'],
   });
   const adcom2 = classifyGroundedEvent({
     title: 'ADCOM 2027',
-    description: '30th International Conference on Advanced Computing and Communications.',
+    description: '31st International Conference on Advanced Computing and Communications.',
     tags: ['Conferences'],
   });
   assert.equal(adcom1.eventType, 'conference');
@@ -4410,16 +4410,16 @@ test('37. Event deduplication, idempotent & concurrent synchronization, conferen
   assert.equal(
     areEventsSameRealWorldEvent(
       {
-        title: '30th International Conference on Advanced Computing and Communications (ADCOM 2027)',
-        startAt: '2027-11-19',
-        endAt: '2027-11-21',
+        title: '31st International Conference on Advanced Computing and Communications (ADCOM 2027)',
+        startAt: '2027-06-10',
+        endAt: '2027-06-11',
         organizer: 'Department of CSE',
         verifiedCanonicalUrl: 'https://events.pes.edu/11537/',
       },
       {
         title: 'ADCOM 2027',
-        startAt: '2027-11-19',
-        endAt: '2027-11-21',
+        startAt: '2027-06-10',
+        endAt: '2027-06-11',
         organizer: 'Department of CSE',
         verifiedCanonicalUrl: 'https://events.pes.edu/11523/',
       }
@@ -4703,3 +4703,704 @@ test('37. Event deduplication, idempotent & concurrent synchronization, conferen
       );
   }
 });
+
+test('38. PAASHA microservice adapter, cross-source deduplication, strict 5-state eligibility, foreign-key preservation, privacy sanitization, and /api/hackathons endpoints', async () => {
+  const {
+    fetchPaashaHackathons,
+    checkPaashaConnectionStatus,
+  } = await import('../src/services/paashaClient.ts');
+  const {
+    validateAndTransformPaashaHackathon,
+    evaluateHackathonEligibilityAndStates,
+  } = await import('../src/lib/eventsAndAnnouncements.ts');
+  const {
+    createPublishedHackathonDirect,
+    ingestPaashaHackathonsToDatabase,
+  } = await import('../src/db/repository.ts');
+  const { db } = await import('../src/db/index.ts');
+  const {
+    hackathons,
+    eventCandidates,
+    teams,
+    participations,
+    conversations,
+    users,
+  } = await import('../src/db/schema.ts');
+  const { eq, inArray } = await import('drizzle-orm');
+
+  const prevPaashaUrl = process.env.PAASHA_SERVICE_URL;
+  const prevPaashaKey = process.env.PAASHA_API_KEY;
+  const prevPaashaTimeout = process.env.PAASHA_REQUEST_TIMEOUT_MS;
+
+  const testSlugsToClean = [
+    'pes_event_99931',
+    'pes_event_99932',
+    'paasha_cross_merge_99931',
+    'paasha_unknown_team_99933',
+    'paasha_solo_only_99934',
+    'paasha_workshop_99935',
+    'paasha_kodikon_5_99936',
+    'paasha_kodikon_6_99937',
+    'paasha_paasha_kodikon_5_99936',
+    'paasha_paasha_kodikon_6_99937',
+  ];
+  const testCandidateUidsToClean = [
+    'cand_paasha_paasha_cross_merge_99931',
+    'cand_paasha_paasha_unknown_team_99933',
+    'cand_paasha_paasha_solo_only_99934',
+    'cand_paasha_paasha_workshop_99935',
+    'cand_paasha_paasha_kodikon_5_99936',
+    'cand_paasha_paasha_kodikon_6_99937',
+  ];
+  let createdTeamId: number | null = null;
+  let createdParticipationId: number | null = null;
+  let createdConversationId: number | null = null;
+
+  try {
+    // --- Scenario 1 & 2: PAASHA missing/invalid API key & secret non-leakage ---
+    process.env.PAASHA_SERVICE_URL = 'http://localhost:4000';
+    delete process.env.PAASHA_API_KEY;
+
+    const noKeyRes = await fetchPaashaHackathons();
+    assert.equal(noKeyRes.ok, false);
+    assert.equal(noKeyRes.errorCode, 'PAASHA_NOT_CONFIGURED');
+
+    const secretApiKey = 'super_secret_paasha_key_do_not_leak_999';
+    process.env.PAASHA_API_KEY = secretApiKey;
+    process.env.PAASHA_REQUEST_TIMEOUT_MS = '2000';
+
+    setServerTestOverrides({
+      fetchFn: async (input, init) => {
+        const url = String(input);
+        if (url.startsWith('http://localhost:4000/')) {
+          const authHeader =
+            init?.headers && typeof init.headers === 'object'
+              ? (init.headers as Record<string, string>)['Authorization'] ||
+                (init.headers as Record<string, string>)['X-API-Key']
+              : '';
+          if (!authHeader || !authHeader.includes(secretApiKey)) {
+            return new Response(JSON.stringify({ error: 'Invalid API key' }), {
+              status: 401,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          return new Response(
+            JSON.stringify({ error: `Upstream rejected ${secretApiKey}` }),
+            {
+              status: 403,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+        return new Response('Not Found', { status: 404 });
+      },
+    });
+
+    const unauthRes = await fetchPaashaHackathons();
+    assert.equal(unauthRes.ok, false);
+    assert.equal(unauthRes.errorCode, 'PAASHA_UNAUTHORIZED');
+    assert.equal(
+      unauthRes.message.includes(secretApiKey),
+      false,
+      'PAASHA error message must NEVER leak PAASHA_API_KEY'
+    );
+
+    // --- Scenario 3: PAASHA timeout or 503 unavailable -> graceful degradation ---
+    setServerTestOverrides({
+      fetchFn: async (input) => {
+        const url = String(input);
+        if (url.startsWith('http://localhost:4000/')) {
+          return new Response('Service Unavailable', { status: 503 });
+        }
+        if (url.startsWith('https://events.pes.edu/browse/')) {
+          return new Response('<div class="tickets-grid"></div>', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' },
+          });
+        }
+        return new Response('Not Found', { status: 404 });
+      },
+    });
+
+    const downStatus = await checkPaashaConnectionStatus();
+    assert.equal(downStatus.ok, false);
+    assert.equal(downStatus.errorCode, 'PAASHA_UNAVAILABLE');
+
+    const statusApiDown = await fetch(`${baseUrl}/api/events/paasha/status`);
+    const statusApiDownJson = await statusApiDown.json();
+    assert.equal(statusApiDown.status, 200);
+    assert.equal(statusApiDownJson.ok, false);
+    assert.equal(
+      JSON.stringify(statusApiDownJson).includes(secretApiKey),
+      false,
+      '/api/events/paasha/status must never expose PAASHA_API_KEY'
+    );
+
+    const syncAllWhenPaashaDown = await fetch(`${baseUrl}/api/events/sync-all`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forceRefresh: false }),
+    });
+    const syncAllWhenPaashaDownJson = await syncAllWhenPaashaDown.json();
+    assert.equal(
+      syncAllWhenPaashaDown.status,
+      200,
+      '/api/events/sync-all must succeed and continue serving events.pes.edu hackathons even when PAASHA is unavailable'
+    );
+    assert.equal(syncAllWhenPaashaDownJson.ok, true);
+    assert.equal(syncAllWhenPaashaDownJson.paasha.ok, false);
+    assert.ok(Array.isArray(syncAllWhenPaashaDownJson.hackathons));
+
+    // --- Scenario 4: PAASHA invalid/incomplete JSON envelope rejected safely ---
+    setServerTestOverrides({
+      fetchFn: async (input) => {
+        const url = String(input);
+        if (url.startsWith('http://localhost:4000/')) {
+          return new Response(
+            JSON.stringify({ resource: 'wrong_resource', data: 'not_an_array' }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+        return new Response('Not Found', { status: 404 });
+      },
+    });
+
+    const malformedRes = await fetchPaashaHackathons();
+    assert.equal(malformedRes.ok, false);
+    assert.equal(malformedRes.errorCode, 'PAASHA_INVALID_RESPONSE');
+
+    // --- Scenario 8, 9, 10, 11: Strict 5-state validation & privacy sanitization ---
+    const privacyAndUnknownCheck = validateAndTransformPaashaHackathon({
+      id: 'paasha_privacy_test_1',
+      title: 'PESU Quantum Buildathon 2027',
+      summary: 'Annual quantum computing hackathon at PES University.',
+      description:
+        'Contact coordinator Rahul PES1UG23CS999 at rahul.student@pesu.pes.edu or +91 9876543210.',
+      eventType: 'HACKATHON',
+      teamSizeMin: null,
+      teamSizeMax: null,
+      startDate: '2027-08-15',
+      endDate: '2027-08-16',
+      registrationDeadline: null,
+      registrationUrl: 'https://pesuacademy.com/Academy/s/studentProfilePESU/ann/123',
+      sourceUrl: 'https://pesuacademy.com/Academy/s/studentProfilePESU',
+      posterImageUrl: 'https://pesuacademy.com/Academy/private_poster.png',
+      organizer: 'Quantum Club PESU',
+      campusOrVenue: 'PESU RR Campus',
+      mode: 'OFFLINE',
+      tags: ['Quantum', 'Hackathon'],
+      verificationStatus: 'ANNOUNCEMENT_ONLY',
+      isMatchable: true, // PAASHA claims matchable=true even though team size is unknown!
+      isIndependentlyVerified: true, // PAASHA claims verified even though URL is private pesuacademy.com!
+      ocrSnippet: 'RAW OCR PRIVATE ANNOUNCEMENT BODY DO NOT PUBLISH',
+    });
+
+    assert.equal(privacyAndUnknownCheck.accepted, true);
+    assert.ok(privacyAndUnknownCheck.event);
+    assert.equal(
+      privacyAndUnknownCheck.event.teamParticipationVerified,
+      false,
+      'Unknown team size must set teamParticipationVerified = false'
+    );
+    assert.equal(
+      privacyAndUnknownCheck.event.matchable,
+      false,
+      'Quackathon must NOT trust PAASHA isMatchable=true when team size is unknown'
+    );
+    assert.equal(
+      privacyAndUnknownCheck.event.publicSourceVerified,
+      false,
+      'Private pesuacademy.com URLs must NOT be treated as publicSourceVerified = true'
+    );
+    assert.equal(
+      privacyAndUnknownCheck.event.registrationUrl,
+      undefined,
+      'Private pesuacademy.com registrationUrl must be stripped from public record'
+    );
+    assert.equal(
+      privacyAndUnknownCheck.event.imageUrl,
+      undefined,
+      'Private pesuacademy.com posterImageUrl must be stripped from public record'
+    );
+    assert.equal(
+      privacyAndUnknownCheck.event.registrationStatus,
+      'UNKNOWN',
+      'Event without verified registration form or deadline must have registrationStatus = UNKNOWN, never OPEN'
+    );
+    assert.equal(
+      privacyAndUnknownCheck.event.description.includes('PES1UG23CS999'),
+      false,
+      'Student SRNs must be sanitized from description'
+    );
+    assert.equal(
+      privacyAndUnknownCheck.event.description.includes('RAW OCR PRIVATE'),
+      false,
+      'ocrSnippet must never be published into public event description'
+    );
+
+    // Non-hackathon & solo-only rejection check
+    const soloOnlyCheck = validateAndTransformPaashaHackathon({
+      id: 'paasha_solo_test_1',
+      title: 'Solo Speed Coding Contest 2027',
+      summary: 'Individual participation only coding challenge.',
+      description: 'Individual participation only. Team size: 1.',
+      eventType: 'COMPETITION',
+      teamSizeMin: 1,
+      teamSizeMax: 1,
+      startDate: '2027-09-01',
+      endDate: '2027-09-01',
+      registrationDeadline: '2027-08-28',
+      registrationUrl: 'https://forms.gle/solo-coding',
+      sourceUrl: 'https://events.pes.edu/99934/',
+      posterImageUrl: null,
+      organizer: 'CodeChef PESU',
+      campusOrVenue: 'PESU EC Campus',
+      mode: 'OFFLINE',
+      tags: ['Coding'],
+      verificationStatus: 'CONFIRMED',
+      isMatchable: true,
+      isIndependentlyVerified: true,
+    });
+    assert.equal(
+      soloOnlyCheck.accepted,
+      false,
+      'Solo-only competitions (maxTeamSize=1) must be rejected by PAASHA hackathon ingestion'
+    );
+
+    const workshopCheck = validateAndTransformPaashaHackathon({
+      id: 'paasha_workshop_test_1',
+      title: 'Hands-on Docker & Kubernetes Workshop 2027',
+      summary: 'Learn container orchestration in this 2-day workshop.',
+      description: 'Hands-on training session and lecture for students.',
+      eventType: 'HACKATHON', // Even if mislabeled upstream
+      teamSizeMin: 2,
+      teamSizeMax: 4,
+      startDate: '2027-09-10',
+      endDate: '2027-09-11',
+      registrationDeadline: null,
+      registrationUrl: null,
+      sourceUrl: null,
+      posterImageUrl: null,
+      organizer: 'DevOps Club',
+      campusOrVenue: 'PESU RR Campus',
+      mode: 'OFFLINE',
+      tags: ['Workshop'],
+      verificationStatus: 'ANNOUNCEMENT_ONLY',
+      isMatchable: true,
+      isIndependentlyVerified: false,
+    });
+    assert.equal(
+      workshopCheck.accepted,
+      false,
+      'Workshops must be rejected even if upstream mislabels them'
+    );
+
+    // --- Scenario 5, 6, 7, 12: Cross-Source Deduplication (`events.pes.edu` + PAASHA) & Foreign-Key Preservation ---
+    // First create an official events.pes.edu hackathon record that lacks team size in its short blurb
+    const pesBaseEvent = await createPublishedHackathonDirect({
+      slug: 'pes_event_99931',
+      name: 'QuackCrossSource CyberHack 2026',
+      organizer: 'PESU CyberSecurity Center',
+      description: 'Official 24-hour cybersecurity hackathon at PES University RR Campus.',
+      eventType: 'hackathon',
+      matchable: false,
+      themes: ['CyberSecurity', 'Hackathon'],
+      campus: 'RR Campus',
+      venueName: 'PESU RR Campus',
+      format: 'onsite',
+      startAt: '2027-10-10',
+      endAt: '2027-10-11',
+      registrationDeadline: '2027-10-10',
+      minTeamSize: null,
+      maxTeamSize: null,
+      registrationUrl: 'https://events.pes.edu/99931/',
+      verifiedCanonicalUrl: 'https://events.pes.edu/99931/',
+      sourceUrlStatus: 'verified',
+      sourceType: 'pes_public_events',
+      additionalSources: ['https://events.pes.edu/99931/'],
+      createdByUid: 'usr_system',
+    });
+
+    assert.equal(pesBaseEvent.id, 'pes_event_99931');
+    assert.equal(
+      pesBaseEvent.teamParticipationVerified,
+      false,
+      'Before PAASHA enrichment, short PESU blurb without team size has teamParticipationVerified = false'
+    );
+    assert.equal(
+      pesBaseEvent.matchable,
+      false,
+      'Before PAASHA enrichment, event with unknown team size is not matchable'
+    );
+
+    // Attach a real team, participation, and conversation to pes_event_99931 to verify foreign-key preservation
+    const existingUsers = await db.select().from(users).limit(2);
+    if (existingUsers.length >= 2) {
+      const testTeamSlug = `team_cross_merge_${Date.now()}`;
+      const [teamRow] = await db
+        .insert(teams)
+        .values({
+          teamSlug: testTeamSlug,
+          hackathonSlug: pesBaseEvent.id,
+          leaderUid: existingUsers[0].uid,
+          name: 'CrossSource Defenders',
+          pitch: 'Testing cross-source foreign key preservation',
+          targetSize: 4,
+          memberCount: 1,
+          status: 'open',
+        })
+        .returning();
+      createdTeamId = teamRow.id;
+
+      const [partRow] = await db
+        .insert(participations)
+        .values({
+          participationKey: `${pesBaseEvent.id}::${existingUsers[0].uid}::cross_merge_test`,
+          hackathonSlug: pesBaseEvent.id,
+          uid: existingUsers[0].uid,
+          intent: 'looking',
+        })
+        .returning();
+      createdParticipationId = partRow.id;
+
+      const [convRow] = await db
+        .insert(conversations)
+        .values({
+          conversationUid: `conv_cross_merge_${Date.now()}`,
+          hackathonSlug: pesBaseEvent.id,
+          type: 'team_roster',
+          title: 'CrossSource Defenders Chat',
+          participantUidsJson: JSON.stringify([existingUsers[0].uid, existingUsers[1].uid]),
+          teamSlug: testTeamSlug,
+        })
+        .returning();
+      createdConversationId = convRow.id;
+    }
+
+    // Now configure PAASHA mock to return:
+    // 1) The same event ('QuackCrossSource CyberHack 2026') with teamSizeMin: 2, teamSizeMax: 4 and a Google Forms registration link
+    // 2) An event with unknown team size ('PAASHA Mystery Ideathon 2026')
+    // 3) Two separate editions ('PAASHA Kodikon 5.0 Test' and 'PAASHA KODIKON 6.0 Test')
+    const paashaFixtures = [
+      {
+        id: 'paasha_cross_merge_99931',
+        title: 'QuackCrossSource CyberHack 2026',
+        summary: '24-hour cybersecurity hackathon for teams of 2 to 4 students.',
+        description:
+          '24-hour cybersecurity hackathon at PES University. Team Size: 2-4 members. Register via the official form before Oct 5, 2027.',
+        eventType: 'HACKATHON',
+        teamSizeMin: 2,
+        teamSizeMax: 4,
+        startDate: '2027-10-10',
+        endDate: '2027-10-11',
+        registrationDeadline: '2027-10-05',
+        registrationUrl: 'https://forms.gle/quack-cyberhack-2026',
+        sourceUrl: 'https://events.pes.edu/99931/',
+        posterImageUrl: null,
+        organizer: 'PESU CyberSecurity Center',
+        campusOrVenue: 'PESU RR Campus',
+        mode: 'OFFLINE',
+        tags: ['CyberSecurity', 'Hackathon', 'CTF'],
+        verificationStatus: 'CONFIRMED',
+        isMatchable: true,
+        isIndependentlyVerified: true,
+        extractedAt: '2026-04-10T10:00:00.000Z',
+        verifiedAt: '2026-04-10T10:05:00.000Z',
+      },
+      {
+        id: 'paasha_unknown_team_99933',
+        title: 'PAASHA Mystery Ideathon 2026',
+        summary: 'Campus-wide sustainability ideathon announced on PESU Academy.',
+        description: 'Submit innovative sustainability proposals at PESU EC Campus.',
+        eventType: 'IDEATHON',
+        teamSizeMin: null,
+        teamSizeMax: null,
+        startDate: '2027-10-20',
+        endDate: '2027-10-21',
+        registrationDeadline: null,
+        registrationUrl: null,
+        sourceUrl: null,
+        posterImageUrl: null,
+        organizer: 'PESU Green Club',
+        campusOrVenue: 'PESU EC Campus',
+        mode: 'OFFLINE',
+        tags: ['Ideathon', 'Sustainability'],
+        verificationStatus: 'ANNOUNCEMENT_ONLY',
+        isMatchable: true, // Should be overridden to false because team size is unknown
+        isIndependentlyVerified: false,
+      },
+      {
+        id: 'paasha_kodikon_5_99936',
+        title: 'PAASHA QuackSeries 5.0 Test Edition',
+        summary: '5th edition national hackathon for teams of 3 to 4.',
+        description: 'National level 24-hour hackathon. Team size: 3-4 members.',
+        eventType: 'HACKATHON',
+        teamSizeMin: 3,
+        teamSizeMax: 4,
+        startDate: '2026-12-12',
+        endDate: '2026-12-13',
+        registrationDeadline: '2026-12-08',
+        registrationUrl: 'https://forms.gle/quackseries-5-test',
+        sourceUrl: 'https://embrione.pes.edu/quackseries5',
+        posterImageUrl: null,
+        organizer: 'Embrione PESU',
+        campusOrVenue: 'PESU RR Campus',
+        mode: 'OFFLINE',
+        tags: ['Hackathon'],
+        verificationStatus: 'CONFIRMED',
+        isMatchable: true,
+        isIndependentlyVerified: true,
+      },
+      {
+        id: 'paasha_kodikon_6_99937',
+        title: 'PAASHA QUACKSERIES 6.0 Test Edition',
+        summary: '6th edition national hackathon for teams of 3 to 4.',
+        description: 'National level 24-hour hackathon. Team size: 3-4 members.',
+        eventType: 'HACKATHON',
+        teamSizeMin: 3,
+        teamSizeMax: 4,
+        startDate: '2027-11-07',
+        endDate: '2027-11-08',
+        registrationDeadline: '2027-11-01',
+        registrationUrl: 'https://forms.gle/quackseries-6-test',
+        sourceUrl: 'https://embrione.pes.edu/quackseries6',
+        posterImageUrl: null,
+        organizer: 'Embrione PESU',
+        campusOrVenue: 'PESU RR Campus',
+        mode: 'OFFLINE',
+        tags: ['Hackathon'],
+        verificationStatus: 'CONFIRMED',
+        isMatchable: true,
+        isIndependentlyVerified: true,
+      },
+    ];
+
+    setServerTestOverrides({
+      fetchFn: async (input) => {
+        const url = String(input);
+        if (url.startsWith('http://localhost:4000/api/v1/connection-status')) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              service: 'paasha',
+              version: '1.0.0',
+              status: 'healthy',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url.startsWith('http://localhost:4000/api/v1/hackathons')) {
+          return new Response(
+            JSON.stringify({
+              resource: 'hackathons',
+              data: paashaFixtures,
+              fetched_at: '2026-04-10T10:10:00.000Z',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response('Not Found', { status: 404 });
+      },
+    });
+
+    // Test /api/events/sync-paasha twice to verify cross-source deduplication AND idempotency
+    const syncRes1 = await fetch(`${baseUrl}/api/events/sync-paasha`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forceRefresh: true }),
+    });
+    const syncJson1 = await syncRes1.json();
+    assert.equal(syncRes1.status, 200);
+    assert.equal(syncJson1.ok, true);
+
+    const syncRes2 = await fetch(`${baseUrl}/api/events/sync-paasha`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forceRefresh: true }),
+    });
+    const syncJson2 = await syncRes2.json();
+    assert.equal(syncRes2.status, 200);
+    assert.equal(syncJson2.ok, true);
+
+    // Check database rows for QuackCrossSource CyberHack 2026: must be 1 consolidated row with slug 'pes_event_99931'
+    const cyberRows = await db
+      .select()
+      .from(hackathons)
+      .where(
+        inArray(hackathons.slug, ['pes_event_99931', 'paasha_cross_merge_99931'])
+      );
+    assert.equal(
+      cyberRows.length,
+      1,
+      'Event present in both events.pes.edu and PAASHA must be merged into a single DB row'
+    );
+    assert.equal(cyberRows[0].slug, 'pes_event_99931');
+    assert.equal(
+      cyberRows[0].minTeamSize,
+      2,
+      'PAASHA teamSizeMin (2) must enrich missing team size on events.pes.edu record'
+    );
+    assert.equal(
+      cyberRows[0].maxTeamSize,
+      4,
+      'PAASHA teamSizeMax (4) must enrich missing team size on events.pes.edu record'
+    );
+    assert.equal(
+      cyberRows[0].matchable,
+      true,
+      'Merged event with verified team size 2-4 must now be matchable = true'
+    );
+    assert.equal(
+      cyberRows[0].registrationUrl,
+      'https://forms.gle/quack-cyberhack-2026',
+      'PAASHA verified external registration form must enrich bare PESU page URL'
+    );
+    const parsedCyberProv = JSON.parse(cyberRows[0].fieldProvenanceJson || '{}');
+    const allCyberSources: string[] = Array.isArray(parsedCyberProv?._meta?.allSourceUrls)
+      ? parsedCyberProv._meta.allSourceUrls
+      : [];
+    assert.ok(
+      allCyberSources.includes('https://events.pes.edu/99931/') &&
+        allCyberSources.includes('paasha:paasha_cross_merge_99931'),
+      'Merged record must preserve both events.pes.edu and PAASHA provenance in _meta.allSourceUrls'
+    );
+
+    // Verify existing team, participation, and conversation remain linked to the merged event slug
+    if (createdTeamId && createdParticipationId && createdConversationId) {
+      const [linkedTeam] = await db
+        .select()
+        .from(teams)
+        .where(eq(teams.id, createdTeamId));
+      const [linkedPart] = await db
+        .select()
+        .from(participations)
+        .where(eq(participations.id, createdParticipationId));
+      const [linkedConv] = await db
+        .select()
+        .from(conversations)
+        .where(eq(conversations.id, createdConversationId));
+      assert.equal(linkedTeam?.hackathonSlug, pesBaseEvent.id);
+      assert.equal(linkedPart?.hackathonSlug, pesBaseEvent.id);
+      assert.equal(linkedConv?.hackathonSlug, pesBaseEvent.id);
+    }
+
+    // --- Scenario 14: Verify GET /api/hackathons and GET /api/hackathons/:id ---
+    const listAllRes = await fetch(
+      `${baseUrl}/api/hackathons?filter=ALL&search=QuackCrossSource`
+    );
+    const listAllJson = await listAllRes.json();
+    assert.equal(listAllRes.status, 200);
+    assert.equal(listAllJson.ok, true);
+    assert.equal(listAllJson.hackathons.length, 1);
+
+    const mergedCard = listAllJson.hackathons[0];
+    assert.equal(mergedCard.id, 'pes_event_99931');
+    assert.equal(mergedCard.isHackathon, true);
+    assert.equal(mergedCard.teamParticipationVerified, true);
+    assert.equal(mergedCard.matchable, true);
+    assert.equal(mergedCard.findTeammatesEligible, true);
+    assert.equal(mergedCard.publicSourceVerified, true);
+    assert.equal(mergedCard.registrationStatus, 'OPEN');
+    assert.deepEqual(mergedCard.teamSize, { min: 2, max: 4, label: '2–4 members' });
+    assert.ok(
+      Array.isArray(mergedCard.sources) &&
+        mergedCard.sources.includes('events.pes.edu') &&
+        mergedCard.sources.includes('PAASHA'),
+      'Normalized API card must list both events.pes.edu and PAASHA in sources[]'
+    );
+
+    // Verify separate editions (QuackSeries 5.0 vs QUACKSERIES 6.0) both exist separately
+    const kodikonRes = await fetch(
+      `${baseUrl}/api/hackathons?filter=ALL&search=PAASHA%20QuackSeries`
+    );
+    const kodikonJson = await kodikonRes.json();
+    assert.equal(kodikonRes.status, 200);
+    assert.equal(
+      kodikonJson.hackathons.length,
+      2,
+      'Separate editions (PAASHA QuackSeries 5.0 vs PAASHA QUACKSERIES 6.0) must remain separate in /api/hackathons'
+    );
+
+    // Verify Mystery Ideathon (unknown team size) is excluded from default public /api/hackathons catalog
+    // and held in event_candidates with reviewStatus = 'needs_confirmation' and matchable = false
+    const mysteryDefaultRes = await fetch(
+      `${baseUrl}/api/hackathons?filter=ALL&search=PAASHA%20Mystery%20Ideathon`
+    );
+    const mysteryDefaultJson = await mysteryDefaultRes.json();
+    assert.equal(
+      mysteryDefaultJson.hackathons.length,
+      0,
+      'Events with unknown team eligibility must not appear in default public /api/hackathons catalog'
+    );
+
+    const [mysteryCandidateRow] = await db
+      .select()
+      .from(eventCandidates)
+      .where(eq(eventCandidates.candidateUid, 'cand_paasha_paasha_unknown_team_99933'));
+    assert.ok(
+      mysteryCandidateRow,
+      'PAASHA Mystery Ideathon with unknown team size must be staged in event_candidates for admin review'
+    );
+    assert.equal(mysteryCandidateRow.reviewStatus, 'needs_confirmation');
+    assert.equal(mysteryCandidateRow.matchable, false);
+
+    // Verify GET /api/hackathons/:id returns full event details + provenance
+    const detailRes = await fetch(`${baseUrl}/api/hackathons/pes_event_99931`);
+    const detailJson = await detailRes.json();
+    assert.equal(detailRes.status, 200);
+    assert.equal(detailJson.ok, true);
+    assert.equal(detailJson.hackathon.id, 'pes_event_99931');
+    assert.equal(detailJson.hackathon.title, 'QuackCrossSource CyberHack 2026');
+    assert.ok(detailJson.hackathon.provenance);
+    assert.ok(
+      detailJson.hackathon.provenance.sources.includes('events.pes.edu') &&
+        detailJson.hackathon.provenance.sources.includes('PAASHA')
+    );
+
+    const notFoundDetailRes = await fetch(
+      `${baseUrl}/api/hackathons/non_existent_hackathon_id_999999`
+    );
+    assert.equal(notFoundDetailRes.status, 404);
+  } finally {
+    resetServerTestOverrides();
+    if (prevPaashaUrl !== undefined) process.env.PAASHA_SERVICE_URL = prevPaashaUrl;
+    else delete process.env.PAASHA_SERVICE_URL;
+    if (prevPaashaKey !== undefined) process.env.PAASHA_API_KEY = prevPaashaKey;
+    else delete process.env.PAASHA_API_KEY;
+    if (prevPaashaTimeout !== undefined)
+      process.env.PAASHA_REQUEST_TIMEOUT_MS = prevPaashaTimeout;
+    else delete process.env.PAASHA_REQUEST_TIMEOUT_MS;
+
+    if (createdConversationId) {
+      await db.delete(conversations).where(eq(conversations.id, createdConversationId));
+    }
+    if (createdParticipationId) {
+      await db.delete(participations).where(eq(participations.id, createdParticipationId));
+    }
+    if (createdTeamId) {
+      await db.delete(teams).where(eq(teams.id, createdTeamId));
+    }
+    await db.delete(hackathons).where(inArray(hackathons.slug, testSlugsToClean));
+    await db
+      .delete(eventCandidates)
+      .where(inArray(eventCandidates.candidateUid, testCandidateUidsToClean));
+  }
+
+  // --- Scenario 13: Verify zero test data leaks in the live catalog ---
+  await runTestArtifactsCleanup({ execute: true });
+  const dryRunCleanup = await runTestArtifactsCleanup({ execute: false });
+  assert.equal(
+    dryRunCleanup.affectedHackathons.length,
+    0,
+    'Live database must have 0 residual test hackathons after test teardown'
+  );
+  assert.equal(
+    dryRunCleanup.affectedCandidateIds.length,
+    0,
+    'Live database must have 0 residual test event candidates after test teardown'
+  );
+});
+

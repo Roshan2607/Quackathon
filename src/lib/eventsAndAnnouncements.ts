@@ -524,15 +524,23 @@ export function extractGroundedCampus(text: string): CampusType | null {
 }
 
 /**
- * Extracts explicit team size bounds from text if stated (e.g., "teams of 2 to 4", "team size: 3-4").
+ * Extracts explicit team size bounds from text if stated (e.g., "teams of 2 to 4",
+ * "Team Size – 3–4 members", "Team size: 3 or 4 members", "Register as a Team of 3",
+ * "Team-based competition (3–4 members per team)", "Teams of 4 members only").
  */
 export function extractGroundedTeamSize(text: string): {
   min: number | null;
   max: number | null;
   excerpt: string | null;
 } {
+  if (!text || typeof text !== 'string') {
+    return { min: null, max: null, excerpt: null };
+  }
+
+  // 1. Explicit range: "teams of 2 to 4", "team size: 3-4", "Team Size – 3–4 members",
+  //    "Team size: 3 or 4 members", "Team-based competition (3–4 members per team)"
   const rangeMatch = text.match(
-    /(?:teams?\s+of|team\s+size\s*(?:of|:|-)?|group\s+of)\s*(\d)\s*(?:to|-|–|—)\s*(\d)\s*(?:members|students|participants|builders|people)?/i
+    /(?:teams?\s+of|team\s+size\s*(?:of|:|-|–|—)?|group\s+of|team-based\s+(?:competition|hackathon|ideathon|buildathon|challenge|event)\s*\(?)\s*(\d{1,2})\s*(?:to|or|-|–|—)\s*(\d{1,2})\s*(?:members?|students?|participants?|builders?|people|per\s+team|in\s+each\s+team)?/i
   );
   if (rangeMatch) {
     const a = parseInt(rangeMatch[1], 10);
@@ -542,18 +550,36 @@ export function extractGroundedTeamSize(text: string): {
     }
   }
 
+  // 2. Min/Max phrasing: "minimum 2 and maximum 4 members"
+  const minMaxMatch = text.match(
+    /\bmin(?:imum)?\s*(?:of\s*)?(\d{1,2})\s*(?:and|,|to)\s*max(?:imum)?\s*(?:of\s*)?(\d{1,2})\s*(?:members?|students?|participants?|per\s+team)?/i
+  );
+  if (minMaxMatch) {
+    const a = parseInt(minMaxMatch[1], 10);
+    const b = parseInt(minMaxMatch[2], 10);
+    if (a >= 1 && b >= a && b <= 10) {
+      return { min: a, max: b, excerpt: minMaxMatch[0].trim() };
+    }
+  }
+
+  // 3. Exact team size: "Team Size: 3 members per team", "Register as a Team of 3",
+  //    "Teams of 4 members only", "compete in teams of 2"
   const exactTeamMatch = text.match(
-    /(?:team\s+size\s*(?:of|:|-)?\s*(\d)\s*(?:members|students|participants|per\s+team)?|(\d)\s*members?\s+per\s+team)/i
+    /(?:team\s+size\s*(?:of|:|-|–|—)?\s*(\d{1,2})\s*(?:members?|students?|participants?|per\s+team)?|(\d{1,2})\s*members?\s+(?:per\s+team|in\s+each\s+team)|(?:register\s+as\s+a\s+|compete\s+in\s+|participate\s+in\s+|form\s+(?:a\s+)?)?teams?\s+of\s+(\d{1,2})(?:\s*(?:members?|students?|participants?|people|only))?\b)/i
   );
   if (exactTeamMatch) {
-    const n = parseInt(exactTeamMatch[1] || exactTeamMatch[2], 10);
+    const n = parseInt(
+      exactTeamMatch[1] || exactTeamMatch[2] || exactTeamMatch[3],
+      10
+    );
     if (n >= 1 && n <= 10) {
       return { min: n, max: n, excerpt: exactTeamMatch[0].trim() };
     }
   }
 
+  // 4. Up to / maximum team size: "up to 4 members", "maximum of 4 students", "max team size: 4"
   const upToMatch = text.match(
-    /(?:up\s+to|maximum\s+of|max\s+team\s+size\s*(?:of|:)?)\s*(\d)\s*(?:members|students|participants)/i
+    /(?:up\s+to|maximum\s+of|max(?:imum)?\s+team\s+size\s*(?:of|:|-|–|—)?)\s*(\d{1,2})\s*(?:members?|students?|participants?|per\s+team)/i
   );
   if (upToMatch) {
     const max = parseInt(upToMatch[1], 10);
@@ -563,12 +589,126 @@ export function extractGroundedTeamSize(text: string): {
     }
   }
 
-  if (/\b(solo\s+only|individual\s+participation\s+only)\b/i.test(text)) {
+  // 5. Explicit individual / solo only
+  if (
+    /\b(solo\s+only|individual\s+participation\s+only|individual-only|single\s+participant\s+only)\b/i.test(
+      text
+    )
+  ) {
     return { min: 1, max: 1, excerpt: 'Individual participation only' };
   }
 
   return { min: null, max: null, excerpt: null };
 }
+
+/**
+ * Verifies whether an event genuinely supports team participation (`teamParticipationVerified`).
+ *
+ * Rules:
+ * - Individual-only competitions (`maxTeamSize === 1` or explicit solo-only rule) -> `false`.
+ * - Numeric `maxTeamSize > 1` or `minTeamSize > 1` (passed in or extracted from text) -> `true`.
+ * - Explicit team participation phrasing in title/description/evidence -> `true`.
+ * - Unknown / unstated team eligibility -> `false` (must NOT be marked `matchable: true`).
+ */
+export function verifyTeamParticipationEvidence(params: {
+  title?: string | null;
+  description?: string | null;
+  minTeamSize?: number | null;
+  maxTeamSize?: number | null;
+  evidenceText?: string | null;
+}): {
+  teamParticipationVerified: boolean;
+  minTeamSize: number | null;
+  maxTeamSize: number | null;
+  excerpt: string | null;
+  reason: string;
+} {
+  const combined = cleanHtmlToText(
+    `${params.title ?? ''} ${params.description ?? ''} ${params.evidenceText ?? ''}`
+  );
+  const extracted = extractGroundedTeamSize(combined);
+
+  const preferExtractedRange =
+    extracted.min !== null &&
+    extracted.max !== null &&
+    extracted.max > extracted.min &&
+    params.minTeamSize === params.maxTeamSize;
+
+  const effectiveMin = preferExtractedRange
+    ? extracted.min
+    : typeof params.minTeamSize === 'number' && params.minTeamSize >= 1
+      ? params.minTeamSize
+      : extracted.min;
+  const effectiveMax = preferExtractedRange
+    ? extracted.max
+    : typeof params.maxTeamSize === 'number' && params.maxTeamSize >= 1
+      ? params.maxTeamSize
+      : extracted.max;
+
+  const isSoloOnly =
+    effectiveMax === 1 ||
+    /\b(solo\s+only|individual\s+participation\s+only|individual-only|single\s+participant\s+only)\b/i.test(
+      combined
+    );
+
+  if (isSoloOnly) {
+    return {
+      teamParticipationVerified: false,
+      minTeamSize: 1,
+      maxTeamSize: 1,
+      excerpt: extracted.excerpt ?? 'Individual participation only',
+      reason: 'Individual-only competition (maxTeamSize = 1); not eligible for team matching.',
+    };
+  }
+
+  if (typeof effectiveMax === 'number' && effectiveMax > 1) {
+    return {
+      teamParticipationVerified: true,
+      minTeamSize: effectiveMin ?? null,
+      maxTeamSize: effectiveMax,
+      excerpt:
+        extracted.excerpt ??
+        (effectiveMin
+          ? `${effectiveMin}–${effectiveMax} members`
+          : `Up to ${effectiveMax} members`),
+      reason: `Verified team participation (team size ${effectiveMin ? `${effectiveMin}–${effectiveMax}` : `up to ${effectiveMax}`}).`,
+    };
+  }
+
+  if (typeof effectiveMin === 'number' && effectiveMin > 1) {
+    return {
+      teamParticipationVerified: true,
+      minTeamSize: effectiveMin,
+      maxTeamSize: effectiveMax ?? effectiveMin,
+      excerpt: extracted.excerpt ?? `${effectiveMin} members`,
+      reason: `Verified team participation (minimum team size ${effectiveMin}).`,
+    };
+  }
+
+  // Check for explicit multi-member team participation statements in the text even if exact numbers are omitted
+  const explicitTeamRuleMatch = combined.match(
+    /\b(student\s+teams|for\s+teams|in\s+teams|as\s+a\s+team|team-based\s+(?:competition|hackathon|ideathon|buildathon|challenges?|event)|team\s+competition|team\s+hackathon|team\s+ideathon|team\s+registration|team\s+leader\s+must|members?\s+per\s+team|members?\s+in\s+each\s+team|each\s+team\s+(?:must|can|will|shall|consists)|inter-college\s+teams?|open\s+to\s+teams|collaborate\s+in\s+teams|compete\s+as\s+teams|form\s+(?:your\s+|a\s+)?teams?|teams\s+will\s+(?:design|present|build|compete|participate|work|solve)|per\s+team\b|winning\s+teams\b|top\s+\d+\s+teams\b)\b/i
+  );
+  if (explicitTeamRuleMatch) {
+    return {
+      teamParticipationVerified: true,
+      minTeamSize: null,
+      maxTeamSize: null,
+      excerpt: explicitTeamRuleMatch[0].trim(),
+      reason: `Explicit team participation rule stated in source ("${explicitTeamRuleMatch[0].trim()}").`,
+    };
+  }
+
+  return {
+    teamParticipationVerified: false,
+    minTeamSize: null,
+    maxTeamSize: null,
+    excerpt: null,
+    reason:
+      'Team participation eligibility is not stated in source text; awaiting team size verification.',
+  };
+}
+
 
 /**
  * Deterministic Event Classification using source tags, title, subtitle, and description.
@@ -1749,6 +1889,13 @@ function extractCanonicalEventAliases(record: {
     aliases.push('alias:robofest_5_rero_2025');
   }
 
+  if (
+    /\btriverse\s+ideathon\b/i.test(combined) &&
+    (/\b2025\b/i.test(combined) || /\bhcltech\b/i.test(combined))
+  ) {
+    aliases.push('alias:triverse_ideathon_2025');
+  }
+
   return aliases;
 }
 
@@ -1818,13 +1965,21 @@ export function areEventsSameRealWorldEvent(
     return diffDays <= 4;
   })();
 
-  // 2. Canonical multi-page alias match (e.g., ADCOM 2027 across 11537 & 11523)
+  const sameYearOrUndated = (() => {
+    if (!dateA || !dateB) return true;
+    return dateA.slice(0, 4) === dateB.slice(0, 4);
+  })();
+
+  // 2. Canonical multi-page alias match (e.g., ADCOM 2027 across 11537 & 11523, Triverse Ideathon 2025 across 11364/11314/11283)
   const aliasesA = extractCanonicalEventAliases(a);
   const aliasesB = extractCanonicalEventAliases(b);
   if (
     aliasesA.length > 0 &&
     aliasesB.some((al) => aliasesA.includes(al)) &&
-    datesCompatible
+    (datesCompatible ||
+      (aliasesA.includes('alias:triverse_ideathon_2025') &&
+        aliasesB.includes('alias:triverse_ideathon_2025') &&
+        sameYearOrUndated))
   ) {
     return true;
   }
@@ -1960,26 +2115,81 @@ export function deduplicateHackathonCatalog(hackathons: Hackathon[]): Hackathon[
       normalizeUrlForComparison(cleanedIncoming.registrationUrl) !==
         normalizeUrlForComparison(cleanedIncoming.verifiedCanonicalUrl);
 
+    const mergedSources = Array.from(
+      new Set([
+        ...(existing.sources ?? []),
+        ...(cleanedIncoming.sources ?? []),
+        ...mergedSourceIds,
+      ].filter((s): s is string => typeof s === 'string' && s.trim().length > 0))
+    );
+
+    const mergedName = preferIncomingName ? cleanedIncoming.name : existing.name;
+    const mergedDesc =
+      cleanedIncoming.description.length > existing.description.length
+        ? cleanedIncoming.description
+        : existing.description;
+    const mergedRegUrl =
+      existingRegIsFallback && incomingRegIsDistinct
+        ? cleanedIncoming.registrationUrl
+        : existing.registrationUrl || cleanedIncoming.registrationUrl;
+    const mergedDeadline =
+      existing.registrationDeadline || cleanedIncoming.registrationDeadline;
+    const mergedStartAt = existing.startAt || cleanedIncoming.startAt;
+    const mergedEndAt = existing.endAt || cleanedIncoming.endAt || mergedStartAt;
+    const mergedMinTeam = existing.minTeamSize ?? cleanedIncoming.minTeamSize;
+    const mergedMaxTeam = existing.maxTeamSize ?? cleanedIncoming.maxTeamSize;
+
+    const states = evaluateHackathonEligibilityAndStates({
+      name: mergedName,
+      description: mergedDesc,
+      eventType: existing.eventType,
+      themes: existing.themes,
+      minTeamSize: mergedMinTeam,
+      maxTeamSize: mergedMaxTeam,
+      startAt: mergedStartAt,
+      endAt: mergedEndAt,
+      registrationDeadline: mergedDeadline,
+      registrationUrl: mergedRegUrl,
+      verifiedCanonicalUrl: existing.verifiedCanonicalUrl || cleanedIncoming.verifiedCanonicalUrl,
+      originalSubmissionUrl: existing.originalSubmissionUrl || cleanedIncoming.originalSubmissionUrl,
+      sourceUrlStatus:
+        existing.sourceUrlStatus === 'verified' || cleanedIncoming.sourceUrlStatus === 'verified'
+          ? 'verified'
+          : existing.sourceUrlStatus,
+      sourceType: existing.sourceType,
+      status: existing.status,
+    });
+
     consolidated[existingIdx] = {
       ...existing,
-      name: preferIncomingName ? cleanedIncoming.name : existing.name,
-      description:
-        cleanedIncoming.description.length > existing.description.length
-          ? cleanedIncoming.description
-          : existing.description,
-      registrationUrl:
-        existingRegIsFallback && incomingRegIsDistinct
-          ? cleanedIncoming.registrationUrl
-          : existing.registrationUrl || cleanedIncoming.registrationUrl,
-      registrationDeadline:
-        existing.registrationDeadline || cleanedIncoming.registrationDeadline,
-      minTeamSize: existing.minTeamSize ?? cleanedIncoming.minTeamSize,
-      maxTeamSize: existing.maxTeamSize ?? cleanedIncoming.maxTeamSize,
+      name: mergedName,
+      description: mergedDesc,
+      shortDescription: mergedDesc.slice(0, 220),
+      startAt: mergedStartAt,
+      endAt: mergedEndAt,
+      dateDisplay: formatEventDateDisplayIST({ startAt: mergedStartAt, endAt: mergedEndAt }),
+      registrationUrl: mergedRegUrl,
+      registrationDeadline: mergedDeadline,
+      minTeamSize: states.minTeamSize,
+      maxTeamSize: states.maxTeamSize,
+      teamSize: {
+        min: states.minTeamSize,
+        max: states.maxTeamSize,
+      },
+      isHackathon: states.isHackathon,
+      teamParticipationVerified: states.teamParticipationVerified,
+      publicSourceVerified: states.publicSourceVerified,
+      matchable: states.matchable,
+      findTeammatesEligible: states.findTeammatesEligible,
+      registrationStatus: states.registrationStatus,
+      registrationStatusDetail: states.registrationStatusDetail,
+      registrationStatusLabel: states.registrationStatusLabel,
       venue: {
         campus: existing.venue?.campus ?? cleanedIncoming.venue?.campus ?? null,
         name: existing.venue?.name ?? cleanedIncoming.venue?.name ?? null,
       },
       sourceIds: mergedSourceIds,
+      sources: mergedSources,
       fieldProvenance: mergedProvenance,
     };
   }
@@ -2515,6 +2725,7 @@ export function resolveHackathonSourceCategory(
     h.verifiedCanonicalUrl,
     h.originalSubmissionUrl,
     h.registrationUrl,
+    ...(h.sources ?? []),
   ]
     .filter(Boolean)
     .join(' ')
@@ -2546,6 +2757,13 @@ export function getHackathonSourceLabel(h: Hackathon): {
     };
   }
   const st = h.sourceType ?? 'submitted_public_url';
+  if (st === 'paasha_microservice') {
+    return {
+      label: 'Verified via PAASHA',
+      isPesuOfficial: false,
+      sourceType: st,
+    };
+  }
   if (st === 'academy_opt_in_hint') {
     return {
       label: 'Verified from Academy Hint',
@@ -2622,5 +2840,663 @@ export function extractPesuEventsPaginationLinks(
 
   return results;
 }
+
+/**
+ * Checks whether a URL is a safe, public, non-private proof or registration URL.
+ * Rejects `pesuacademy.com`, private IPs, localhost, `attachment://`, `pesu-academy://`,
+ * and bogus QR generator landing pages (`me-qr.com/page/blog`).
+ */
+export function isSafePublicEventUrl(url: string | null | undefined): boolean {
+  if (!url || typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  if (
+    lower.startsWith('attachment://') ||
+    lower.startsWith('pesu-academy://') ||
+    lower.includes('pesuacademy.com') ||
+    lower.includes('me-qr.com/page/blog')
+  ) {
+    return false;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '0.0.0.0' ||
+      host === '::1' ||
+      host.endsWith('.local') ||
+      host.endsWith('.internal') ||
+      /^127\./.test(host) ||
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^169\.254\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface EvaluatedHackathonStates {
+  eventType: EventType;
+  categoryLabel: string;
+  isHackathon: boolean;
+  teamParticipationVerified: boolean;
+  publicSourceVerified: boolean;
+  matchable: boolean;
+  findTeammatesEligible: boolean;
+  registrationStatus: 'OPEN' | 'CLOSED' | 'UNKNOWN';
+  registrationStatusDetail:
+    | 'open_confirmed'
+    | 'deadline_known'
+    | 'link_available'
+    | 'unknown'
+    | 'closed'
+    | 'ended';
+  registrationStatusLabel: string;
+  minTeamSize: number | null;
+  maxTeamSize: number | null;
+  teamEligibilityReason: string;
+  classificationReason: string;
+}
+
+/**
+ * Evaluates all 5 required Phase 4 / Phase 6 state flags for an event:
+ * 1. `isHackathon`: competition type identified ('hackathon' | 'buildathon' | 'ideathon' | 'ctf' | 'team_competition' and not solo-only)
+ * 2. `teamParticipationVerified`: sufficient evidence of team eligibility (`maxTeamSize > 1` or explicit team rules)
+ * 3. `publicSourceVerified`: reliable public evidence established (`events.pes.edu` or verified public URL)
+ * 4. `matchable`: verified event eligible for teammate discovery (`isHackathon && teamParticipationVerified && publicSourceVerified`)
+ * 5. `registrationStatus`: `'OPEN' | 'CLOSED' | 'UNKNOWN'` (unknown status stays `'UNKNOWN'`, never `'OPEN'`)
+ */
+export function evaluateHackathonEligibilityAndStates(params: {
+  title?: string | null;
+  name?: string | null;
+  description?: string | null;
+  eventType?: EventType | string | null;
+  themes?: string[] | null;
+  minTeamSize?: number | null;
+  maxTeamSize?: number | null;
+  startAt?: string | null;
+  endAt?: string | null;
+  registrationDeadline?: string | null;
+  registrationUrl?: string | null;
+  verifiedCanonicalUrl?: string | null;
+  originalSubmissionUrl?: string | null;
+  sourceUrlStatus?: string | null;
+  sourceType?: EventSourceType | string | null;
+  status?: string | null;
+  registrationConfirmedOpen?: boolean | null;
+  evidenceText?: string | null;
+  todayIstYmd?: string;
+}): EvaluatedHackathonStates {
+  const title = cleanHtmlToText(params.title || params.name || '');
+  const description = cleanHtmlToText(params.description || '');
+
+  const teamCheck = verifyTeamParticipationEvidence({
+    title,
+    description,
+    minTeamSize: params.minTeamSize,
+    maxTeamSize: params.maxTeamSize,
+    evidenceText: params.evidenceText,
+  });
+
+  const cls = classifyGroundedEvent({
+    title,
+    description,
+    tags: params.themes ?? [],
+    minTeamSize: teamCheck.minTeamSize,
+    maxTeamSize: teamCheck.maxTeamSize,
+  });
+
+  const eligibleTypes = new Set<string>([
+    'hackathon',
+    'buildathon',
+    'ideathon',
+    'ctf',
+    'team_competition',
+  ]);
+  const nonHackathonTypes = new Set<string>([
+    'workshop',
+    'tech_talk',
+    'conference',
+  ]);
+
+  let effectiveEventType: EventType = cls.eventType;
+  if (nonHackathonTypes.has(cls.eventType)) {
+    effectiveEventType = cls.eventType;
+  } else if (eligibleTypes.has(cls.eventType)) {
+    effectiveEventType = cls.eventType;
+  } else if (
+    params.eventType &&
+    nonHackathonTypes.has(String(params.eventType))
+  ) {
+    effectiveEventType = params.eventType as EventType;
+  } else if (
+    params.eventType &&
+    eligibleTypes.has(String(params.eventType)) &&
+    cls.eventType === 'other' &&
+    !description
+  ) {
+    effectiveEventType = params.eventType as EventType;
+  }
+
+  const isSoloOnly = teamCheck.maxTeamSize === 1;
+  const isArchivedOrDraft =
+    params.status === 'archived' || params.status === 'draft';
+
+  const isHackathon =
+    Boolean(title) &&
+    eligibleTypes.has(effectiveEventType) &&
+    cls.matchable &&
+    !isSoloOnly &&
+    !isArchivedOrDraft;
+
+  const hasValidPublicUrl =
+    isSafePublicEventUrl(params.verifiedCanonicalUrl) ||
+    isSafePublicEventUrl(params.registrationUrl) ||
+    isSafePublicEventUrl(params.originalSubmissionUrl);
+
+  const publicSourceVerified =
+    hasValidPublicUrl ||
+    params.sourceUrlStatus === 'verified' ||
+    params.sourceType === 'pes_public_events' ||
+    params.sourceType === 'approved_organizer';
+
+  const teamParticipationVerified =
+    isHackathon && teamCheck.teamParticipationVerified;
+
+  const reg = getVerifiableRegistrationStatus(
+    {
+      registrationDeadline: params.registrationDeadline,
+      startAt: params.startAt,
+      endAt: params.endAt,
+      registrationUrl: params.registrationUrl,
+      verifiedCanonicalUrl: params.verifiedCanonicalUrl,
+      status: params.status,
+      registrationConfirmedOpen: params.registrationConfirmedOpen,
+    },
+    params.todayIstYmd ?? getTodayDateStringIST()
+  );
+
+  const registrationStatus: 'OPEN' | 'CLOSED' | 'UNKNOWN' =
+    reg.status === 'closed' || reg.status === 'ended'
+      ? 'CLOSED'
+      : reg.status === 'open_confirmed' ||
+          reg.status === 'deadline_known' ||
+          reg.status === 'link_available'
+        ? 'OPEN'
+        : 'UNKNOWN';
+
+  // Events with unknown team eligibility must NEVER be marked matchable: true
+  const matchable =
+    isHackathon && teamParticipationVerified && publicSourceVerified;
+
+  const findTeammatesEligible = matchable && registrationStatus !== 'CLOSED';
+
+  return {
+    eventType: effectiveEventType,
+    categoryLabel: formatEventTypeCategoryLabel(effectiveEventType),
+    isHackathon,
+    teamParticipationVerified,
+    publicSourceVerified,
+    matchable,
+    findTeammatesEligible,
+    registrationStatus,
+    registrationStatusDetail: reg.status,
+    registrationStatusLabel: reg.label,
+    minTeamSize: teamCheck.minTeamSize,
+    maxTeamSize: teamCheck.maxTeamSize,
+    teamEligibilityReason: teamCheck.reason,
+    classificationReason: cls.reason,
+  };
+}
+
+export interface ValidatedPaashaIngestionRecord {
+  accepted: boolean;
+  event?: ValidatedPaashaIngestionRecord;
+  paashaId: string;
+  announcementId: string;
+  externalFingerprint: string;
+  title: string;
+  organizer: string;
+  description: string;
+  shortDescription: string;
+  eventType: EventType;
+  isHackathon: boolean;
+  teamParticipationVerified: boolean;
+  publicSourceVerified: boolean;
+  matchable: boolean;
+  findTeammatesEligible: boolean;
+  registrationStatus: 'OPEN' | 'CLOSED' | 'UNKNOWN';
+  registrationStatusDetail:
+    | 'open_confirmed'
+    | 'deadline_known'
+    | 'link_available'
+    | 'unknown'
+    | 'closed'
+    | 'ended';
+  startAt: string | null;
+  endAt: string | null;
+  registrationDeadline: string | null;
+  campus: CampusType | null;
+  venueName: string | null;
+  format: 'onsite' | 'online' | 'hybrid' | 'unknown';
+  minTeamSize: number | null;
+  maxTeamSize: number | null;
+  registrationUrl: string | undefined;
+  verifiedCanonicalUrl: string | null;
+  imageUrl?: string | undefined;
+  themes: string[];
+  sources: string[];
+  fieldProvenance: Record<string, import('../types/domain').FieldProvenanceEntry>;
+  confidenceScore: number;
+  shouldPublishToCatalog: boolean;
+  reviewStatus: 'verified' | 'needs_confirmation' | 'rejected';
+  rejectionOrHoldReason: string;
+}
+
+/**
+ * Validates and transforms a single PAASHA `/api/v1/hackathons` record into a privacy-safe,
+ * strictly grounded Quackathon ingestion record.
+ *
+ * Security & Grounding Guarantees:
+ * - Does NOT blindly trust `item.isMatchable` or `item.isIndependentlyVerified`.
+ * - Strips private `pesuacademy.com` URLs (`posterImageUrl`, internal links) and never exposes `ocrSnippet`.
+ * - Redacts any personal student identifiers (emails, phone numbers, SRNs) from summary/title/organizer.
+ * - Rejects copying `publishedDate` (announcement publication date) into `startAt` unless supported by event text/provenance.
+ * - Requires verified public proof (`officialSourceUrl` or `registrationUrl`) and verified team participation (`maxTeamSize > 1` or explicit team rules) before marking `matchable: true` or auto-publishing.
+ */
+export function validateAndTransformPaashaHackathon(
+  rawOrValidated: Record<string, any>,
+  todayIstYmd: string = getTodayDateStringIST()
+): ValidatedPaashaIngestionRecord {
+  const itemId = String(rawOrValidated.id || '').trim();
+  const announcementId = String(
+    rawOrValidated.announcementId || itemId
+  ).trim();
+  const rawTitle = String(rawOrValidated.title || '');
+  const rawOrganizer =
+    typeof rawOrValidated.organizer === 'string'
+      ? rawOrValidated.organizer
+      : '';
+  const rawSummaryText = [
+    typeof rawOrValidated.publicSummary === 'string'
+      ? rawOrValidated.publicSummary
+      : '',
+    typeof rawOrValidated.summary === 'string' ? rawOrValidated.summary : '',
+    typeof rawOrValidated.description === 'string'
+      ? rawOrValidated.description
+      : '',
+  ]
+    .filter((s) => s.trim().length > 0)
+    .join(' ');
+
+  const sanitizedTitle = sanitizeTextForPublicCandidate(
+    cleanHtmlToText(rawTitle)
+  );
+  const sanitizedOrganizer = rawOrganizer.trim()
+    ? sanitizeTextForPublicCandidate(cleanHtmlToText(rawOrganizer))
+    : 'PES University';
+  const sanitizedSummary = sanitizeTextForPublicCandidate(
+    cleanHtmlToText(rawSummaryText)
+  );
+
+  const rawOfficialUrl =
+    rawOrValidated.officialSourceUrl ??
+    rawOrValidated.sourceUrl ??
+    rawOrValidated.verification?.publicProofUrl ??
+    null;
+  const rawRegUrl = rawOrValidated.registrationUrl ?? null;
+  const rawPosterUrl =
+    rawOrValidated.posterUrl ?? rawOrValidated.posterImageUrl ?? null;
+
+  // Validate public URLs — strip any pesuacademy.com or unsafe internal URLs
+  const safeOfficialUrl = isSafePublicEventUrl(rawOfficialUrl)
+    ? String(rawOfficialUrl).trim()
+    : null;
+  const safeRegistrationUrl = isSafePublicEventUrl(rawRegUrl)
+    ? String(rawRegUrl).trim()
+    : null;
+  const safePosterUrl = isSafePublicEventUrl(rawPosterUrl)
+    ? String(rawPosterUrl).trim()
+    : undefined;
+
+  const verifiedCanonicalUrl = safeOfficialUrl || safeRegistrationUrl || null;
+  const registrationUrl = safeRegistrationUrl || safeOfficialUrl || undefined;
+
+  // Date grounding: never allow announcement `publishedDate` to masquerade as `startAt`
+  const pubYmd = parseSingleDateToYmd(rawOrValidated.publishedDate ?? null);
+  const rawStart =
+    rawOrValidated.startAt ??
+    rawOrValidated.startDate ??
+    rawOrValidated.eventDates?.start ??
+    null;
+  const rawEnd =
+    rawOrValidated.endAt ??
+    rawOrValidated.endDate ??
+    rawOrValidated.eventDates?.end ??
+    null;
+  const rawDeadline =
+    rawOrValidated.registrationDeadline ??
+    rawOrValidated.eligibility?.registrationDeadline ??
+    null;
+
+  let startAt = parseSingleDateToYmd(rawStart);
+  let endAt = parseSingleDateToYmd(rawEnd) ?? startAt;
+  const registrationDeadline = parseSingleDateToYmd(rawDeadline);
+
+  const startProvenance = String(
+    rawOrValidated.fieldProvenance?.startAt ?? ''
+  ).toLowerCase();
+  if (
+    startAt &&
+    pubYmd &&
+    startAt === pubYmd &&
+    (startProvenance.includes('publisheddate') ||
+      startProvenance.includes('announcement_date'))
+  ) {
+    startAt = null;
+    endAt = null;
+  }
+  if (startAt && endAt && endAt < startAt) {
+    endAt = startAt;
+  }
+
+  // Campus & venue normalization
+  const rawCampus = String(
+    rawOrValidated.campus ??
+      rawOrValidated.eligibility?.campus ??
+      rawOrValidated.campusOrVenue ??
+      ''
+  )
+    .toUpperCase()
+    .trim();
+  let campus: CampusType | null = null;
+  if (rawCampus === 'RR' || /rr\s*campus|ring\s*road/i.test(rawCampus)) {
+    campus = 'RR Campus';
+  } else if (
+    rawCampus === 'EC' ||
+    /ec\s*campus|electronic\s*city/i.test(rawCampus)
+  ) {
+    campus = 'EC Campus';
+  } else if (
+    rawCampus === 'ONLINE' ||
+    rawCampus === 'BOTH' ||
+    rawCampus === 'MULTI'
+  ) {
+    campus = 'Online / Multi-Campus';
+  } else {
+    campus = extractGroundedCampus(
+      `${rawCampus} ${rawOrValidated.venue ?? ''} ${sanitizedTitle} ${sanitizedSummary}`
+    );
+  }
+
+  const rawVenueStr =
+    rawOrValidated.venue ?? rawOrValidated.campusOrVenue ?? null;
+  const venueName = rawVenueStr
+    ? sanitizeTextForPublicCandidate(cleanHtmlToText(String(rawVenueStr)))
+    : null;
+
+  const modeUpper = String(
+    rawOrValidated.mode ?? rawOrValidated.format ?? 'UNKNOWN'
+  ).toUpperCase();
+  const format: 'onsite' | 'online' | 'hybrid' | 'unknown' =
+    modeUpper === 'ONLINE'
+      ? 'online'
+      : modeUpper === 'HYBRID'
+        ? 'hybrid'
+        : modeUpper === 'OFFLINE' ||
+            modeUpper === 'ONSITE' ||
+            venueName ||
+            campus === 'RR Campus' ||
+            campus === 'EC Campus'
+          ? 'onsite'
+          : 'unknown';
+
+  // Map PAASHA category hint + run Quackathon's deterministic classifier
+  const paashaCategoryUpper = String(
+    rawOrValidated.category ?? rawOrValidated.eventType ?? ''
+  ).toUpperCase();
+  const categoryForcedNonHackathon: EventType | null =
+    paashaCategoryUpper === 'WORKSHOP' || paashaCategoryUpper === 'BOOTCAMP'
+      ? 'workshop'
+      : paashaCategoryUpper === 'TECH_TALK' ||
+          paashaCategoryUpper === 'SEMINAR' ||
+          paashaCategoryUpper === 'WEBINAR' ||
+          paashaCategoryUpper === 'LECTURE'
+        ? 'tech_talk'
+        : paashaCategoryUpper === 'CONFERENCE' ||
+            paashaCategoryUpper === 'SUMMIT'
+          ? 'conference'
+          : paashaCategoryUpper === 'CULTURAL'
+            ? 'other'
+            : null;
+
+  const cleanedTags = (Array.isArray(rawOrValidated.tags) ? rawOrValidated.tags : [])
+    .map((t: unknown) =>
+      sanitizeTextForPublicCandidate(cleanHtmlToText(String(t)))
+        .replace(/^#/, '')
+        .trim()
+    )
+    .filter(Boolean);
+
+  const inputMinTeamSize =
+    typeof rawOrValidated.minTeamSize === 'number'
+      ? rawOrValidated.minTeamSize
+      : typeof rawOrValidated.teamSizeMin === 'number'
+        ? rawOrValidated.teamSizeMin
+        : typeof rawOrValidated.teamSize?.min === 'number'
+          ? rawOrValidated.teamSize.min
+          : null;
+  const inputMaxTeamSize =
+    typeof rawOrValidated.maxTeamSize === 'number'
+      ? rawOrValidated.maxTeamSize
+      : typeof rawOrValidated.teamSizeMax === 'number'
+        ? rawOrValidated.teamSizeMax
+        : typeof rawOrValidated.teamSize?.max === 'number'
+          ? rawOrValidated.teamSize.max
+          : null;
+
+  const rawRegStatus = String(
+    rawOrValidated.registrationStatus ??
+      rawOrValidated.eligibility?.status ??
+      'UNKNOWN'
+  ).toUpperCase();
+
+  const states = evaluateHackathonEligibilityAndStates({
+    title: sanitizedTitle,
+    description: sanitizedSummary,
+    eventType: categoryForcedNonHackathon ?? undefined,
+    themes: cleanedTags,
+    minTeamSize: inputMinTeamSize,
+    maxTeamSize: inputMaxTeamSize,
+    startAt,
+    endAt,
+    registrationDeadline,
+    registrationUrl: safeRegistrationUrl,
+    verifiedCanonicalUrl: safeOfficialUrl,
+    sourceUrlStatus: verifiedCanonicalUrl ? 'verified' : 'unverified',
+    sourceType: 'paasha_microservice',
+    status:
+      rawRegStatus === 'CLOSED' || rawRegStatus === 'REGISTRATION_CLOSED'
+        ? 'registration_closed'
+        : 'published',
+    registrationConfirmedOpen: false,
+    todayIstYmd,
+  });
+
+  // Override if PAASHA itself explicitly marked isHackathon: false or non-hackathon category
+  const finalEventType: EventType =
+    categoryForcedNonHackathon ?? states.eventType;
+  const finalIsHackathon =
+    rawOrValidated.isHackathon !== false &&
+    categoryForcedNonHackathon === null &&
+    states.isHackathon;
+
+  // Public proof requires an actual safe external/official public URL (do NOT blindly trust item.isIndependentlyVerified)
+  const finalPublicSourceVerified = Boolean(
+    safeOfficialUrl || safeRegistrationUrl
+  );
+
+  const finalTeamVerified =
+    finalIsHackathon && states.teamParticipationVerified;
+
+  const finalMatchable =
+    finalIsHackathon && finalTeamVerified && finalPublicSourceVerified;
+
+  // Registration status: never upgrade UNKNOWN to OPEN without verified link/deadline
+  const finalRegistrationStatus: 'OPEN' | 'CLOSED' | 'UNKNOWN' =
+    rawRegStatus === 'CLOSED' ||
+    rawRegStatus === 'REGISTRATION_CLOSED' ||
+    states.registrationStatus === 'CLOSED'
+      ? 'CLOSED'
+      : states.registrationStatus === 'OPEN'
+        ? 'OPEN'
+        : 'UNKNOWN';
+
+  const finalFindTeammatesEligible =
+    finalMatchable && finalRegistrationStatus !== 'CLOSED';
+
+  const nowIso = new Date().toISOString();
+  const provSourceUrl =
+    verifiedCanonicalUrl || `paasha://hackathon/${itemId}`;
+  const verifStatusLabel = String(
+    rawOrValidated.verificationStatus ??
+      rawOrValidated.verification?.verificationStatus ??
+      'UNVERIFIED'
+  );
+  const fieldProvenance: Record<
+    string,
+    import('../types/domain').FieldProvenanceEntry
+  > = {
+    _meta: {
+      sourceUrl: provSourceUrl,
+      sourceType: 'paasha_microservice',
+      excerpt: `PAASHA microservice record (${itemId}), verificationStatus=${verifStatusLabel}`,
+      verifiedAt: nowIso,
+    },
+  };
+
+  for (const [fieldKey, provDesc] of Object.entries(
+    rawOrValidated.fieldProvenance ?? {}
+  )) {
+    fieldProvenance[fieldKey] = {
+      sourceUrl: provSourceUrl,
+      sourceType: 'paasha_microservice',
+      excerpt: sanitizeTextForPublicCandidate(String(provDesc)).slice(0, 200),
+      verifiedAt: nowIso,
+    };
+  }
+
+  const sources = Array.from(
+    new Set(
+      [
+        safeOfficialUrl,
+        safeRegistrationUrl,
+        `paasha:${itemId}`,
+      ].filter((x): x is string => Boolean(x))
+    )
+  );
+
+  // Only publish directly into the public hackathon catalog when:
+  // 1. It is a real hackathon or eligible team competition (`finalIsHackathon`)
+  // 2. Team participation is verified (`finalTeamVerified`)
+  // 3. It has a verified public source URL (`finalPublicSourceVerified`)
+  // Events with unverified team size are held in `event_candidates` (`needs_confirmation`) for admin review.
+  const shouldPublishToCatalog =
+    finalIsHackathon && finalTeamVerified && finalPublicSourceVerified;
+
+  let reviewStatus: 'verified' | 'needs_confirmation' | 'rejected' =
+    'needs_confirmation';
+  let rejectionOrHoldReason = '';
+
+  if (!finalIsHackathon) {
+    reviewStatus = 'rejected';
+    rejectionOrHoldReason = `Excluded non-hackathon or individual-only event (${finalEventType}).`;
+  } else if (!finalPublicSourceVerified) {
+    reviewStatus = 'needs_confirmation';
+    rejectionOrHoldReason =
+      'Held in candidate review: missing verifiable public proof URL outside pesuacademy.com.';
+  } else if (!finalTeamVerified) {
+    reviewStatus = 'needs_confirmation';
+    rejectionOrHoldReason =
+      'Held in candidate review: team participation eligibility (minTeamSize/maxTeamSize) is unknown.';
+  } else {
+    reviewStatus = 'verified';
+    rejectionOrHoldReason =
+      'Verified team hackathon with public proof and confirmed team participation.';
+  }
+
+  const fallbackSummary = [
+    `${formatEventTypeCategoryLabel(finalEventType)} organized by ${sanitizedOrganizer}.`,
+    startAt ? `Scheduled: ${startAt}${endAt && endAt !== startAt ? ` to ${endAt}` : ''}.` : null,
+    states.minTeamSize || states.maxTeamSize
+      ? `Team size: ${states.minTeamSize ?? 1}–${states.maxTeamSize ?? states.minTeamSize} members.`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const finalDescription = sanitizedSummary || fallbackSummary;
+  const confidenceScore =
+    typeof rawOrValidated.confidenceScore === 'number'
+      ? rawOrValidated.confidenceScore
+      : 0.75;
+
+  const record: ValidatedPaashaIngestionRecord = {
+    accepted: finalIsHackathon,
+    paashaId: itemId,
+    announcementId,
+    externalFingerprint: `paasha_hack_${itemId}`,
+    title: sanitizedTitle,
+    organizer: sanitizedOrganizer,
+    description: finalDescription,
+    shortDescription: finalDescription.slice(0, 220),
+    eventType: finalEventType,
+    isHackathon: finalIsHackathon,
+    teamParticipationVerified: finalTeamVerified,
+    publicSourceVerified: finalPublicSourceVerified,
+    matchable: finalMatchable,
+    findTeammatesEligible: finalFindTeammatesEligible,
+    registrationStatus: finalRegistrationStatus,
+    registrationStatusDetail:
+      finalRegistrationStatus === 'CLOSED' &&
+      states.registrationStatusDetail !== 'ended'
+        ? 'closed'
+        : states.registrationStatusDetail,
+    startAt,
+    endAt,
+    registrationDeadline,
+    campus,
+    venueName,
+    format,
+    minTeamSize: states.minTeamSize,
+    maxTeamSize: states.maxTeamSize,
+    registrationUrl,
+    verifiedCanonicalUrl,
+    imageUrl: safePosterUrl,
+    themes:
+      cleanedTags.length > 0
+        ? cleanedTags.slice(0, 5)
+        : [formatEventTypeCategoryLabel(finalEventType)],
+    sources,
+    fieldProvenance,
+    confidenceScore,
+    shouldPublishToCatalog,
+    reviewStatus,
+    rejectionOrHoldReason,
+  };
+  record.event = record;
+  return record;
+}
+
 
 
