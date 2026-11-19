@@ -33,7 +33,9 @@ export type IntegrationErrorCategory =
   | 'OAUTH_REDIRECT_URI_MISMATCH'
   | 'OAUTH_STATE_INVALID'
   | 'OAUTH_CONSENT_ERROR'
-  | 'OAUTH_TOKEN_EXCHANGE_FAILED';
+  | 'OAUTH_TOKEN_EXCHANGE_FAILED'
+  | 'INVALID_CLIENT'
+  | 'OAUTH_INVALID_GRANT';
 
 export type ExtractionMethodUsed =
   | 'pdf_text_parser'
@@ -66,6 +68,8 @@ export interface DeveloperDiagnosticTelemetry {
   sessionBindingMatched?: boolean | null;
   handledByDifferentInstance?: boolean | null;
   extractionMethod?: ExtractionMethodUsed;
+  note?: string | null;
+  authMethodUsed?: string | null;
 }
 
 /**
@@ -179,7 +183,7 @@ export interface ExtractEventUrlResponse {
  */
 export interface PesuOAuthStageStatuses {
   providerDiscovery: 'idle' | 'ok' | 'invalid_response' | 'degraded_fallback' | 'unreachable';
-  configuration: 'configured' | 'public_client_only' | 'missing_client_id';
+  configuration: 'configured' | 'public_client_only' | 'missing_client_id' | 'missing_client_secret';
   redirectUriValidation: 'valid' | 'mismatch';
   authorizationRedirect:
     | 'idle'

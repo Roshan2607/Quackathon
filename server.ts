@@ -2358,6 +2358,9 @@ function logOAuthStructuredEvent(params: {
   callbackCookieStatus?: 'valid' | 'missing' | 'invalid_signature' | null;
   sessionBindingMatched?: boolean | null;
   handledByDifferentInstance?: boolean;
+  authMethodUsed?: string | null;
+  hasClientId?: boolean;
+  hasClientSecret?: boolean;
   note?: string;
 }): void {
   const entry = {
@@ -2388,6 +2391,15 @@ function logOAuthStructuredEvent(params: {
       : {}),
     ...(params.handledByDifferentInstance !== undefined
       ? { handledByDifferentInstance: params.handledByDifferentInstance }
+      : {}),
+    ...(params.authMethodUsed !== undefined
+      ? { authMethodUsed: params.authMethodUsed }
+      : {}),
+    ...(params.hasClientId !== undefined
+      ? { hasClientId: params.hasClientId }
+      : {}),
+    ...(params.hasClientSecret !== undefined
+      ? { hasClientSecret: params.hasClientSecret }
       : {}),
     ...(params.note ? { note: params.note } : {}),
   };
@@ -4320,27 +4332,132 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
   const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim() ?? '';
   const clientSecret = process.env.PESU_OAUTH_CLIENT_SECRET?.trim() ?? '';
 
+  // Validate that PESU_OAUTH_CLIENT_ID and PESU_OAUTH_CLIENT_SECRET are loaded from the environment
+  if (!clientId || !clientSecret) {
+    targetSession.stages.configuration = !clientId
+      ? 'missing_client_id'
+      : 'missing_client_secret';
+    targetSession.stages.tokenExchange = 'failed';
+    const missingVar = !clientId ? 'PESU_OAUTH_CLIENT_ID' : 'PESU_OAUTH_CLIENT_SECRET';
+    const userMsg = `Local environment configuration error: ${missingVar} is missing or empty. Please configure it in your backend environment (.env).`;
+    targetSession.lastError = userMsg;
+
+    await completeOAuthTransactionRecord({
+      state,
+      status: 'failed',
+      outcomeStatus: 400,
+      outcomeErrorCategory: 'MISSING_CONFIG',
+      outcomeMessage: userMsg,
+    });
+
+    const durationMs = Date.now() - startTime;
+    const diag: DeveloperDiagnosticTelemetry = {
+      serviceName: 'pesu_oauth2',
+      httpStatus: 400,
+      errorCategory: 'MISSING_CONFIG',
+      retryAttempts: 0,
+      durationMs,
+      requestId,
+      timestamp: new Date().toISOString(),
+      stateFingerprint: stateFp,
+      sessionFingerprint: effectiveSessionFp,
+      transactionStatus: 'failed',
+      callbackOutcome: 'missing_credentials',
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
+      note: `${missingVar} is missing from environment`,
+    };
+    targetSession.lastDiagnostics = diag;
+
+    logOAuthStructuredEvent({
+      requestId,
+      event: 'oauth_callback_missing_credentials',
+      stateFingerprint: stateFp,
+      sessionFingerprint: effectiveSessionFp,
+      transactionStatus: 'failed',
+      callbackOutcome: 'missing_credentials',
+      httpStatus: 400,
+      durationMs,
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
+      hasClientId: Boolean(clientId),
+      hasClientSecret: Boolean(clientSecret),
+    });
+
+    const payload: PesuOAuthCallbackPostMessage = {
+      type: 'PESU_OAUTH_RESULT',
+      status: 'error',
+      ok: false,
+      state,
+      stages: targetSession.stages,
+      identity: null,
+      userMessage: userMsg,
+      error: userMsg,
+      errorCategory: 'MISSING_CONFIG',
+      diagnostics: diag,
+    };
+    res.status(400).send(renderOAuthCallbackHtml(payload, trustedOrigin));
+    return;
+  }
+
   // Case 5: Perform genuine server-side Authorization Code + PKCE S256 token exchange
+  // using exactly one supported client-authentication method
   const fetchFn = getFetch();
   try {
-    const tokenParams = new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: tx.redirectUri,
-      client_id: clientId,
-      code_verifier: tx.codeVerifier,
-    });
+    const disc = await discoverPesuOidcEndpoints(req).catch(() => null);
+    const supportedMethods = disc?.tokenEndpointAuthMethodsSupported ?? [
+      'client_secret_basic',
+      'client_secret_post',
+    ];
+
+    const envAuthMethod = (
+      process.env.PESU_OAUTH_TOKEN_AUTH_METHOD ||
+      process.env.PESU_OAUTH_AUTH_METHOD ||
+      ''
+    ).trim().toLowerCase();
+
+    // Default to 'client_secret_basic' per OIDC Core 1.0 Section 9 and RFC 6749 Section 2.3.1
+    // unless 'client_secret_post' is explicitly configured or it is the only supported method.
+    const authMethod: 'client_secret_basic' | 'client_secret_post' =
+      envAuthMethod === 'client_secret_post' || envAuthMethod === 'post'
+        ? 'client_secret_post'
+        : envAuthMethod === 'client_secret_basic' || envAuthMethod === 'basic'
+        ? 'client_secret_basic'
+        : supportedMethods.includes('client_secret_basic') || !supportedMethods.includes('client_secret_post')
+        ? 'client_secret_basic'
+        : 'client_secret_post';
 
     const tokenHeaders: Record<string, string> = {
       'Content-Type': 'application/x-www-form-urlencoded',
       Accept: 'application/json',
     };
 
-    if (clientSecret) {
+    const tokenParams = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: tx.redirectUri,
+      code_verifier: tx.codeVerifier,
+    });
+
+    if (authMethod === 'client_secret_basic') {
+      // RFC 6749 Section 2.3.1: client_secret_basic
+      // Credentials sent strictly in Authorization header.
+      // client_secret MUST NOT be sent in request body.
       const basicCredentials = Buffer.from(
         `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`
       ).toString('base64');
       tokenHeaders.Authorization = `Basic ${basicCredentials}`;
+    } else {
+      // RFC 6749 Section 2.3.1: client_secret_post
+      // Credentials sent strictly in request body.
+      // Authorization header MUST NOT be sent.
+      tokenParams.set('client_id', clientId);
       tokenParams.set('client_secret', clientSecret);
     }
 
@@ -4358,23 +4475,57 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     if (!tokenResp.ok || (!tokenData.access_token && !tokenData.id_token)) {
       targetSession.stages.tokenExchange = 'failed';
       targetSession.stages.verifiedIdentity = 'unverified';
+
       const upstreamErr =
-        typeof tokenData.error_description === 'string'
+        typeof tokenData.error_description === 'string' && tokenData.error_description
           ? tokenData.error_description
-          : typeof tokenData.error === 'string'
+          : typeof tokenData.error === 'string' && tokenData.error
           ? tokenData.error
           : `HTTP ${tokenResp.status}`;
+
       const isInvalidClient = tokenData.error === 'invalid_client';
+      const isRedirectMismatch =
+        tokenData.error === 'redirect_uri_mismatch' ||
+        /redirect.*mismatch/i.test(upstreamErr);
+      const isInvalidGrant =
+        tokenData.error === 'invalid_grant' ||
+        tokenData.error === 'expired_token' ||
+        /(grant|code|expired)/i.test(upstreamErr);
+
+      // Safe diagnostic categorization distinguishing the failure mode
+      const diagCategory: 'INVALID_CLIENT' | 'OAUTH_REDIRECT_URI_MISMATCH' | 'OAUTH_INVALID_GRANT' | 'OAUTH_TOKEN_EXCHANGE_FAILED' =
+        isInvalidClient
+          ? 'INVALID_CLIENT'
+          : isRedirectMismatch
+          ? 'OAUTH_REDIRECT_URI_MISMATCH'
+          : isInvalidGrant
+          ? 'OAUTH_INVALID_GRANT'
+          : 'OAUTH_TOKEN_EXCHANGE_FAILED';
+
+      const callbackOutcome: DeveloperDiagnosticTelemetry['callbackOutcome'] =
+        isInvalidClient
+          ? 'rejected_invalid_client'
+          : isRedirectMismatch
+          ? 'rejected_redirect_uri_mismatch'
+          : isInvalidGrant
+          ? 'rejected_invalid_grant'
+          : 'token_exchange_failed';
+
       const userMsg = isInvalidClient
         ? `Token exchange with PESU OAuth2 failed (${upstreamErr}). Verify that PESU_OAUTH_CLIENT_SECRET matches client "${clientId}" in the PESU OAuth2 Developer Portal.`
+        : isRedirectMismatch
+        ? `Token exchange with PESU OAuth2 failed (redirect_uri_mismatch: ${upstreamErr}). Ensure the registered callback URL matches the application callback origin.`
+        : isInvalidGrant
+        ? `Token exchange with PESU OAuth2 failed (invalid_grant: ${upstreamErr}). The authorization code may have expired or already been consumed.`
         : `Token exchange with PESU OAuth2 failed (${upstreamErr}).`;
+
       targetSession.lastError = userMsg;
 
       await completeOAuthTransactionRecord({
         state,
         status: 'failed',
         outcomeStatus: tokenResp.status || 502,
-        outcomeErrorCategory: 'OAUTH_TOKEN_EXCHANGE_FAILED',
+        outcomeErrorCategory: diagCategory,
         outcomeMessage: userMsg,
       });
 
@@ -4382,7 +4533,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       const diag: DeveloperDiagnosticTelemetry = {
         serviceName: 'pesu_oauth2',
         httpStatus: tokenResp.status || 502,
-        errorCategory: 'OAUTH_TOKEN_EXCHANGE_FAILED',
+        errorCategory: diagCategory,
         retryAttempts: 0,
         durationMs,
         requestId,
@@ -4390,12 +4541,14 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         stateFingerprint: stateFp,
         sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
-        callbackOutcome: 'token_exchange_failed',
+        callbackOutcome,
         initiatingOrigin: tx.clientOrigin,
         configuredCallbackOrigin,
         callbackCookieStatus,
         sessionBindingMatched: true,
         handledByDifferentInstance,
+        authMethodUsed: authMethod,
+        note: `Token exchange failed: ${upstreamErr} [${diagCategory}]`,
       };
       targetSession.lastDiagnostics = diag;
 
@@ -4405,7 +4558,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         stateFingerprint: stateFp,
         sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
-        callbackOutcome: 'token_exchange_failed',
+        callbackOutcome,
         httpStatus: tokenResp.status || 502,
         durationMs,
         initiatingOrigin: tx.clientOrigin,
@@ -4413,6 +4566,9 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         callbackCookieStatus,
         sessionBindingMatched: true,
         handledByDifferentInstance,
+        authMethodUsed: authMethod,
+        hasClientId: Boolean(clientId),
+        hasClientSecret: Boolean(clientSecret),
         note: upstreamErr,
       });
 

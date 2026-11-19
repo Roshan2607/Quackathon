@@ -5708,3 +5708,383 @@ test('41. Closed, ended, or non-matchable hackathons reject new team creation an
   await db.delete(users).where(eq(users.uid, testUid));
 });
 
+test('42. Token exchange sends client credentials via client_secret_basic (Authorization header ONLY, no client_secret in body)', async () => {
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
+  const { eq } = await import('drizzle-orm');
+
+  resetServerTestOverrides();
+  delete process.env.PESU_OAUTH_TOKEN_AUTH_METHOD;
+  const clientId = 'test_basic_auth_client';
+  const clientSecret = 'test_secret_basic_xyz_123';
+  process.env.PESU_OAUTH_CLIENT_ID = clientId;
+  process.env.PESU_OAUTH_CLIENT_SECRET = clientSecret;
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  let capturedAuthHeader = '';
+  let capturedBodyString = '';
+
+  setServerTestOverrides({
+    fetchFn: async (input, init) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+            token_endpoint_auth_methods_supported: ['client_secret_basic'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/token') {
+        const hdrs = (init?.headers ?? {}) as Record<string, string>;
+        capturedAuthHeader = hdrs.Authorization || hdrs.authorization || '';
+        capturedBodyString = String(init?.body ?? '');
+
+        const idToken = createBase64UrlJwt({
+          iss: 'https://oauth.pesu.mock',
+          aud: clientId,
+          sub: 'pesu_student_basic_01',
+          name: 'Basic Auth Student',
+          email: 'basic.student@pesu.pes.edu',
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        });
+        return new Response(
+          JSON.stringify({
+            access_token: 'token_basic_success',
+            token_type: 'Bearer',
+            expires_in: 3600,
+            scope: 'openid profile email',
+            id_token: idToken,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/userinfo') {
+        return new Response(
+          JSON.stringify({
+            sub: 'pesu_student_basic_01',
+            name: 'Basic Auth Student',
+            email: 'basic.student@pesu.pes.edu',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlData = await urlRes.json();
+
+  const cbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=basic_code_1&state=${encodeURIComponent(urlData.state)}`,
+    { headers: { Cookie: sidCookie } }
+  );
+  assert.equal(cbRes.status, 200);
+
+  // Verify client_secret_basic: Authorization header must be present, client_secret MUST NOT be in body
+  assert.ok(capturedAuthHeader.startsWith('Basic '), 'Must send Basic authorization header');
+  const decodedCreds = Buffer.from(capturedAuthHeader.replace(/^Basic\s+/i, ''), 'base64').toString('utf-8');
+  assert.equal(
+    decodedCreds,
+    `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`
+  );
+
+  const bodyParams = new URLSearchParams(capturedBodyString);
+  assert.equal(
+    bodyParams.get('client_secret'),
+    null,
+    'client_secret MUST NOT be sent in request body when using client_secret_basic'
+  );
+  assert.equal(bodyParams.get('grant_type'), 'authorization_code');
+  assert.ok(bodyParams.get('code_verifier'), 'PKCE code_verifier must be present in body');
+
+  // Cleanup
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, 'pesu_pesu_student_basic_01'));
+  await db.delete(profiles).where(eq(profiles.uid, 'pesu_pesu_student_basic_01'));
+  await db.delete(users).where(eq(users.uid, 'pesu_pesu_student_basic_01'));
+});
+
+test('43. Token exchange sends client credentials via client_secret_post (request body ONLY, no Authorization header)', async () => {
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
+  const { eq } = await import('drizzle-orm');
+
+  resetServerTestOverrides();
+  process.env.PESU_OAUTH_TOKEN_AUTH_METHOD = 'client_secret_post';
+  const clientId = 'test_post_auth_client';
+  const clientSecret = 'test_secret_post_abc_456';
+  process.env.PESU_OAUTH_CLIENT_ID = clientId;
+  process.env.PESU_OAUTH_CLIENT_SECRET = clientSecret;
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  let capturedAuthHeader = '';
+  let capturedBodyString = '';
+
+  setServerTestOverrides({
+    fetchFn: async (input, init) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+            token_endpoint_auth_methods_supported: ['client_secret_post'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/token') {
+        const hdrs = (init?.headers ?? {}) as Record<string, string>;
+        capturedAuthHeader = hdrs.Authorization || hdrs.authorization || '';
+        capturedBodyString = String(init?.body ?? '');
+
+        const idToken = createBase64UrlJwt({
+          iss: 'https://oauth.pesu.mock',
+          aud: clientId,
+          sub: 'pesu_student_post_01',
+          name: 'Post Auth Student',
+          email: 'post.student@pesu.pes.edu',
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        });
+        return new Response(
+          JSON.stringify({
+            access_token: 'token_post_success',
+            token_type: 'Bearer',
+            expires_in: 3600,
+            scope: 'openid profile email',
+            id_token: idToken,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/userinfo') {
+        return new Response(
+          JSON.stringify({
+            sub: 'pesu_student_post_01',
+            name: 'Post Auth Student',
+            email: 'post.student@pesu.pes.edu',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlData = await urlRes.json();
+
+  const cbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=post_code_1&state=${encodeURIComponent(urlData.state)}`,
+    { headers: { Cookie: sidCookie } }
+  );
+  assert.equal(cbRes.status, 200);
+
+  // Verify client_secret_post: Authorization header MUST NOT be sent, credentials MUST be in body
+  assert.equal(capturedAuthHeader, '', 'Must NOT send Authorization header when using client_secret_post');
+
+  const bodyParams = new URLSearchParams(capturedBodyString);
+  assert.equal(bodyParams.get('client_id'), clientId, 'client_id must be in request body');
+  assert.equal(bodyParams.get('client_secret'), clientSecret, 'client_secret must be in request body');
+  assert.equal(bodyParams.get('grant_type'), 'authorization_code');
+  assert.ok(bodyParams.get('code_verifier'), 'PKCE code_verifier must be in request body');
+
+  // Cleanup
+  delete process.env.PESU_OAUTH_TOKEN_AUTH_METHOD;
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, 'pesu_pesu_student_post_01'));
+  await db.delete(profiles).where(eq(profiles.uid, 'pesu_pesu_student_post_01'));
+  await db.delete(users).where(eq(users.uid, 'pesu_pesu_student_post_01'));
+});
+
+test('44. Token exchange with invalid client credentials returns safe INVALID_CLIENT diagnostic without secret leakage', async () => {
+  resetServerTestOverrides();
+  const clientId = 'test_invalid_client_app';
+  const clientSecret = 'super_secret_that_must_not_leak_987';
+  process.env.PESU_OAUTH_CLIENT_ID = clientId;
+  process.env.PESU_OAUTH_CLIENT_SECRET = clientSecret;
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/token') {
+        return new Response(
+          JSON.stringify({
+            error: 'invalid_client',
+            error_description: 'Client authentication failed: invalid client secret',
+          }),
+          { status: 401, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlData = await urlRes.json();
+
+  const cbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=bad_secret_code&state=${encodeURIComponent(urlData.state)}`,
+    { headers: { Cookie: sidCookie } }
+  );
+  const cbHtml = await cbRes.text();
+  assert.equal(cbRes.status, 502);
+
+  // Extract postMessage payload
+  const match = cbHtml.match(/var payload = ({.*?});/);
+  assert.ok(match, 'Callback HTML must contain payload');
+  const payload = JSON.parse(match[1]);
+
+  assert.equal(payload.ok, false);
+  assert.equal(payload.diagnostics.errorCategory, 'INVALID_CLIENT');
+  assert.equal(payload.diagnostics.callbackOutcome, 'rejected_invalid_client');
+  assert.equal(payload.diagnostics.httpStatus, 401);
+  assert.equal(payload.stages.tokenExchange, 'failed');
+
+  // Verify that the secret was NEVER leaked into the HTML, userMessage, or diagnostics
+  assert.ok(!cbHtml.includes(clientSecret), 'Client secret MUST NEVER be present in callback HTML');
+  assert.ok(!payload.userMessage.includes(clientSecret));
+  assert.ok(!payload.error.includes(clientSecret));
+  assert.ok(!JSON.stringify(payload.diagnostics).includes(clientSecret));
+});
+
+test('45. Missing local backend credentials (missing PESU_OAUTH_CLIENT_SECRET) fails callback with 400 MISSING_CONFIG before network exchange', async () => {
+  resetServerTestOverrides();
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_valid_client_id';
+  const prevSecret = process.env.PESU_OAUTH_CLIENT_SECRET;
+  delete process.env.PESU_OAUTH_CLIENT_SECRET;
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  let tokenEndpointCalled = false;
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/token') {
+        tokenEndpointCalled = true;
+        return new Response(JSON.stringify({ error: 'should_not_reach' }), { status: 500 });
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  try {
+    const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+    const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
+    const urlData = await urlRes.json();
+
+    const cbRes = await fetch(
+      `${baseUrl}/auth/pesu/callback?code=missing_secret_code&state=${encodeURIComponent(urlData.state)}`,
+      { headers: { Cookie: sidCookie } }
+    );
+    const cbHtml = await cbRes.text();
+    assert.equal(cbRes.status, 400);
+
+    const match = cbHtml.match(/var payload = ({.*?});/);
+    assert.ok(match, 'Callback HTML must contain payload');
+    const payload = JSON.parse(match[1]);
+
+    assert.equal(payload.ok, false);
+    assert.equal(payload.errorCategory, 'MISSING_CONFIG');
+    assert.equal(payload.stages.configuration, 'missing_client_secret');
+    assert.equal(payload.diagnostics.callbackOutcome, 'missing_credentials');
+    assert.equal(tokenEndpointCalled, false, 'Token endpoint must NOT be called when credentials are missing');
+  } finally {
+    if (prevSecret !== undefined) {
+      process.env.PESU_OAUTH_CLIENT_SECRET = prevSecret;
+    }
+  }
+});
+
+test('46. Upstream authorization-code rejection (invalid_grant) returns distinct OAUTH_INVALID_GRANT diagnostic', async () => {
+  resetServerTestOverrides();
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_grant_client';
+  process.env.PESU_OAUTH_CLIENT_SECRET = 'test_grant_secret';
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/token') {
+        return new Response(
+          JSON.stringify({
+            error: 'invalid_grant',
+            error_description: 'Authorization code has expired or was already redeemed',
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlData = await urlRes.json();
+
+  const cbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=expired_code&state=${encodeURIComponent(urlData.state)}`,
+    { headers: { Cookie: sidCookie } }
+  );
+  const cbHtml = await cbRes.text();
+  assert.equal(cbRes.status, 502);
+
+  const match = cbHtml.match(/var payload = ({.*?});/);
+  assert.ok(match, 'Callback HTML must contain payload');
+  const payload = JSON.parse(match[1]);
+
+  assert.equal(payload.ok, false);
+  assert.equal(payload.diagnostics.errorCategory, 'OAUTH_INVALID_GRANT');
+  assert.equal(payload.diagnostics.callbackOutcome, 'rejected_invalid_grant');
+});
+
