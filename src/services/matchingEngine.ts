@@ -673,6 +673,32 @@ export function rankPeopleForHackathon(params: {
       part.workPreferences.length > 0 ? part.workPreferences : prof.workingStyleTags
     );
 
+    const viewerSkills = Array.from(
+      new Set([
+        ...(viewerParticipation?.skillsOffered ?? []),
+        ...(viewerProfile?.skillTags ?? []),
+      ])
+    );
+    const candidateSkills = Array.from(
+      new Set([...part.skillsOffered, ...prof.skillTags])
+    );
+    const { score: skillSim, shared: sharedSkills } = jaccardOverlap(
+      viewerSkills,
+      candidateSkills
+    );
+
+    const hasViewerStyle = Boolean(viewerWorkStyle.length > 0);
+    const hasCandidateStyle = Boolean(
+      part.workPreferences.length > 0 || prof.workingStyleTags.length > 0
+    );
+    const effectiveCollabSim =
+      hasViewerStyle && hasCandidateStyle ? collabSim : skillSim > 0 ? skillSim : 0.5;
+
+    const hasViewerAvail = Boolean(viewerAvail.length > 0);
+    const hasCandidateAvail = Boolean(part.availabilityWindows.length > 0);
+    const effectiveAvailSim =
+      hasViewerAvail && hasCandidateAvail ? availSim : 0.6;
+
     const rolesNeededByViewer = viewerTeam
       ? viewerTeam.rolesNeeded
       : viewerProfile
@@ -706,6 +732,8 @@ export function rankPeopleForHackathon(params: {
         : baseRoleScore;
 
     const isColdStart = Boolean(prof.isFirstTimeHacker && !prof.githubUsername);
+    const isSparseProfile =
+      (!prof.githubUsername && prof.featuredProjects.length === 0) || !prof.about;
     const explorationBonus = prof.isFirstTimeHacker ? 0.85 : 0.5;
 
     let totalScore = 0;
@@ -714,20 +742,26 @@ export function rankPeopleForHackathon(params: {
     );
 
     if (isRecruitingMode) {
-      const skillComplement = isColdStart ? interestSim : Math.max(tfidfSim, customSpecMatch.score);
+      const skillComplement =
+        isColdStart || isSparseProfile
+          ? Math.max(interestSim, skillSim, customSpecMatch.score)
+          : Math.max(tfidfSim, customSpecMatch.score);
       totalScore =
         0.35 * combinedRoleAndSpecScore +
         0.25 * interestSim +
-        0.20 * (viewerAvail.length > 0 ? availSim : 0.6) +
+        0.20 * effectiveAvailSim +
         0.15 * skillComplement +
         0.05 * explorationBonus;
     } else {
-      const effectiveThemeSim = isColdStart ? Math.max(tfidfSim, interestSim) : tfidfSim;
+      const effectiveThemeSim =
+        isColdStart || isSparseProfile
+          ? Math.max(tfidfSim, interestSim, skillSim)
+          : tfidfSim;
       totalScore =
         0.35 * interestSim +
         0.25 * effectiveThemeSim +
-        0.20 * (viewerAvail.length > 0 ? availSim : 0.6) +
-        0.15 * collabSim +
+        0.20 * effectiveAvailSim +
+        0.15 * effectiveCollabSim +
         0.05 * explorationBonus;
     }
 
@@ -752,6 +786,10 @@ export function rankPeopleForHackathon(params: {
 
     if (sharedInterests.length > 0) {
       reasons.push(`Shared interest in ${sharedInterests.slice(0, 2).join(' & ')}`);
+    }
+
+    if (sharedSkills.length > 0 && reasons.length < 3) {
+      reasons.push(`Matching skills in ${sharedSkills.slice(0, 2).join(' & ')}`);
     }
 
     if (sharedAvail.length > 0 && reasons.length < 3) {
@@ -968,7 +1006,8 @@ export function rankTeamsForHackathon(params: {
       team.desiredDomains
     );
 
-    const score = 0.45 * combinedRoleSpecScore + 0.3 * domainSim + 0.25 * tfidfSim;
+    const effectiveThemeSim = Math.max(tfidfSim, domainSim, specMatch.score);
+    const score = 0.45 * combinedRoleSpecScore + 0.35 * domainSim + 0.20 * effectiveThemeSim;
 
     const reasons: string[] = [];
     if (specMatch.matchedOriginalLabels.length > 0) {

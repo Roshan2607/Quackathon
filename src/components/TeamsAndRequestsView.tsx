@@ -413,45 +413,47 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> = React.m
           </div>
         </div>
 
-        {/* Collapsible Roster Safeguards Section */}
-        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setShowAdvancedLab(!showAdvancedLab)}
-            className="w-full px-4 py-2.5 flex items-center justify-between text-xs font-semibold text-slate-500 hover:bg-slate-50 cursor-pointer"
-          >
-            <span>Advanced: Roster Capacity & Concurrency Checks</span>
-            {showAdvancedLab ? (
-              <ChevronUp className="w-4 h-4 text-slate-400" />
-            ) : (
-              <ChevronDown className="w-4 h-4 text-slate-400" />
-            )}
-          </button>
+        {/* Collapsible Roster Safeguards Section (Restricted to Moderator / Admin) */}
+        {currentUser.isAdmin && (
+          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowAdvancedLab(!showAdvancedLab)}
+              className="w-full px-4 py-2.5 flex items-center justify-between text-xs font-semibold text-slate-500 hover:bg-slate-50 cursor-pointer"
+            >
+              <span>Advanced: Roster Capacity & Concurrency Checks</span>
+              {showAdvancedLab ? (
+                <ChevronUp className="w-4 h-4 text-slate-400" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-slate-400" />
+              )}
+            </button>
 
-          {showAdvancedLab && (
-            <div className="p-4 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
-              <p className="text-slate-600 dark:text-slate-400">
-                Verify that simultaneous accepts on the last open slot never exceed team capacity and that students cannot join two teams in the same hackathon.
-              </p>
-              <div className="flex flex-wrap gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={onSimulateConcurrentLastSlotRace}
-                  className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-medium whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  Test Last-Slot Race
-                </button>
-                <button
-                  type="button"
-                  onClick={onSimulateDoubleTeamAttempt}
-                  className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-medium whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  Test Duplicate Membership Guard
-                </button>
+            {showAdvancedLab && (
+              <div className="p-4 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
+                <p className="text-slate-600 dark:text-slate-400">
+                  Verify that simultaneous accepts on the last open slot never exceed team capacity and that students cannot join two teams in the same hackathon.
+                </p>
+                <div className="flex flex-wrap gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={onSimulateConcurrentLastSlotRace}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-medium whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Test Last-Slot Race
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onSimulateDoubleTeamAttempt}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-medium whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Test Duplicate Membership Guard
+                  </button>
+                </div>
               </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
         {/* Create Team Modal */}
         {showCreateModal && (

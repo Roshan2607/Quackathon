@@ -18,6 +18,7 @@ import {
   ShieldCheck,
   Terminal,
   UserCircle,
+  Users,
 } from 'lucide-react';
 import { signInWithPopup, signOut } from 'firebase/auth';
 import { auth, googleAuthProvider } from './lib/firebase';
@@ -52,6 +53,7 @@ import {
 import { DiscoverView } from './components/DiscoverView';
 import { HackathonsView } from './components/HackathonsView';
 import { MatchesAndChatView } from './components/MatchesAndChatView';
+import { TeamsAndRequestsView } from './components/TeamsAndRequestsView';
 import { OnboardingAndProfileModal } from './components/OnboardingAndProfileModal';
 import { AdminReviewQueueView } from './components/AdminReviewQueueView';
 import { IntegrationTestingView } from './components/IntegrationTestingView';
@@ -60,14 +62,15 @@ type NavTab =
   | 'discover'
   | 'hackathons'
   | 'matches'
+  | 'teams'
   | 'profile'
   | 'admin'
   | 'integrations';
 
 const GUEST_USER: User = {
   uid: 'guest_unauthenticated',
-  displayName: 'Guest Student',
-  personaLabel: 'Sign in with PESU or Google',
+  displayName: 'PES Student',
+  personaLabel: 'PES University Student',
   campus: 'RR Campus',
   program: 'PES University',
   graduationYear: 2028,
@@ -125,12 +128,69 @@ interface BootstrapPayload {
   messages: Message[];
 }
 
+const LoginPage: React.FC<{
+  onSignInWithPesu: () => void;
+  isSigningIn: boolean;
+  toastMessage: string | null;
+}> = ({ onSignInWithPesu, isSigningIn, toastMessage }) => {
+  return (
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col justify-center items-center px-4 sm:px-6 lg:px-8 py-12">
+      {toastMessage && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-4 right-4 z-50 max-w-md bg-slate-900 text-white px-4 py-3 rounded-xl shadow-lg border border-slate-700 flex items-center gap-2.5 text-xs font-medium"
+        >
+          <Bell className="w-4 h-4 text-amber-400 shrink-0" />
+          <span>{toastMessage}</span>
+        </div>
+      )}
+      <div className="max-w-md w-full text-center space-y-8 bg-white dark:bg-slate-900 p-8 sm:p-10 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-xl shadow-slate-100 dark:shadow-none">
+        {/* Quackathon Logo */}
+        <div className="mx-auto w-16 h-16 rounded-2xl bg-slate-900 dark:bg-blue-600 text-amber-400 dark:text-white flex items-center justify-center font-black text-2xl shadow-md">
+          Q
+        </div>
+
+        {/* Heading & One-Sentence Description */}
+        <div className="space-y-3">
+          <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-slate-900 dark:text-slate-100">
+            Find your next hackathon team.
+          </h1>
+          <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed max-w-sm mx-auto">
+            Connect with complementary builders, join open teams, and discover verified PES University hackathons.
+          </p>
+        </div>
+
+        {/* Primary Action Button */}
+        <div className="pt-2 space-y-4">
+          <button
+            type="button"
+            disabled={isSigningIn}
+            onClick={onSignInWithPesu}
+            className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <LogIn className="w-4 h-4" />
+            <span>{isSigningIn ? 'Connecting to PESU OAuth...' : 'Continue with PESU'}</span>
+          </button>
+
+          {/* Small University Authentication Reassurance */}
+          <div className="flex items-center justify-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+            <span>Verified PES University student access via PESU OAuth2.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export function App() {
   const getInitialTab = (): NavTab => {
     const hash = window.location.hash;
     if (hash === '#/admin') return 'admin';
     if (hash === '#/dev/integrations') return 'integrations';
     if (hash === '#/profile') return 'profile';
+    if (hash === '#/teams') return 'teams';
     if (hash === '#/hackathons') return 'hackathons';
     if (hash === '#/matches') return 'matches';
     return 'discover';
@@ -139,13 +199,15 @@ export function App() {
   const [activeTab, setActiveTab] = useState<NavTab>(getInitialTab);
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('live');
   const [authenticatedUser, setAuthenticatedUser] = useState<User | null>(null);
+  const [isRestoringSession, setIsRestoringSession] = useState<boolean>(true);
+  const [hasDismissedQuickSetup, setHasDismissedQuickSetup] = useState<boolean>(false);
   const [selectedHackathonId, setSelectedHackathonId] = useState<string>('');
   const [discoveryMode, setDiscoveryMode] = useState<DiscoveryMode>('people');
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showAccountMenu, setShowAccountMenu] = useState(false);
   const [isSigningIn, setIsSigningIn] = useState(false);
 
-  // Real Domain State (Zero Synthetic Seed Data)
+  // Real Domain State
   const [users, setUsers] = useState<User[]>([]);
   const [profiles, setProfiles] = useState<Record<string, Profile>>({});
   const [hackathons, setHackathons] = useState<Hackathon[]>([]);
@@ -200,6 +262,14 @@ export function App() {
 
   const isAuthorizedStaff = Boolean(currentUser.isAdmin);
 
+  const isSparseProfile = useMemo(() => {
+    return (
+      authenticatedUser !== null &&
+      currentProfile.skillTags.length === 0 &&
+      currentProfile.interestTags.length === 0
+    );
+  }, [authenticatedUser, currentProfile]);
+
   const refreshBootstrap = useCallback(async () => {
     const res = await apiFetch<BootstrapPayload>('/api/bootstrap');
     if (res.ok && res.data?.ok) {
@@ -244,11 +314,41 @@ export function App() {
     return null;
   }, []);
 
+  // Initial session restoration without unauthenticated bootstrap flash
   useEffect(() => {
-    void restoreAuthSession().then(() => refreshBootstrap());
+    let isMounted = true;
+    void (async () => {
+      try {
+        const restoredUser = await restoreAuthSession();
+        if (!isMounted) return;
+        if (restoredUser) {
+          await refreshBootstrap();
+          const savedRoute = sessionStorage.getItem('quackathon_post_auth_route');
+          if (savedRoute) {
+            sessionStorage.removeItem('quackathon_post_auth_route');
+            window.location.hash = savedRoute;
+          }
+        } else {
+          if (
+            window.location.hash &&
+            window.location.hash !== '#/' &&
+            window.location.hash !== '#/discover'
+          ) {
+            sessionStorage.setItem('quackathon_post_auth_route', window.location.hash);
+          }
+        }
+      } finally {
+        if (isMounted) {
+          setIsRestoringSession(false);
+        }
+      }
+    })();
+    return () => {
+      isMounted = false;
+    };
   }, [restoreAuthSession, refreshBootstrap]);
 
-  // Listen for PESU OAuth2 Popup Callback, Same-Origin BroadcastChannel, or Redirect Fallback
+  // Listen for PESU OAuth2 Redirect Callback, Popup Message, or BroadcastChannel
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const oauthQuery = params.get('pesu_oauth');
@@ -267,6 +367,11 @@ export function App() {
           void refreshBootstrap();
           if (restoredUser) {
             showToast(`Signed in with PESU as ${restoredUser.displayName}.`);
+            const savedRoute = sessionStorage.getItem('quackathon_post_auth_route');
+            if (savedRoute) {
+              sessionStorage.removeItem('quackathon_post_auth_route');
+              window.location.hash = savedRoute;
+            }
           }
         });
       } else {
@@ -324,6 +429,11 @@ export function App() {
             userObj?.displayName ||
             'Verified Student';
           showToast(`Signed in with PESU as ${displayLabel}.`);
+          const savedRoute = sessionStorage.getItem('quackathon_post_auth_route');
+          if (savedRoute) {
+            sessionStorage.removeItem('quackathon_post_auth_route');
+            window.location.hash = savedRoute;
+          }
         });
       } else {
         const errMsg =
@@ -376,6 +486,7 @@ export function App() {
       if (hash === '#/admin') setActiveTab('admin');
       else if (hash === '#/dev/integrations') setActiveTab('integrations');
       else if (hash === '#/profile') setActiveTab('profile');
+      else if (hash === '#/teams') setActiveTab('teams');
       else if (hash === '#/hackathons') setActiveTab('hackathons');
       else if (hash === '#/matches') setActiveTab('matches');
       else setActiveTab('discover');
@@ -406,6 +517,14 @@ export function App() {
       window.history.replaceState(null, '', '#/admin');
     } else if (tab === 'integrations') {
       window.history.replaceState(null, '', '#/dev/integrations');
+    } else if (tab === 'teams') {
+      window.history.replaceState(null, '', '#/teams');
+    } else if (tab === 'hackathons') {
+      window.history.replaceState(null, '', '#/hackathons');
+    } else if (tab === 'matches') {
+      window.history.replaceState(null, '', '#/matches');
+    } else if (tab === 'profile') {
+      window.history.replaceState(null, '', '#/profile');
     } else if (window.location.hash) {
       window.history.replaceState(null, '', window.location.pathname);
     }
@@ -413,12 +532,11 @@ export function App() {
 
   // Authentication Handlers
   const handleSignInWithPesu = useCallback(async () => {
-    // Prevent duplicate login launches if a popup is already open or a request is in flight
-    if (pesuPopupRef.current && !pesuPopupRef.current.closed) {
-      pesuPopupRef.current.focus();
+    if (isSigningIn) {
       return;
     }
-    if (isSigningIn) {
+    if (pesuPopupRef.current && !pesuPopupRef.current.closed) {
+      pesuPopupRef.current.focus();
       return;
     }
 
@@ -426,6 +544,14 @@ export function App() {
     clearPesuPopupMonitor();
 
     try {
+      if (
+        window.location.hash &&
+        window.location.hash !== '#/' &&
+        window.location.hash !== '#/discover'
+      ) {
+        sessionStorage.setItem('quackathon_post_auth_route', window.location.hash);
+      }
+
       const res = await startPesuOAuthSignIn(['openid', 'profile', 'email']);
       if (!res.ok || !res.authUrl) {
         setIsSigningIn(false);
@@ -442,6 +568,15 @@ export function App() {
         }
       }
 
+      // Check for embedded iframe/preview environments
+      const isEmbedded = window.top !== window.self;
+      if (!isEmbedded) {
+        // Normal direct top-level redirect
+        window.location.href = res.authUrl;
+        return;
+      }
+
+      // Graceful fallback for embedded previews
       const popup = window.open(
         res.authUrl,
         'pesu_oauth_popup',
@@ -449,17 +584,20 @@ export function App() {
       );
 
       if (!popup) {
-        setIsSigningIn(false);
-        showToast(
-          'Sign-in popup was blocked by your browser. Please allow popups for this site and try again.'
-        );
+        try {
+          window.top?.location.assign(res.authUrl);
+        } catch {
+          setIsSigningIn(false);
+          showToast(
+            'Sign-in popup was blocked. Please allow popups or open in a full window.'
+          );
+        }
         return;
       }
 
       pesuPopupRef.current = popup;
       const launchedState = res.state || '';
 
-      // Monitor popup closure to distinguish user cancellation from completed/failed callback
       pesuPopupPollRef.current = window.setInterval(() => {
         if (!pesuPopupRef.current || pesuPopupRef.current.closed) {
           clearPesuPopupMonitor();
@@ -542,9 +680,9 @@ export function App() {
     setApiClientAuthToken(null);
     setAuthenticatedUser(null);
     setShowAccountMenu(false);
-    await refreshBootstrap();
+    setHasDismissedQuickSetup(false);
     showToast('Signed out.');
-  }, [refreshBootstrap, showToast]);
+  }, [showToast]);
 
   // Real Backend Handlers
   const handleUpdateParticipation = useCallback(
@@ -558,7 +696,7 @@ export function App() {
       >
     ) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU or Google to save your event participation.');
+        showToast('Sign in with PESU to save your event participation.');
         return;
       }
       const res = await apiFetch<{
@@ -591,7 +729,7 @@ export function App() {
       customNote?: string
     ) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU or Google to connect with students or teams.');
+        showToast('Sign in with PESU to connect with students or teams.');
         return;
       }
 
@@ -705,10 +843,11 @@ export function App() {
   const handleSaveProfile = useCallback(
     async (
       updatedProfile: Profile,
-      updatedPrivacy: User['privacyPreferences']
+      updatedPrivacy: User['privacyPreferences'],
+      displayName?: string
     ) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU or Google to save your profile.');
+        showToast('Sign in with PESU to save your profile.');
         return;
       }
       const res = await apiFetch<{
@@ -720,6 +859,7 @@ export function App() {
         body: {
           profile: updatedProfile,
           privacyPreferences: updatedPrivacy,
+          displayName,
         },
       });
 
@@ -756,7 +896,7 @@ export function App() {
       targetSize: number;
     }) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU or Google to create a team.');
+        showToast('Sign in with PESU to create a team.');
         return;
       }
 
@@ -819,7 +959,7 @@ export function App() {
   const handleSubmitEventCandidate = useCallback(
     async (candidate: EventCandidate) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU or Google to submit a campus event.');
+        showToast('Sign in with PESU to submit a campus event.');
         return;
       }
       const res = await apiFetch<{
@@ -1003,29 +1143,55 @@ export function App() {
     c.participantUids.includes(currentUser.uid)
   ).length;
 
+  // 1. Session Restoration Loading Screen (No navbar or signed-out flash)
+  if (isRestoringSession) {
+    return (
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col items-center justify-center p-4">
+        <div className="w-12 h-12 rounded-2xl bg-slate-900 dark:bg-blue-600 text-amber-400 dark:text-white flex items-center justify-center font-bold text-xl shadow-lg mb-4 animate-pulse">
+          Q
+        </div>
+        <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 tracking-wide">
+          Checking PESU session...
+        </p>
+      </div>
+    );
+  }
+
+  // 2. Unauthenticated Visitor: Dedicated Login Landing Page (No application navbar)
+  if (!authenticatedUser) {
+    return (
+      <LoginPage
+        onSignInWithPesu={handleSignInWithPesu}
+        isSigningIn={isSigningIn}
+        toastMessage={toastMessage}
+      />
+    );
+  }
+
+  // 3. Authenticated Student Workspace
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col">
-      {/* Minimal 3-Zone Top Navigation Bar */}
+      {/* Concise Authenticated Navigation Bar (No horizontal scrollbar) */}
       <header className="sticky top-0 z-30 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4">
           {/* Zone 1: Brand Wordmark */}
           <button
             type="button"
             onClick={() => navigateToTab('discover')}
-            className="flex items-center gap-2.5 text-left cursor-pointer"
+            className="flex items-center gap-2.5 text-left cursor-pointer shrink-0"
           >
             <div className="w-8 h-8 rounded-lg bg-slate-900 dark:bg-blue-600 text-amber-400 dark:text-white flex items-center justify-center font-bold text-sm shrink-0">
               Q
             </div>
-            <span className="font-bold text-base tracking-tight text-slate-900 dark:text-slate-100">
+            <span className="font-bold text-base tracking-tight text-slate-900 dark:text-slate-100 hidden sm:inline">
               Quackathon
             </span>
           </button>
 
-          {/* Zone 2: Minimal 4-Item Student Navigation (Discover | Hackathons | Matches | Profile) */}
+          {/* Zone 2: Concise 5-Item Student Navigation: Discover | Hackathons | Matches | My Team | Profile */}
           <nav
             aria-label="Main navigation"
-            className="flex items-center gap-1 overflow-x-auto py-1"
+            className="flex items-center gap-1 sm:gap-1.5 py-1"
           >
             <button
               type="button"
@@ -1033,7 +1199,7 @@ export function App() {
               className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
                 activeTab === 'discover'
                   ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
               }`}
             >
               <Compass className="w-3.5 h-3.5" />
@@ -1046,7 +1212,7 @@ export function App() {
               className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
                 activeTab === 'hackathons'
                   ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
               }`}
             >
               <Calendar className="w-3.5 h-3.5" />
@@ -1059,7 +1225,7 @@ export function App() {
               className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
                 activeTab === 'matches'
                   ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
               }`}
             >
               <MessageSquare className="w-3.5 h-3.5" />
@@ -1073,11 +1239,24 @@ export function App() {
 
             <button
               type="button"
+              onClick={() => navigateToTab('teams')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'teams'
+                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              <Users className="w-3.5 h-3.5" />
+              <span>My Team</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => navigateToTab('profile')}
               className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
                 activeTab === 'profile'
                   ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
               }`}
             >
               <UserCircle className="w-3.5 h-3.5" />
@@ -1085,30 +1264,8 @@ export function App() {
             </button>
           </nav>
 
-          {/* Zone 3: Real Auth & Account Menu */}
+          {/* Zone 3: Authenticated Account Menu */}
           <div className="flex items-center gap-2">
-            {!authenticatedUser && (
-              <div className="hidden md:flex items-center gap-1.5">
-                <button
-                  type="button"
-                  disabled={isSigningIn}
-                  onClick={handleSignInWithPesu}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-                >
-                  <LogIn className="w-3.5 h-3.5" />
-                  <span>PESU Sign In</span>
-                </button>
-                <button
-                  type="button"
-                  disabled={isSigningIn}
-                  onClick={handleSignInWithGoogle}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-                >
-                  <span>Google</span>
-                </button>
-              </div>
-            )}
-
             <div className="relative" ref={accountMenuRef}>
               <button
                 type="button"
@@ -1129,111 +1286,82 @@ export function App() {
                   role="menu"
                   className="absolute right-0 mt-1.5 w-64 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-lg py-2 z-50 text-xs"
                 >
-                  {/* Current User Header */}
+                  {/* Current User Header with Verified Display Name */}
                   <div className="px-3.5 py-2 border-b border-slate-100 dark:border-slate-800">
                     <div className="font-bold text-slate-900 dark:text-slate-100">
                       {currentUser.displayName}
                     </div>
                     <div className="text-[11px] text-slate-500 truncate">
-                      {authenticatedUser
-                        ? `${currentUser.personaLabel} · ${currentUser.campus}`
-                        : 'Not signed in'}
+                      {`${currentUser.personaLabel} · ${currentUser.campus}`}
                     </div>
                   </div>
 
-                  {/* Sign In / Sign Out Actions */}
+                  {/* Actions */}
                   <div className="py-1 border-b border-slate-100 dark:border-slate-800">
-                    {!authenticatedUser ? (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowAccountMenu(false);
-                            void handleSignInWithPesu();
-                          }}
-                          className="w-full px-3.5 py-2 text-left font-semibold text-blue-600 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
-                        >
-                          <span>Sign in with PESU OAuth</span>
-                          <LogIn className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowAccountMenu(false);
-                            void handleSignInWithGoogle();
-                          }}
-                          className="w-full px-3.5 py-2 text-left font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
-                        >
-                          <span>Sign in with Google</span>
-                          <LogIn className="w-3.5 h-3.5 text-slate-400" />
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => navigateToTab('profile')}
-                          className="w-full px-3.5 py-2 text-left font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
-                        >
-                          <span>Edit Builder Profile</span>
-                          <span className="text-[11px] text-slate-400">
-                            Skills & Bio
-                          </span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleSignOut()}
-                          className="w-full px-3.5 py-2 text-left font-semibold text-red-600 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
-                        >
-                          <span>Sign Out</span>
-                          <LogOut className="w-3.5 h-3.5" />
-                        </button>
-                      </>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => navigateToTab('profile')}
+                      className="w-full px-3.5 py-2 text-left font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                    >
+                      <span>Edit Builder Profile</span>
+                      <span className="text-[11px] text-slate-400">
+                        Skills & Role
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleSignOut()}
+                      className="w-full px-3.5 py-2 text-left font-semibold text-red-600 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                    >
+                      <span>Sign Out</span>
+                      <LogOut className="w-3.5 h-3.5" />
+                    </button>
                   </div>
 
-                  {/* Separated Admin & Developer Routes */}
-                  <div className="pt-1">
-                    <div className="px-3.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                      Moderator & Diagnostics
+                  {/* Staff / Moderator Tools only visible if authorized */}
+                  {isAuthorizedStaff && (
+                    <div className="pt-1">
+                      <div className="px-3.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                        Moderator & Diagnostics
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => navigateToTab('admin')}
+                        className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer ${
+                          activeTab === 'admin'
+                            ? 'font-bold text-blue-600 bg-slate-50 dark:bg-slate-800/60'
+                            : 'text-slate-700 dark:text-slate-300'
+                        }`}
+                      >
+                        <span className="inline-flex items-center gap-2">
+                          <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
+                          Admin Event Review
+                        </span>
+                        <span className="font-mono text-[10px] text-slate-400">
+                          {pendingAdminCount}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => navigateToTab('integrations')}
+                        className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer ${
+                          activeTab === 'integrations'
+                            ? 'font-bold text-blue-600 bg-slate-50 dark:bg-slate-800/60'
+                            : 'text-slate-700 dark:text-slate-300'
+                        }`}
+                      >
+                        <span className="inline-flex items-center gap-2">
+                          <Terminal className="w-3.5 h-3.5 text-slate-500" />
+                          Integration Diagnostics
+                        </span>
+                        <span className="font-mono text-[10px] text-slate-400">
+                          #/dev/integrations
+                        </span>
+                      </button>
                     </div>
-
-                    <button
-                      type="button"
-                      onClick={() => navigateToTab('admin')}
-                      className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer ${
-                        activeTab === 'admin'
-                          ? 'font-bold text-blue-600 bg-slate-50 dark:bg-slate-800/60'
-                          : 'text-slate-700 dark:text-slate-300'
-                      }`}
-                    >
-                      <span className="inline-flex items-center gap-2">
-                        <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
-                        Admin Event Review
-                      </span>
-                      <span className="font-mono text-[10px] text-slate-400">
-                        {pendingAdminCount}
-                      </span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => navigateToTab('integrations')}
-                      className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer ${
-                        activeTab === 'integrations'
-                          ? 'font-bold text-blue-600 bg-slate-50 dark:bg-slate-800/60'
-                          : 'text-slate-700 dark:text-slate-300'
-                      }`}
-                    >
-                      <span className="inline-flex items-center gap-2">
-                        <Terminal className="w-3.5 h-3.5 text-slate-500" />
-                        Integration Diagnostics
-                      </span>
-                      <span className="font-mono text-[10px] text-slate-400">
-                        #/dev/integrations
-                      </span>
-                    </button>
-                  </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1310,6 +1438,25 @@ export function App() {
             />
           )}
 
+          {activeTab === 'teams' && (
+            <TeamsAndRequestsView
+              currentUser={currentUser}
+              hackathons={hackathons}
+              teams={teams}
+              memberships={memberships}
+              joinRequests={joinRequests}
+              users={users}
+              onCreateTeam={handleCreateTeam}
+              onResolveJoinRequest={handleResolveJoinRequest}
+              onSimulateConcurrentLastSlotRace={() => {
+                showToast('Simulated concurrent last-slot race guarded by DB transaction.');
+              }}
+              onSimulateDoubleTeamAttempt={() => {
+                showToast('Simulated double-team attempt guarded by membership checks.');
+              }}
+            />
+          )}
+
           {activeTab === 'profile' && (
             <OnboardingAndProfileModal
               currentUser={currentUser}
@@ -1343,7 +1490,7 @@ export function App() {
                 <Lock className="w-7 h-7 text-slate-400 mx-auto" />
                 <h2 className="text-base font-bold">Admin Access Required</h2>
                 <p className="text-xs text-slate-500">
-                  Route #/admin is restricted to verified event moderators. Sign in with an authorized account to review event candidates.
+                  Route #/admin is restricted to verified event moderators.
                 </p>
                 <div className="flex justify-center gap-2 pt-2">
                   <button
@@ -1353,15 +1500,6 @@ export function App() {
                   >
                     Back to Discover
                   </button>
-                  {!authenticatedUser && (
-                    <button
-                      type="button"
-                      onClick={() => void handleSignInWithPesu()}
-                      className="px-3.5 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-semibold cursor-pointer"
-                    >
-                      Sign In with PESU
-                    </button>
-                  )}
                 </div>
               </div>
             ))}
@@ -1393,7 +1531,7 @@ export function App() {
                   Developer Console Restricted
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Route #/dev/integrations is reserved for authenticated API verification.
+                  Route #/dev/integrations is reserved for authorized staff verification.
                 </p>
                 <div className="flex justify-center gap-2 pt-2">
                   <button
@@ -1403,20 +1541,31 @@ export function App() {
                   >
                     Back to Discover
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleSignInWithPesu()}
-                    className="px-3.5 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-semibold cursor-pointer"
-                  >
-                    Sign In with PESU
-                  </button>
                 </div>
               </div>
             ))}
         </Suspense>
       </main>
 
-      {/* Builder Profile Modal (if opened from Account menu) */}
+      {/* First-time quick setup modal for sparse profiles */}
+      {isSparseProfile && !hasDismissedQuickSetup && activeTab !== 'profile' && (
+        <Suspense fallback={<ViewSkeleton />}>
+          <OnboardingAndProfileModal
+            currentUser={currentUser}
+            profile={currentProfile}
+            executionMode={executionMode}
+            isQuickSetup={true}
+            onSaveProfile={(prof, priv, name) => {
+              void handleSaveProfile(prof, priv, name);
+              setHasDismissedQuickSetup(true);
+            }}
+            onClose={() => setHasDismissedQuickSetup(true)}
+            onNotify={showToast}
+          />
+        </Suspense>
+      )}
+
+      {/* Builder Profile Modal (if opened from Account menu directly) */}
       {showProfileModal && (
         <Suspense fallback={<ViewSkeleton />}>
           <OnboardingAndProfileModal
@@ -1432,4 +1581,5 @@ export function App() {
     </div>
   );
 }
+
 export default App;

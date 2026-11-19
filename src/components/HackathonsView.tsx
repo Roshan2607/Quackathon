@@ -52,9 +52,8 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
     onSelectHackathonForDiscovery,
     onSubmitEventCandidate,
   }) => {
-    const [filterCategory, setFilterCategory] = useState<
-      'ALL' | 'MATCHABLE' | 'INFO_ONLY'
-    >('ALL');
+    type TimeFilterTab = 'upcoming' | 'week' | 'month' | 'past' | 'all';
+    const [timeFilter, setTimeFilter] = useState<TimeFilterTab>('upcoming');
     const [campusFilter, setCampusFilter] = useState<CampusType | 'ALL'>('ALL');
     const [searchInput, setSearchInput] = useState('');
     const [debouncedQuery, setDebouncedQuery] = useState('');
@@ -103,9 +102,33 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
     }, [searchInput]);
 
     const filteredEvents = useMemo(() => {
+      const now = new Date();
+      const todayStart = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate()
+      ).getTime();
+      const weekEnd = todayStart + 7 * 86400000;
+      const monthEnd = todayStart + 30 * 86400000;
+
       return hackathons.filter((h) => {
-        if (filterCategory === 'MATCHABLE' && !h.matchable) return false;
-        if (filterCategory === 'INFO_ONLY' && h.matchable) return false;
+        const startMs = h.startAt ? new Date(h.startAt).getTime() : 0;
+        const endMs = h.endAt ? new Date(h.endAt).getTime() : startMs;
+
+        if (timeFilter === 'upcoming') {
+          if (endMs && endMs < todayStart) return false;
+        } else if (timeFilter === 'week') {
+          if (!startMs || startMs > weekEnd || (endMs && endMs < todayStart)) {
+            return false;
+          }
+        } else if (timeFilter === 'month') {
+          if (!startMs || startMs > monthEnd || (endMs && endMs < todayStart)) {
+            return false;
+          }
+        } else if (timeFilter === 'past') {
+          if (!endMs || endMs >= todayStart) return false;
+        }
+
         if (
           campusFilter !== 'ALL' &&
           h.venue.campus !== campusFilter &&
@@ -119,7 +142,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
         }
         return true;
       });
-    }, [hackathons, filterCategory, campusFilter, debouncedQuery]);
+    }, [hackathons, timeFilter, campusFilter, debouncedQuery]);
 
     const liveClassifier = useMemo(() => {
       if (!showSuggestModal) return null;
@@ -370,49 +393,86 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
       return iso.slice(0, 10);
     };
 
+    const getRegistrationInfo = (h: Hackathon) => {
+      const nowMs = Date.now();
+      if (h.endAt && new Date(h.endAt).getTime() < nowMs) {
+        return { label: 'Event Ended', status: 'ended', isEligible: false };
+      }
+      if (h.registrationDeadline) {
+        const deadlineMs = new Date(h.registrationDeadline).getTime();
+        if (deadlineMs < nowMs) {
+          return { label: 'Registration Closed', status: 'closed', isEligible: false };
+        }
+        return { label: 'Registration Open', status: 'open', isEligible: true };
+      }
+      return { label: 'Registration Unknown', status: 'unknown', isEligible: true };
+    };
+
     return (
       <div className="space-y-4">
-        {/* Compact Top Filter & Action Bar */}
+        {/* Simplified Student Controls: Time Filters, Search, Campus, Suggest */}
         <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-3.5">
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-            {/* Category Filter Tabs */}
+            {/* Time Filter Tabs */}
             <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg self-start">
               <button
                 type="button"
-                onClick={() => setFilterCategory('ALL')}
+                onClick={() => setTimeFilter('upcoming')}
                 className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  filterCategory === 'ALL'
+                  timeFilter === 'upcoming'
                     ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
                 }`}
               >
-                All ({hackathons.length})
+                Upcoming
               </button>
               <button
                 type="button"
-                onClick={() => setFilterCategory('MATCHABLE')}
+                onClick={() => setTimeFilter('week')}
                 className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  filterCategory === 'MATCHABLE'
+                  timeFilter === 'week'
                     ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
                 }`}
               >
-                Team Hackathons
+                This Week
               </button>
               <button
                 type="button"
-                onClick={() => setFilterCategory('INFO_ONLY')}
+                onClick={() => setTimeFilter('month')}
                 className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  filterCategory === 'INFO_ONLY'
+                  timeFilter === 'month'
                     ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
                 }`}
               >
-                Workshops & Solo
+                This Month
+              </button>
+              <button
+                type="button"
+                onClick={() => setTimeFilter('past')}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  timeFilter === 'past'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                }`}
+              >
+                Past
+              </button>
+              <button
+                type="button"
+                onClick={() => setTimeFilter('all')}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  timeFilter === 'all'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                }`}
+              >
+                All
               </button>
             </div>
 
-            {/* Search, Campus Filter & Suggest Button */}
+            {/* Search, Campus Filter & Suggest Hackathon */}
             <div className="flex flex-wrap items-center gap-2">
               <div className="relative flex-1 sm:w-48">
                 <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -420,8 +480,8 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
                   type="search"
                   value={searchInput}
                   onChange={(e) => setSearchInput(e.target.value)}
-                  placeholder="Search events..."
-                  aria-label="Search events"
+                  placeholder="Search hackathons..."
+                  aria-label="Search hackathons"
                   className="w-full pl-8 pr-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-slate-100"
                 />
               </div>
@@ -446,26 +506,27 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
                 className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5" />
-                Suggest Event
+                Suggest Hackathon
               </button>
             </div>
           </div>
         </div>
 
-        {/* Compact Event Cards Grid */}
+        {/* Focused Event Cards Grid */}
         {filteredEvents.length === 0 ? (
           <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
             <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
-              No verified hackathons published yet.
+              No hackathons found for this filter.
             </p>
             <p className="text-xs text-slate-500">
-              Click &ldquo;Suggest Event&rdquo; above to submit a real campus hackathon URL or poster for review.
+              Click &ldquo;Suggest Hackathon&rdquo; above to submit an upcoming campus hackathon link or brochure.
             </p>
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {filteredEvents.map((event) => {
               const isExpanded = Boolean(expandedEventIds[event.id]);
+              const regInfo = getRegistrationInfo(event);
               const validUrl =
                 event.sourceUrlStatus !== 'unavailable' &&
                 (event.verifiedCanonicalUrl ||
@@ -481,18 +542,33 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
                     <div className="flex items-start justify-between gap-2">
                       <div>
                         <span className="text-xs text-slate-500 dark:text-slate-400">
-                          {event.eventType.replace('_', ' ')} · {event.organizer}
+                          {event.organizer}
                         </span>
                         <h3 className="text-base font-bold text-slate-900 dark:text-slate-100 mt-0.5">
                           {event.name}
                         </h3>
                       </div>
-                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">
-                        {event.venue.campus ?? 'Campus Unspecified'}
-                      </span>
+                      <div className="flex flex-col items-end gap-1 shrink-0">
+                        <span className="text-xs font-medium text-slate-500 dark:text-slate-400 whitespace-nowrap">
+                          {event.venue.campus ?? 'Campus Unspecified'}
+                        </span>
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold whitespace-nowrap ${
+                            regInfo.status === 'open'
+                              ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800'
+                              : regInfo.status === 'closed'
+                              ? 'bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
+                              : regInfo.status === 'ended'
+                              ? 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                              : 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
+                          }`}
+                        >
+                          {regInfo.label}
+                        </span>
+                      </div>
                     </div>
 
-                    {/* Essential Metadata Line */}
+                    {/* Focused Metadata Line */}
                     <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-400 font-mono tabular-nums">
                       <span className="inline-flex items-center gap-1">
                         <Calendar className="w-3.5 h-3.5 text-slate-400" />
@@ -568,7 +644,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
                     )}
                   </div>
 
-                  {/* Card Footer: Details Toggle + Single Primary Action */}
+                  {/* Card Footer: Details Toggle + Teammate Action */}
                   <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
                     <button
                       type="button"
@@ -586,7 +662,11 @@ export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
                       )}
                     </button>
 
-                    {event.matchable ? (
+                    {!regInfo.isEligible ? (
+                      <span className="text-xs text-slate-400 font-medium">
+                        {regInfo.label}
+                      </span>
+                    ) : event.matchable ? (
                       <button
                         type="button"
                         onClick={() => onSelectHackathonForDiscovery(event.id)}

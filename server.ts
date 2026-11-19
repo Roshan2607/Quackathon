@@ -47,6 +47,7 @@ import {
   loadBootstrapData,
   recordSwipeAndProcessMatchRecord,
   rejectEventCandidateRecord,
+  isPesuSrnOrPrn,
   resetPassedSwipesForHackathon,
   resolveJoinRequestRecord,
   revokeOAuthSessionRecord,
@@ -3930,16 +3931,42 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       mergedClaims.sub ?? mergedClaims.prn ?? mergedClaims.srn ?? 'pesu_verified_user'
     );
 
+    const extractVerifiedHumanName = (claims: Record<string, unknown>): string | null => {
+      if (typeof claims.name === 'string') {
+        const trimmed = claims.name.trim();
+        if (trimmed && !isPesuSrnOrPrn(trimmed)) return trimmed;
+      }
+      const given = typeof claims.given_name === 'string' ? claims.given_name.trim() : '';
+      const family = typeof claims.family_name === 'string' ? claims.family_name.trim() : '';
+      const combined = `${given} ${family}`.trim();
+      if (combined && !isPesuSrnOrPrn(combined)) return combined;
+
+      if (typeof claims.preferred_username === 'string') {
+        const trimmed = claims.preferred_username.trim();
+        if (trimmed && !isPesuSrnOrPrn(trimmed) && !/^[A-Z0-9_-]{8,}$/i.test(trimmed)) {
+          return trimmed;
+        }
+      }
+      return null;
+    };
+
+    const verifiedHumanName = extractVerifiedHumanName(mergedClaims);
+    const detectedSrn =
+      (typeof mergedClaims.srn === 'string' && mergedClaims.srn) ||
+      (isPesuSrnOrPrn(mergedClaims.preferred_username)
+        ? String(mergedClaims.preferred_username)
+        : undefined) ||
+      (isPesuSrnOrPrn(mergedClaims.name)
+        ? String(mergedClaims.name)
+        : undefined) ||
+      (typeof mergedClaims.prn === 'string' && mergedClaims.prn) ||
+      undefined;
+
     const verifiedIdentity: PesuVerifiedIdentity = {
       sub,
-      name:
-        typeof mergedClaims.name === 'string'
-          ? mergedClaims.name
-          : typeof mergedClaims.preferred_username === 'string'
-          ? mergedClaims.preferred_username
-          : undefined,
+      name: verifiedHumanName || undefined,
       email: typeof mergedClaims.email === 'string' ? mergedClaims.email : undefined,
-      srn: typeof mergedClaims.srn === 'string' ? mergedClaims.srn : undefined,
+      srn: detectedSrn,
       prn: typeof mergedClaims.prn === 'string' ? mergedClaims.prn : undefined,
       campus:
         typeof mergedClaims.campus === 'string' ? mergedClaims.campus : undefined,
@@ -3988,11 +4015,11 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       const synced = await upsertUserAndProfile({
         uid: dbUid,
         email: verifiedIdentity.email || `${dbUid}@pesu.pes.edu`,
-        displayName:
-          verifiedIdentity.name || verifiedIdentity.srn || `PES Student (${sub})`,
+        displayName: verifiedHumanName || 'PES Student',
         campus: resolvedCampus,
         program: verifiedIdentity.program || 'B.Tech CSE',
         pesuOidcSub: sub,
+        pesPrnOrSrn: detectedSrn,
         verificationStatus: 'verified_pesu_oidc',
       });
       syncedUser = synced.user;
@@ -4443,9 +4470,10 @@ app.get('/api/hackathons', async (req, res) => {
 app.put('/api/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const authUser = req.user!;
-    const { profile, privacyPreferences } = req.body as {
+    const { profile, privacyPreferences, displayName } = req.body as {
       profile?: Profile;
       privacyPreferences?: User['privacyPreferences'];
+      displayName?: string;
     };
 
     if (!profile) {
@@ -4458,6 +4486,7 @@ app.put('/api/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
 
     const updated = await updateUserProfileAndPrivacy({
       uid: authUser.uid,
+      displayName,
       profile: { ...profile, uid: authUser.uid },
       privacyPreferences: privacyPreferences ?? {
         profileVisible: true,
@@ -4772,6 +4801,15 @@ app.post('/api/teams', requireAuth, async (req: AuthenticatedRequest, res) => {
       });
       return;
     }
+    if (error instanceof Error && error.message.startsWith('EVENT_')) {
+      const cleanMsg = error.message.replace(/^[A-Z_]+:\s*/, '');
+      res.status(400).json({
+        ok: false,
+        error: cleanMsg,
+        userMessage: cleanMsg,
+      });
+      return;
+    }
     console.error('Error in POST /api/teams:', error);
     res.status(500).json({
       ok: false,
@@ -4847,6 +4885,15 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
         ok: false,
         error: error.message.replace('TEAM_FULL: ', ''),
         userMessage: error.message.replace('TEAM_FULL: ', ''),
+      });
+      return;
+    }
+    if (error instanceof Error && error.message.startsWith('EVENT_')) {
+      const cleanMsg = error.message.replace(/^[A-Z_]+:\s*/, '');
+      res.status(400).json({
+        ok: false,
+        error: cleanMsg,
+        userMessage: cleanMsg,
       });
       return;
     }

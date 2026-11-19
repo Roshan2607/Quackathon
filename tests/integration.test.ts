@@ -1953,6 +1953,308 @@ test('27. OAuth transaction lifecycle: pending -> processing -> completed/failed
   await db.delete(oauthTransactions);
 });
 
+test('28. Missing OAuth full-name claim does not default displayName to SRN and keeps SRN separate', async () => {
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
+  const { eq } = await import('drizzle-orm');
+
+  resetServerTestOverrides();
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_client_123';
+  process.env.PESU_OAUTH_CLIENT_SECRET = 'test_pesu_secret_123';
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/token') {
+        const idToken = createBase64UrlJwt({
+          iss: 'https://oauth.pesu.mock',
+          aud: 'test_pesu_client_123',
+          sub: 'pesu_srn_student_01',
+          preferred_username: 'PES1UG23CS777',
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        });
+        return new Response(
+          JSON.stringify({
+            access_token: 'token_srn_test_1',
+            token_type: 'Bearer',
+            expires_in: 3600,
+            scope: 'openid profile email',
+            id_token: idToken,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/userinfo') {
+        return new Response(
+          JSON.stringify({
+            sub: 'pesu_srn_student_01',
+            preferred_username: 'PES1UG23CS777',
+            srn: 'PES1UG23CS777',
+            email: 'student777@pesu.pes.edu',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlData = await urlRes.json();
+
+  const cbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=srn_code_1&state=${encodeURIComponent(urlData.state)}`,
+    { headers: { Cookie: sidCookie } }
+  );
+  const cbHtml = await cbRes.text();
+  assert.equal(cbRes.status, 200);
+
+  // Extract postMessage payload from callback HTML
+  const match = cbHtml.match(/var payload = ({.*?});/);
+  assert.ok(match, 'Callback HTML must contain payload');
+  const payload = JSON.parse(match[1]);
+
+  assert.equal(payload.ok, true);
+  assert.ok(!payload.user.displayName.includes('PES1UG23CS777'), 'displayName must NOT be an SRN');
+  assert.equal(payload.user.displayName, 'PES Student');
+  assert.equal(payload.identity.srn, 'PES1UG23CS777');
+  assert.ok(!payload.identity.name, 'identity.name must be null/undefined when only SRN is given');
+
+  // Verify DB session restoration
+  const oauthCookie = (cbRes.headers.get('set-cookie') ?? '').split(';')[0];
+  const sessRes = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Cookie: `${sidCookie}; ${oauthCookie}` },
+  });
+  const sessData = await sessRes.json();
+  assert.equal(sessData.ok, true);
+  assert.equal(sessData.authenticated, true);
+  assert.equal(sessData.user.displayName, 'PES Student');
+
+  // Cleanup
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, payload.user.uid));
+  await db.delete(profiles).where(eq(profiles.uid, payload.user.uid));
+  await db.delete(users).where(eq(users.uid, payload.user.uid));
+});
+
+test('29. Preserves chosen display name across future OAuth re-logins and does not overwrite with OAuth claims', async () => {
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
+  const { eq } = await import('drizzle-orm');
+
+  resetServerTestOverrides();
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_client_123';
+  process.env.PESU_OAUTH_CLIENT_SECRET = 'test_pesu_secret_123';
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
+
+  setServerTestOverrides({
+    fetchFn: async (input) => {
+      const url = String(input);
+      if (url.includes('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://oauth.pesu.mock',
+            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
+            token_endpoint: 'https://oauth.pesu.mock/token',
+            scopes_supported: ['openid', 'profile', 'email'],
+            code_challenge_methods_supported: ['S256'],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === 'https://oauth.pesu.mock/token') {
+        const idToken = createBase64UrlJwt({
+          iss: 'https://oauth.pesu.mock',
+          aud: 'test_pesu_client_123',
+          sub: 'pesu_relogin_user_02',
+          preferred_username: 'PES1UG23CS555',
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        });
+        return new Response(
+          JSON.stringify({
+            access_token: 'token_relogin_1',
+            token_type: 'Bearer',
+            expires_in: 3600,
+            scope: 'openid profile email',
+            id_token: idToken,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  // Step 1: Initial Login
+  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlData = await urlRes.json();
+
+  const cbRes = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=relogin_code_1&state=${encodeURIComponent(urlData.state)}`,
+    { headers: { Cookie: sidCookie } }
+  );
+  const cbCookie = (cbRes.headers.get('set-cookie') ?? '').split(';')[0];
+  const authHeaders = { Cookie: `${sidCookie}; ${cbCookie}` };
+
+  // Step 2: Student chooses a custom display name "Ananya Rao"
+  const updateRes = await fetch(`${baseUrl}/api/profile`, {
+    method: 'PUT',
+    headers: { ...authHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      displayName: 'Ananya Rao',
+      profile: {
+        headline: 'AI Builder',
+        skillTags: ['Python', 'PyTorch'],
+        interestTags: ['Applied AI/ML'],
+        preferredRoles: ['ML/Data'],
+      },
+    }),
+  });
+  const updateData = await updateRes.json();
+  assert.equal(updateRes.status, 200);
+  assert.equal(updateData.user.displayName, 'Ananya Rao');
+
+  // Step 3: Student logs in again later via PESU OAuth
+  const urlRes2 = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+  const sidCookie2 = (urlRes2.headers.get('set-cookie') ?? '').split(';')[0];
+  const urlData2 = await urlRes2.json();
+
+  const cbRes2 = await fetch(
+    `${baseUrl}/auth/pesu/callback?code=relogin_code_2&state=${encodeURIComponent(urlData2.state)}`,
+    { headers: { Cookie: sidCookie2 } }
+  );
+  const cbCookie2 = (cbRes2.headers.get('set-cookie') ?? '').split(';')[0];
+
+  const sessRes = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Cookie: `${sidCookie2}; ${cbCookie2}` },
+  });
+  const sessData = await sessRes.json();
+  assert.equal(sessData.ok, true);
+  assert.equal(sessData.authenticated, true);
+  assert.equal(
+    sessData.user.displayName,
+    'Ananya Rao',
+    'Custom display name must be preserved across OAuth re-logins'
+  );
+
+  // Cleanup
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, sessData.user.uid));
+  await db.delete(profiles).where(eq(profiles.uid, sessData.user.uid));
+  await db.delete(users).where(eq(users.uid, sessData.user.uid));
+});
+
+test('30. Closed, ended, or non-matchable hackathons reject new team creation and swipe matching in backend APIs', async () => {
+  const { upsertUserAndProfile, createOAuthSessionRecord, createPublishedHackathonDirect } = await import('../src/db/repository.ts');
+  const { db } = await import('../src/db/index.ts');
+  const { hackathons, users, profiles, oauthSessions, teams, swipes } = await import('../src/db/schema.ts');
+  const { eq } = await import('drizzle-orm');
+
+  // Create test user
+  const testUid = `elig_user_${Date.now()}`;
+  await upsertUserAndProfile({
+    uid: testUid,
+    displayName: 'Eligibility Tester',
+    email: 'elig@pesu.pes.edu',
+    pesuOidcSub: `sub_elig_${Date.now()}`,
+    isAdmin: false,
+  });
+
+  const sessionToken = `pesu_tok_elig_${Date.now()}`;
+  await createOAuthSessionRecord({
+    sessionToken,
+    uid: testUid,
+    pesuSub: `sub_elig_${Date.now()}`,
+    accessToken: null,
+    refreshToken: null,
+    scopes: ['openid', 'profile'],
+    expiresAt: new Date(Date.now() + 3600000),
+  });
+
+  const authHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${sessionToken}`,
+  };
+
+  // 1. Create a closed hackathon (registrationDeadline in past)
+  const closedSlug = `closed_hack_${Date.now()}`;
+  await createPublishedHackathonDirect({
+    slug: closedSlug,
+    name: 'Closed Hackathon 2025',
+    organizer: 'Past Club',
+    description: 'Past event where registration has ended.',
+    eventType: 'hackathon',
+    matchable: true,
+    themes: ['AI/ML'],
+    campus: 'RR Campus',
+    venueName: 'Auditorium',
+    format: 'onsite',
+    startAt: '2025-10-10',
+    endAt: '2025-10-11',
+    registrationDeadline: '2025-10-01',
+    minTeamSize: 2,
+    maxTeamSize: 4,
+    registrationUrl: 'https://events.pes.edu/past',
+    verifiedCanonicalUrl: 'https://events.pes.edu/past',
+    sourceUrlStatus: 'verified',
+    createdByUid: testUid,
+  });
+
+  // Attempting to create a team for the closed event should return 400
+  const teamRes = await fetch(`${baseUrl}/api/teams`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({
+      hackathonId: closedSlug,
+      name: 'Late Team',
+      pitch: 'Trying to register late',
+    }),
+  });
+  const teamData = await teamRes.json();
+  assert.equal(teamRes.status, 400);
+  assert.equal(teamData.ok, false);
+  assert.match(teamData.error, /Registration for this event has closed|ended/);
+
+  // Attempting to swipe interested on the closed event should return 400
+  const swipeRes = await fetch(`${baseUrl}/api/swipes`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({
+      hackathonId: closedSlug,
+      targetType: 'user',
+      targetId: 'target_student_123',
+      decision: 'interested',
+    }),
+  });
+  const swipeData = await swipeRes.json();
+  assert.equal(swipeRes.status, 400);
+  assert.equal(swipeData.ok, false);
+  assert.match(swipeData.error, /Registration for this event has closed|ended/);
+
+  // Cleanup
+  await db.delete(swipes).where(eq(swipes.hackathonSlug, closedSlug));
+  await db.delete(teams).where(eq(teams.hackathonSlug, closedSlug));
+  await db.delete(hackathons).where(eq(hackathons.slug, closedSlug));
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, testUid));
+  await db.delete(profiles).where(eq(profiles.uid, testUid));
+  await db.delete(users).where(eq(users.uid, testUid));
+});
+
+
 
 
 

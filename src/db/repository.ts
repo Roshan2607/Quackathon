@@ -213,6 +213,16 @@ export function mapDbCandidateToDomain(
   };
 }
 
+export function isPesuSrnOrPrn(val: unknown): boolean {
+  if (typeof val !== 'string') return false;
+  const s = val.trim().toUpperCase();
+  if (!s) return false;
+  if (/^PES[12]?(UG|PG)?[0-9]{2}[A-Z]{2}[0-9]{3,5}$/i.test(s)) return true;
+  if (/^PES[0-9]{8,12}$/i.test(s)) return true;
+  if (/^PES[0-9A-Z_-]{8,16}$/i.test(s) && /\d{3,}/.test(s)) return true;
+  return false;
+}
+
 export async function upsertUserAndProfile(params: {
   uid: string;
   email: string;
@@ -230,12 +240,45 @@ export async function upsertUserAndProfile(params: {
     const now = new Date();
     const resolvedSub =
       params.pesuOidcSub ?? params.pesPrnOrSrn ?? 'UNVERIFIED';
+
+    // Check if user already exists to preserve custom chosen display name across logins
+    const existingUsers = await db
+      .select()
+      .from(schema.users)
+      .where(eq(schema.users.uid, params.uid));
+    const existingUser = existingUsers[0];
+
+    let targetDisplayName = params.displayName;
+    if (existingUser) {
+      const currentName = existingUser.displayName?.trim();
+      const isParamSrn = isPesuSrnOrPrn(params.displayName);
+      const isParamPlaceholder =
+        !params.displayName || params.displayName === 'PES Student' || isParamSrn;
+      const isCurrentValidHuman =
+        Boolean(currentName && !isPesuSrnOrPrn(currentName) && currentName !== 'PES Student');
+
+      if (isCurrentValidHuman) {
+        // Preserve a student's chosen display name across future logins
+        targetDisplayName = currentName;
+      } else if (!isParamPlaceholder && !isParamSrn) {
+        targetDisplayName = params.displayName.trim();
+      } else {
+        targetDisplayName = 'PES Student';
+      }
+    } else {
+      if (!params.displayName || isPesuSrnOrPrn(params.displayName)) {
+        targetDisplayName = 'PES Student';
+      } else {
+        targetDisplayName = params.displayName.trim();
+      }
+    }
+
     const [userRow] = await db
       .insert(schema.users)
       .values({
         uid: params.uid,
         email: params.email,
-        displayName: params.displayName,
+        displayName: targetDisplayName,
         campus: params.campus ?? 'RR Campus',
         program: params.program ?? 'B.Tech CSE',
         graduationYear: params.graduationYear ?? 2027,
@@ -249,7 +292,7 @@ export async function upsertUserAndProfile(params: {
         target: schema.users.uid,
         set: {
           email: params.email,
-          displayName: params.displayName,
+          displayName: targetDisplayName,
           pesuOidcSub: resolvedSub,
           updatedAt: now,
         },
@@ -350,6 +393,7 @@ export async function getUserAndProfileByUid(
 
 export async function updateUserProfileAndPrivacy(params: {
   uid: string;
+  displayName?: string;
   profile: Partial<Profile>;
   privacyPreferences?: Partial<User['privacyPreferences']>;
 }): Promise<{ user: User; profile: Profile }> {
@@ -364,12 +408,21 @@ export async function updateUserProfileAndPrivacy(params: {
       ...(params.privacyPreferences ?? {}),
     };
 
+    const userSetFields: Record<string, unknown> = {
+      privacyPreferencesJson: JSON.stringify(mergedPrivacy),
+      updatedAt: now,
+    };
+
+    if (typeof params.displayName === 'string') {
+      const trimmed = params.displayName.trim();
+      if (trimmed && !isPesuSrnOrPrn(trimmed)) {
+        userSetFields.displayName = trimmed;
+      }
+    }
+
     const [updatedUserRow] = await db
       .update(schema.users)
-      .set({
-        privacyPreferencesJson: JSON.stringify(mergedPrivacy),
-        updatedAt: now,
-      })
+      .set(userSetFields)
       .where(eq(schema.users.uid, params.uid))
       .returning();
 
@@ -1190,6 +1243,7 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
   messages: Message[];
 }> {
   try {
+    const hasViewer = Boolean(viewerUid);
     const [
       userRows,
       profileRows,
@@ -1216,16 +1270,22 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
       db.select().from(schema.participations),
       db.select().from(schema.teams).orderBy(desc(schema.teams.createdAt)),
       db.select().from(schema.memberships),
-      db
-        .select()
-        .from(schema.joinRequests)
-        .orderBy(desc(schema.joinRequests.createdAt)),
-      db.select().from(schema.swipes),
-      db
-        .select()
-        .from(schema.conversations)
-        .orderBy(desc(schema.conversations.lastMessageAt)),
-      db.select().from(schema.messages).orderBy(schema.messages.createdAt),
+      hasViewer
+        ? db
+            .select()
+            .from(schema.joinRequests)
+            .orderBy(desc(schema.joinRequests.createdAt))
+        : Promise.resolve([]),
+      hasViewer ? db.select().from(schema.swipes) : Promise.resolve([]),
+      hasViewer
+        ? db
+            .select()
+            .from(schema.conversations)
+            .orderBy(desc(schema.conversations.lastMessageAt))
+        : Promise.resolve([]),
+      hasViewer
+        ? db.select().from(schema.messages).orderBy(schema.messages.createdAt)
+        : Promise.resolve([]),
     ]);
 
     const users = userRows.map(mapDbUserToDomain);
@@ -1764,6 +1824,17 @@ export async function createTeamWithLeaderRecord(params: {
       .from(schema.hackathons)
       .where(eq(schema.hackathons.slug, params.hackathonSlug));
     const hack = hackRows[0];
+
+    if (hack && !hack.matchable) {
+      throw new Error('EVENT_NOT_MATCHABLE: This event is not eligible for team formation.');
+    }
+    if (hack?.registrationDeadline && new Date(hack.registrationDeadline).getTime() < Date.now()) {
+      throw new Error('EVENT_REGISTRATION_CLOSED: Registration for this event has closed.');
+    }
+    if (hack?.endAt && new Date(hack.endAt).getTime() < Date.now()) {
+      throw new Error('EVENT_ENDED: This event has ended.');
+    }
+
     const clampedTargetSize =
       hack?.maxTeamSize != null
         ? Math.min(params.targetSize, hack.maxTeamSize)
@@ -1866,7 +1937,8 @@ export async function createTeamWithLeaderRecord(params: {
     console.error('Database error in createTeamWithLeaderRecord:', error);
     if (
       error instanceof Error &&
-      error.message.startsWith('ALREADY_IN_TEAM:')
+      (error.message.startsWith('ALREADY_IN_TEAM:') ||
+        error.message.startsWith('EVENT_'))
     ) {
       throw error;
     }
@@ -1889,6 +1961,23 @@ export async function recordSwipeAndProcessMatchRecord(params: {
   initialMessage?: Message;
 }> {
   try {
+    if (params.decision === 'interested') {
+      const hackRows = await db
+        .select()
+        .from(schema.hackathons)
+        .where(eq(schema.hackathons.slug, params.hackathonSlug));
+      const hack = hackRows[0];
+      if (hack && !hack.matchable) {
+        throw new Error('EVENT_NOT_MATCHABLE: This event is not eligible for teammate matching.');
+      }
+      if (hack?.registrationDeadline && new Date(hack.registrationDeadline).getTime() < Date.now()) {
+        throw new Error('EVENT_REGISTRATION_CLOSED: Registration for this event has closed.');
+      }
+      if (hack?.endAt && new Date(hack.endAt).getTime() < Date.now()) {
+        throw new Error('EVENT_ENDED: This event has ended.');
+      }
+    }
+
     const swipeKey = `${params.hackathonSlug}_${params.fromUid}_${params.targetType}_${params.targetId}`;
     const [swipeRow] = await db
       .insert(schema.swipes)
@@ -2137,7 +2226,11 @@ export async function recordSwipeAndProcessMatchRecord(params: {
     return { interest };
   } catch (error) {
     console.error('Database error in recordSwipeAndProcessMatchRecord:', error);
-    if (error instanceof Error && error.message.startsWith('TEAM_FULL:')) {
+    if (
+      error instanceof Error &&
+      (error.message.startsWith('TEAM_FULL:') ||
+        error.message.startsWith('EVENT_'))
+    ) {
       throw error;
     }
     throw new Error('Failed to record swipe decision.', { cause: error });
