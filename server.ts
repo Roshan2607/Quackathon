@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import dotenv from 'dotenv';
+import fs from 'fs';
 import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
@@ -3336,6 +3338,31 @@ app.post('/api/pesu-oauth/logout', async (req, res) => {
   });
 });
 
+function refreshPesuOAuthEnvFromDisk(): void {
+  if (process.env.QUACKATHON_TEST_MODE === 'true') {
+    return;
+  }
+  try {
+    if (fs.existsSync('.env')) {
+      const parsed = dotenv.parse(fs.readFileSync('.env', 'utf8'));
+      if (parsed.PESU_OAUTH_CLIENT_ID !== undefined) {
+        process.env.PESU_OAUTH_CLIENT_ID = parsed.PESU_OAUTH_CLIENT_ID;
+      }
+      if (parsed.PESU_OAUTH_CLIENT_SECRET !== undefined) {
+        process.env.PESU_OAUTH_CLIENT_SECRET = parsed.PESU_OAUTH_CLIENT_SECRET;
+      }
+      if (parsed.PESU_OAUTH_TOKEN_AUTH_METHOD !== undefined) {
+        process.env.PESU_OAUTH_TOKEN_AUTH_METHOD = parsed.PESU_OAUTH_TOKEN_AUTH_METHOD;
+      }
+      if (parsed.PESU_OAUTH_REDIRECT_URI !== undefined) {
+        process.env.PESU_OAUTH_REDIRECT_URI = parsed.PESU_OAUTH_REDIRECT_URI;
+      }
+    }
+  } catch {
+    // ignore disk reading failures
+  }
+}
+
 app.get('/api/pesu-oauth/url', async (req, res) => {
   const startTime = Date.now();
   const requestId = createRequestId('oauth_url');
@@ -3343,6 +3370,7 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     req,
     res
   );
+  refreshPesuOAuthEnvFromDisk();
   const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
   const {
     expectedRedirectUri,
@@ -4329,6 +4357,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
   targetSession.stages.authorizationRedirect = 'callback_received';
   targetSession.stages.tokenExchange = 'exchanging';
 
+  refreshPesuOAuthEnvFromDisk();
   const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim() ?? '';
   const clientSecret = process.env.PESU_OAUTH_CLIENT_SECRET?.trim() ?? '';
 
