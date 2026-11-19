@@ -5,6 +5,7 @@ import {
   ExecutionMode,
   Hackathon,
   PrivateAcademyHint,
+  Profile,
   User,
 } from '../types/domain';
 import {
@@ -36,21 +37,34 @@ type FieldEvidence = { sourceUrl: string; excerpt?: string };
 
 interface HackathonsViewProps {
   currentUser: User;
+  currentProfile?: Profile;
   executionMode: ExecutionMode;
   hackathons: Hackathon[];
   privateAcademyHints: PrivateAcademyHint[];
   onSelectHackathonForDiscovery: (hackathonId: string) => void;
   onSubmitEventCandidate: (candidate: EventCandidate) => void;
+  onSaveProfile?: (
+    profile: Profile,
+    privacy: User['privacyPreferences']
+  ) => Promise<void> | void;
+  onConnectPesuAcademy?: (mode: 'popup' | 'redirect') => void;
+  onRefreshCatalog?: () => Promise<void> | void;
+  onNotify?: (message: string) => void;
 }
 
 export const HackathonsView: React.FC<HackathonsViewProps> = React.memo(
   ({
     currentUser,
+    currentProfile,
     executionMode,
     hackathons,
     privateAcademyHints,
     onSelectHackathonForDiscovery,
     onSubmitEventCandidate,
+    onSaveProfile,
+    onConnectPesuAcademy,
+    onRefreshCatalog,
+    onNotify,
   }) => {
     type TimeFilterTab = 'upcoming' | 'week' | 'month' | 'past' | 'all';
     const [timeFilter, setTimeFilter] = useState<TimeFilterTab>('upcoming');

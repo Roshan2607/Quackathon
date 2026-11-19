@@ -59,6 +59,12 @@ export interface DeveloperDiagnosticTelemetry {
   sessionFingerprint?: string | null;
   transactionStatus?: string | null;
   callbackOutcome?: string | null;
+  initiatingOrigin?: string | null;
+  configuredCallbackOrigin?: string | null;
+  initiationCookieStatus?: 'existing' | 'new' | null;
+  callbackCookieStatus?: 'valid' | 'missing' | 'invalid_signature' | null;
+  sessionBindingMatched?: boolean | null;
+  handledByDifferentInstance?: boolean | null;
   extractionMethod?: ExtractionMethodUsed;
 }
 
@@ -219,6 +225,9 @@ export interface PesuOAuthDiscoveryResponse {
   supportedScopes: string[];
   clientConfigured: boolean;
   clientSecretConfigured: boolean;
+  publicClientId?: string | null;
+  portalManageUrl?: string | null;
+  providerRedirectUriRegistered?: boolean | null;
   expectedRedirectUri: string;
   allowedRedirectUris: string[];
   stages: PesuOAuthStageStatuses;
@@ -239,6 +248,13 @@ export interface PesuOAuthUrlResponse {
   authUrl?: string;
   state?: string;
   redirectUri: string;
+  canonicalAppOrigin?: string;
+  initiatingOrigin?: string;
+  configuredCallbackOrigin?: string;
+  initiationCookieStatus?: 'existing' | 'new';
+  publicClientId?: string | null;
+  portalManageUrl?: string | null;
+  providerRedirectUriRegistered?: boolean | null;
   scope?: string;
   scopes?: string[];
   codeChallengeMethod?: 'S256';
@@ -252,6 +268,8 @@ export interface PesuOAuthSessionStatusResponse {
   ok: boolean;
   authenticated: boolean;
   sessionId?: string;
+  canonicalAppOrigin?: string;
+  configuredCallbackOrigin?: string;
   stages: PesuOAuthStageStatuses;
   identity?: PesuVerifiedIdentity | null;
   user?: User | null;
@@ -294,4 +312,55 @@ export interface GitHubRepositoryItem {
   updatedAt?: string;
   readmeExcerpt?: string;
 }
+
+export type PesuAnnouncementsErrorCode =
+  | 'AUTH_REQUIRED'
+  | 'NOT_PESU_VERIFIED'
+  | 'OPT_IN_REQUIRED'
+  | 'MISSING_ANNOUNCEMENTS_SCOPE'
+  | 'DELEGATED_CREDENTIALS_REQUIRED'
+  | 'TOKEN_EXPIRED_OR_REVOKED'
+  | 'PROVIDER_UNAVAILABLE'
+  | 'MALFORMED_PROVIDER_PAYLOAD'
+  | 'NETWORK_ERROR';
+
+export interface PesuAnnouncementsResponse {
+  ok: boolean;
+  resource?: string;
+  announcements?: Array<{
+    id: string;
+    title: string;
+    date: string | null;
+    description: string;
+    image: string | null;
+    attachments: number;
+  }>;
+  fetchedAt?: string;
+  cached?: boolean;
+  grantedScopes?: string[];
+  homepageBannersSupported?: boolean;
+  homepageBannersNote?: string;
+  errorCode?: PesuAnnouncementsErrorCode;
+  requiresOptIn?: boolean;
+  requiresScopeGrant?: boolean;
+  requiresReauth?: boolean;
+  userMessage?: string;
+  error?: string;
+  diagnostics?: DeveloperDiagnosticTelemetry;
+}
+
+export interface PesuPublicEventsSyncResponse {
+  ok: boolean;
+  live: boolean;
+  fetchedAt: string;
+  sourcePagesChecked: string[];
+  reachablePagesCount: number;
+  discoveredCount: number;
+  publishedOrUpdatedCount: number;
+  stagedForReviewCount: number;
+  duplicatesSkippedCount: number;
+  userMessage: string;
+  warnings: string[];
+}
+
 

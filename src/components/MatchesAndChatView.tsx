@@ -1,34 +1,36 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  CheckCircle2,
+  Flag,
+  Heart,
+  MessageSquare,
+  Send,
+  Sparkles,
+  UserCheck,
+  UserPlus,
+  Users,
+} from 'lucide-react';
+import {
+  CandidateCard,
   Conversation,
   Hackathon,
+  Interest,
   JoinRequest,
   Membership,
   Message,
   Profile,
   Team,
+  TeamProposal,
   User,
 } from '../types/domain';
-import {
-  ROLE_TAXONOMY,
-  SUGGESTED_CUSTOM_SPECIALIZATIONS,
-} from '../data/seedData';
-import {
-  MessageSquare,
-  Send,
-  Sparkles,
-  Check,
-  X,
-  Flag,
-  Plus,
-  Users,
-} from 'lucide-react';
-import { Modal } from './Modal';
 
 interface MatchesAndChatViewProps {
   currentUser: User;
+  selectedHackathonId?: string;
   conversations: Conversation[];
   messages: Message[];
+  interests?: Interest[];
+  teamProposals?: TeamProposal[];
   users: User[];
   profiles: Record<string, Profile>;
   hackathons: Hackathon[];
@@ -36,6 +38,12 @@ interface MatchesAndChatViewProps {
   teams?: Team[];
   memberships?: Membership[];
   onSendMessage: (conversationId: string, body: string) => void;
+  onSwipeBack?: (
+    targetUid: string,
+    hackathonId: string
+  ) => Promise<void> | void;
+  onRefreshMatchesAndMessages?: () => Promise<void> | void;
+  onOpenMyTeam?: () => void;
   onResolveJoinRequest?: (
     requestId: string,
     decision: 'accept' | 'reject'
@@ -55,6 +63,11 @@ interface MatchesAndChatViewProps {
     targetLabel: string;
     reason: string;
   }) => void;
+  // Optional unused legacy compatibility props
+  onSwipeDecision?: (
+    card: CandidateCard,
+    decision: 'interested' | 'passed'
+  ) => void;
 }
 
 const DEFAULT_ICEBREAKERS = [
@@ -66,59 +79,196 @@ const DEFAULT_ICEBREAKERS = [
 export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
   ({
     currentUser,
+    selectedHackathonId,
     conversations,
     messages,
+    interests = [],
+    teamProposals = [],
     users,
     profiles,
     hackathons,
-    joinRequests = [],
     teams = [],
     memberships = [],
     onSendMessage,
-    onResolveJoinRequest,
-    onCreateTeam,
+    onSwipeBack,
+    onRefreshMatchesAndMessages,
+    onOpenMyTeam,
     onReportTarget,
   }) => {
-    const myConversations = conversations.filter((c) =>
-      c.participantUids.includes(currentUser.uid)
+    const [activeSection, setActiveSection] = useState<'shortlist' | 'chat'>(
+      'shortlist'
     );
+    const [shortlistTab, setShortlistTab] = useState<
+      'mutual' | 'interested' | 'incoming'
+    >('mutual');
+
+    const myConversations = useMemo(
+      () =>
+        conversations.filter((c) =>
+          c.participantUids.includes(currentUser.uid)
+        ),
+      [conversations, currentUser.uid]
+    );
+
     const [selectedConvId, setSelectedConvId] = useState<string>(
       myConversations[0]?.id ?? ''
     );
     const [draftText, setDraftText] = useState('');
     const [showIcebreakers, setShowIcebreakers] = useState(false);
 
-    // Create Team Modal State
-    const matchableHackathons = hackathons.filter((h) => h.matchable);
-    const [showCreateTeamModal, setShowCreateTeamModal] = useState(false);
-    const [teamHackathonId, setTeamHackathonId] = useState<string>(
-      matchableHackathons[0]?.id ?? ''
-    );
-    const [teamName, setTeamName] = useState('');
-    const [teamPitch, setTeamPitch] = useState('');
-    const [projectIdea, setProjectIdea] = useState('');
-    const [rolesNeeded, setRolesNeeded] = useState<string[]>([
-      'Backend / APIs',
-      'Frontend / UI',
-    ]);
-    const [customSpecs, setCustomSpecs] = useState<string[]>([]);
-    const [targetSize, setTargetSize] = useState<number>(4);
+    // Poll messages every 4 seconds only while chat is open
+    useEffect(() => {
+      if (!onRefreshMatchesAndMessages) return;
+      const interval = setInterval(() => {
+        void onRefreshMatchesAndMessages();
+      }, 4000);
+      return () => clearInterval(interval);
+    }, [onRefreshMatchesAndMessages]);
 
-    // Pending invitations or applications relevant to currentUser
-    const pendingInvites = joinRequests.filter((req) => {
-      if (req.status !== 'pending') return false;
-      const team = teams.find((t) => t.id === req.teamId);
-      if (!team) return false;
-      return (
-        team.leaderId === currentUser.uid ||
-        req.applicantUid === currentUser.uid
+    // Compute the 3 Shortlist sections from PostgreSQL-persisted `interests`
+    const { interestedList, incomingList, mutualMatchesList } = useMemo(() => {
+      const userSwipes = interests.filter(
+        (i) =>
+          i.targetType === 'user' &&
+          i.decision === 'interested' &&
+          (!selectedHackathonId || i.hackathonId === selectedHackathonId)
       );
-    });
 
-    // Active teams the user belongs to
-    const myActiveMemberships = memberships.filter(
-      (m) => m.uid === currentUser.uid && m.status === 'active'
-    );
+      const outgoingByPair = new Map<string, Interest>();
+      const incomingByPair = new Map<string, Interest>();
+
+      for (const sw of userSwipes) {
+        if (sw.fromUid === currentUser.uid) {
+          outgoingByPair.set(`${sw.hackathonId}:${sw.targetId}`, sw);
+        } else if (sw.targetId === currentUser.uid) {
+          incomingByPair.set(`${sw.hackathonId}:${sw.fromUid}`, sw);
+        }
+      }
+
+      const interestedItems: Array<{
+        key: string;
+        uid: string;
+        hackathonId: string;
+        user?: User;
+        profile?: Profile;
+        swipedAt: string;
+        note?: string;
+        isMutual: boolean;
+      }> = [];
+
+      const incomingItems: Array<{
+        key: string;
+        uid: string;
+        hackathonId: string;
+        user?: User;
+        profile?: Profile;
+        swipedAt: string;
+        note?: string;
+        isMutual: boolean;
+      }> = [];
+
+      const mutualItems: Array<{
+        key: string;
+        uid: string;
+        hackathonId: string;
+        user?: User;
+        profile?: Profile;
+        swipedAt: string;
+        conversationId?: string;
+        team?: Team;
+        proposal?: TeamProposal;
+      }> = [];
+
+      for (const [pairKey, out] of outgoingByPair.entries()) {
+        const otherUid = out.targetId;
+        const u = users.find((usr) => usr.uid === otherUid);
+        const p = profiles[otherUid];
+        const inc = incomingByPair.get(pairKey);
+        const isMutual = Boolean(inc);
+
+        interestedItems.push({
+          key: pairKey,
+          uid: otherUid,
+          hackathonId: out.hackathonId,
+          user: u,
+          profile: p,
+          swipedAt: out.createdAt,
+          note: out.note,
+          isMutual,
+        });
+
+        if (isMutual) {
+          const conv = myConversations.find(
+            (c) =>
+              c.type === 'direct_match' &&
+              c.hackathonId === out.hackathonId &&
+              c.participantUids.includes(otherUid)
+          );
+          const sharedTeam = teams.find((t) => {
+            if (t.hackathonId !== out.hackathonId || t.status === 'dissolved')
+              return false;
+            const activeUids = memberships
+              .filter((m) => m.teamId === t.id && m.status === 'active')
+              .map((m) => m.uid);
+            return (
+              activeUids.includes(currentUser.uid) &&
+              activeUids.includes(otherUid)
+            );
+          });
+          const activeProp = teamProposals.find(
+            (tp) =>
+              tp.hackathonId === out.hackathonId &&
+              (tp.candidateUid === otherUid ||
+                tp.candidateUid === currentUser.uid)
+          );
+          mutualItems.push({
+            key: pairKey,
+            uid: otherUid,
+            hackathonId: out.hackathonId,
+            user: u,
+            profile: p,
+            swipedAt: inc!.createdAt > out.createdAt ? inc!.createdAt : out.createdAt,
+            conversationId: conv?.id,
+            team: sharedTeam,
+            proposal: activeProp,
+          });
+        }
+      }
+
+      for (const [pairKey, inc] of incomingByPair.entries()) {
+        const otherUid = inc.fromUid;
+        const u = users.find((usr) => usr.uid === otherUid);
+        const p = profiles[otherUid];
+        if (u && u.privacyPreferences?.profileVisible === false) continue;
+        const isMutual = outgoingByPair.has(pairKey);
+        incomingItems.push({
+          key: pairKey,
+          uid: otherUid,
+          hackathonId: inc.hackathonId,
+          user: u,
+          profile: p,
+          swipedAt: inc.createdAt,
+          note: inc.note,
+          isMutual,
+        });
+      }
+
+      return {
+        interestedList: interestedItems,
+        incomingList: incomingItems,
+        mutualMatchesList: mutualItems,
+      };
+    }, [
+      interests,
+      selectedHackathonId,
+      currentUser.uid,
+      users,
+      profiles,
+      myConversations,
+      teams,
+      memberships,
+      teamProposals,
+    ]);
 
     const activeConv =
       myConversations.find((c) => c.id === selectedConvId) ??
@@ -143,168 +293,320 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
       setDraftText('');
     };
 
-    const toggleListItem = (
-      item: string,
-      list: string[],
-      setter: React.Dispatch<React.SetStateAction<string[]>>
-    ) => {
-      if (list.includes(item)) {
-        setter(list.filter((i) => i !== item));
-      } else {
-        setter([...list, item]);
-      }
-    };
-
-    const handleCreateTeamSubmit = (e: React.FormEvent) => {
-      e.preventDefault();
-      const targetHackId = teamHackathonId || matchableHackathons[0]?.id;
-      if (!targetHackId || !teamName.trim() || !teamPitch.trim() || !onCreateTeam)
-        return;
-
-      onCreateTeam({
-        hackathonId: targetHackId,
-        name: teamName.trim(),
-        pitch: teamPitch.trim(),
-        projectIdea: projectIdea.trim(),
-        rolesNeeded:
-          rolesNeeded.length > 0 ? rolesNeeded : ['Generalist'],
-        customSpecializations: customSpecs,
-        targetSize,
-      });
-
-      setTeamName('');
-      setTeamPitch('');
-      setProjectIdea('');
-      setShowCreateTeamModal(false);
-    };
-
     return (
-      <div className="space-y-4">
-        {/* Top Bar: My Active Teams & Create Team Action */}
-        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="space-y-1">
-            <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-              <Users className="w-4 h-4 text-blue-600" />
-              <span>Matches, Join Requests & Teams</span>
+      <div className="space-y-5">
+        {/* Top Bar: Shortlist vs. Direct & Team Messages Switcher */}
+        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+              <Heart className="w-4 h-4 text-blue-600" />
+              <span>Matches, Shortlist & Conversations</span>
             </h2>
-            {myActiveMemberships.length > 0 ? (
-              <div className="flex flex-wrap gap-2 pt-1">
-                {myActiveMemberships.map((m) => {
-                  const t = teams.find((team) => team.id === m.teamId);
-                  const h = hackathons.find((hack) => hack.id === m.hackathonId);
-                  if (!t) return null;
-                  return (
-                    <span
-                      key={m.id}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-xs font-medium text-slate-800 dark:text-slate-200"
-                    >
-                      <strong>{t.name}</strong> ({t.memberCount}/{t.targetSize}) ·{' '}
-                      <span className="text-slate-500">
-                        {h?.name ?? m.hackathonId}
-                      </span>
-                    </span>
-                  );
-                })}
-              </div>
-            ) : (
-              <p className="text-xs text-slate-500">
-                Not in an active team yet. Connect with builders in Discover or create a team for an upcoming hackathon.
-              </p>
-            )}
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Track everyone you expressed interest in, students interested in
+              you, and your mutual matches.
+            </p>
           </div>
 
-          {onCreateTeam && matchableHackathons.length > 0 && (
+          <div className="flex items-center gap-1.5 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg self-start sm:self-auto">
             <button
               type="button"
-              onClick={() => {
-                if (!teamHackathonId && matchableHackathons[0]) {
-                  setTeamHackathonId(matchableHackathons[0].id);
-                }
-                setShowCreateTeamModal(true);
-              }}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer self-start sm:self-auto"
+              onClick={() => setActiveSection('shortlist')}
+              className={`px-3.5 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                activeSection === 'shortlist'
+                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400'
+              }`}
             >
-              <Plus className="w-3.5 h-3.5" />
-              Create Team
+              Shortlist ({mutualMatchesList.length} Mutual ·{' '}
+              {interestedList.length} Outgoing · {incomingList.length} Incoming)
             </button>
-          )}
+            <button
+              type="button"
+              onClick={() => setActiveSection('chat')}
+              className={`px-3.5 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                activeSection === 'chat'
+                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              Messages ({myConversations.length})
+            </button>
+          </div>
         </div>
 
-        {/* Pending Invitations & Requests Section */}
-        {pendingInvites.length > 0 && (
-          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-2.5">
-            <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
-              Pending Invitations & Applications ({pendingInvites.length})
+        {activeSection === 'shortlist' ? (
+          /* 3-Section Shortlist Workspace (Part D.1) */
+          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+            <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 dark:border-slate-800 pb-3">
+              <button
+                type="button"
+                data-testid="shortlist-tab-mutual"
+                onClick={() => setShortlistTab('mutual')}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
+                  shortlistTab === 'mutual'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                <UserCheck className="w-3.5 h-3.5" />
+                <span>Mutual Matches ({mutualMatchesList.length})</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="shortlist-tab-interested"
+                onClick={() => setShortlistTab('interested')}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
+                  shortlistTab === 'interested'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                <Heart className="w-3.5 h-3.5" />
+                <span>Interested ({interestedList.length})</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="shortlist-tab-incoming"
+                onClick={() => setShortlistTab('incoming')}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
+                  shortlistTab === 'incoming'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                <UserPlus className="w-3.5 h-3.5" />
+                <span>Interested in You ({incomingList.length})</span>
+              </button>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
-              {pendingInvites.map((req) => {
-                const team = teams.find((t) => t.id === req.teamId);
-                const applicant = users.find((u) => u.uid === req.applicantUid);
-                const canDecide =
-                  (req.direction === 'application' &&
-                    team?.leaderId === currentUser.uid) ||
-                  (req.direction === 'invitation' &&
-                    req.applicantUid === currentUser.uid);
 
-                return (
-                  <div
-                    key={req.id}
-                    className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3 text-xs"
-                  >
-                    <div className="min-w-0">
-                      <div className="font-bold text-slate-900 dark:text-slate-100 truncate">
-                        {req.direction === 'application'
-                          ? `${
-                              applicant?.displayName ?? req.applicantUid
-                            } applied to ${team?.name}`
-                          : `${team?.name} invited you (${req.proposedRole})`}
-                      </div>
-                      {req.message && (
-                        <p className="text-slate-600 dark:text-slate-400 truncate mt-0.5">
-                          &ldquo;{req.message}&rdquo;
-                        </p>
-                      )}
-                    </div>
-
-                    {canDecide && onResolveJoinRequest && (
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onResolveJoinRequest(req.id, 'accept')
-                          }
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white font-semibold whitespace-nowrap cursor-pointer"
-                        >
-                          <Check className="w-3 h-3" /> Accept
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onResolveJoinRequest(req.id, 'reject')
-                          }
-                          className="p-1 rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-200 text-slate-600 cursor-pointer"
-                          title="Decline"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    )}
+            {shortlistTab === 'mutual' && (
+              <div className="space-y-3">
+                {mutualMatchesList.length === 0 ? (
+                  <div className="py-8 text-center text-xs text-slate-500 space-y-1">
+                    <Users className="w-7 h-7 text-slate-400 mx-auto mb-1" />
+                    <p className="font-semibold text-slate-700 dark:text-slate-300">
+                      No mutual matches yet
+                    </p>
+                    <p>
+                      When you and another student both swipe right on each
+                      other, your mutual match and automatic team appear here.
+                    </p>
                   </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {mutualMatchesList.map((item) => {
+                      const hack = hackathons.find(
+                        (h) => h.id === item.hackathonId
+                      );
+                      return (
+                        <div
+                          key={item.key}
+                          className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 space-y-2.5 text-xs"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <span className="text-[11px] text-blue-600 dark:text-blue-400 font-medium">
+                                {hack?.name ?? item.hackathonId}
+                              </span>
+                              <h4 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                                {item.user?.displayName ?? item.uid}
+                              </h4>
+                              <p className="text-slate-500">
+                                {item.profile?.preferredRoles.join(' · ') ||
+                                  'Student Builder'}
+                              </p>
+                            </div>
 
-        {/* Matches & Messages Workspace */}
-        {myConversations.length === 0 ? (
+                            {item.team ? (
+                              <span className="px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 font-semibold text-[11px]">
+                                Teammates ({item.team.memberCount}/
+                                {item.team.targetSize})
+                              </span>
+                            ) : item.proposal ? (
+                              <span className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300 font-semibold text-[11px]">
+                                Proposal:{' '}
+                                {item.proposal.status.replace(/_/g, ' ')}
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded bg-blue-50 text-blue-700 font-semibold text-[11px]">
+                                Mutual Match
+                              </span>
+                            )}
+                          </div>
+
+                          {item.profile &&
+                            item.profile.skillTags.length > 0 && (
+                              <div className="flex flex-wrap gap-1">
+                                {item.profile.skillTags
+                                  .slice(0, 5)
+                                  .map((sk) => (
+                                    <span
+                                      key={sk}
+                                      className="px-2 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[11px]"
+                                    >
+                                      {sk}
+                                    </span>
+                                  ))}
+                              </div>
+                            )}
+
+                          <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200/70 dark:border-slate-800">
+                            {item.conversationId && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedConvId(item.conversationId!);
+                                  setActiveSection('chat');
+                                }}
+                                className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 cursor-pointer"
+                              >
+                                Message
+                              </button>
+                            )}
+                            {onOpenMyTeam && (
+                              <button
+                                type="button"
+                                onClick={onOpenMyTeam}
+                                className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer"
+                              >
+                                View in My Team
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {shortlistTab === 'interested' && (
+              <div className="space-y-3">
+                {interestedList.length === 0 ? (
+                  <p className="py-8 text-center text-xs text-slate-500">
+                    You haven&apos;t swiped right on any students yet.
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {interestedList.map((item) => {
+                      const hack = hackathons.find(
+                        (h) => h.id === item.hackathonId
+                      );
+                      return (
+                        <div
+                          key={item.key}
+                          className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 flex items-center justify-between gap-3 text-xs"
+                        >
+                          <div>
+                            <span className="text-[11px] text-slate-500">
+                              {hack?.name ?? item.hackathonId}
+                            </span>
+                            <div className="font-bold text-sm text-slate-900 dark:text-slate-100">
+                              {item.user?.displayName ?? item.uid}
+                            </div>
+                            <div className="text-slate-500">
+                              {item.profile?.preferredRoles.join(' · ') ||
+                                'Student'}
+                            </div>
+                          </div>
+
+                          <span
+                            className={`px-2.5 py-1 rounded-lg font-semibold text-[11px] ${
+                              item.isMutual
+                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-300'
+                                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
+                            }`}
+                          >
+                            {item.isMutual
+                              ? 'Mutual Match'
+                              : 'Awaiting Response'}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {shortlistTab === 'incoming' && (
+              <div className="space-y-3">
+                {incomingList.length === 0 ? (
+                  <p className="py-8 text-center text-xs text-slate-500">
+                    No incoming student interests yet.
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {incomingList.map((item) => {
+                      const hack = hackathons.find(
+                        (h) => h.id === item.hackathonId
+                      );
+                      return (
+                        <div
+                          key={item.key}
+                          className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 space-y-2.5 text-xs"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <span className="text-[11px] text-blue-600 dark:text-blue-400">
+                                {hack?.name ?? item.hackathonId}
+                              </span>
+                              <div className="font-bold text-sm text-slate-900 dark:text-slate-100">
+                                {item.user?.displayName ?? item.uid}
+                              </div>
+                              <div className="text-slate-500">
+                                {item.profile?.preferredRoles.join(' · ') ||
+                                  'Student'}
+                              </div>
+                            </div>
+
+                            {item.isMutual ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 font-semibold text-[11px]">
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                Matched
+                              </span>
+                            ) : onSwipeBack ? (
+                              <button
+                                type="button"
+                                data-testid={`match-back-${item.uid}`}
+                                onClick={() =>
+                                  void onSwipeBack(item.uid, item.hackathonId)
+                                }
+                                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                <Heart className="w-3.5 h-3.5" />
+                                <span>Match Back</span>
+                              </button>
+                            ) : null}
+                          </div>
+
+                          {item.note && (
+                            <p className="text-slate-600 dark:text-slate-300 italic">
+                              &ldquo;{item.note}&rdquo;
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ) : /* Direct & Team Conversations Workspace */
+        myConversations.length === 0 ? (
           <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-10 text-center space-y-2">
             <MessageSquare className="w-8 h-8 text-slate-400 mx-auto" />
             <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
               No conversations yet
             </h3>
             <p className="text-xs text-slate-500 max-w-sm mx-auto">
-              Mutual connections with students and accepted team rosters appear here automatically.
+              Mutual connections with students and formed team rosters appear
+              here automatically.
             </p>
           </div>
         ) : (
@@ -354,7 +656,6 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
             <div className="lg:col-span-2 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 flex flex-col h-[520px]">
               {activeConv ? (
                 <>
-                  {/* Conversation Header */}
                   <div className="p-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
                     <div className="min-w-0">
                       <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm truncate">
@@ -383,7 +684,6 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                     </button>
                   </div>
 
-                  {/* Messages Feed */}
                   <div className="flex-1 p-4 overflow-y-auto space-y-2.5 bg-slate-50/40 dark:bg-slate-950/30">
                     {threadMessages.map((msg) => {
                       const isMe = msg.senderUid === currentUser.uid;
@@ -414,7 +714,6 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                     })}
                   </div>
 
-                  {/* Optional Icebreaker Drawer */}
                   {showIcebreakers && (
                     <div className="px-3.5 py-2 bg-slate-50 dark:bg-slate-800/50 border-t border-slate-200 dark:border-slate-800 flex flex-wrap gap-1.5">
                       {(partnerProfile?.icebreakerPrompt
@@ -439,7 +738,6 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                     </div>
                   )}
 
-                  {/* Composer */}
                   <form
                     onSubmit={handleSend}
                     className="p-3 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center gap-2"
@@ -476,154 +774,6 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
               ) : null}
             </div>
           </div>
-        )}
-
-        {/* Create Team Modal */}
-        {showCreateTeamModal && (
-          <Modal
-            title="Create a Hackathon Team"
-            subtitle="Recruit teammates by needed roles and technical specializations."
-            onClose={() => setShowCreateTeamModal(false)}
-            maxWidthClass="max-w-lg"
-          >
-            <form onSubmit={handleCreateTeamSubmit} className="space-y-3.5 text-xs">
-              <div>
-                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Hackathon *
-                </label>
-                <select
-                  value={teamHackathonId}
-                  onChange={(e) => setTeamHackathonId(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                >
-                  {matchableHackathons.map((h) => (
-                    <option key={h.id} value={h.id}>
-                      {h.name} (Max {h.maxTeamSize ?? 4} members)
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                <div className="sm:col-span-2">
-                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                    Team Name *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={teamName}
-                    onChange={(e) => setTeamName(e.target.value)}
-                    placeholder="e.g., NeuralForge"
-                    className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                    Target Size
-                  </label>
-                  <input
-                    type="number"
-                    min={2}
-                    max={6}
-                    value={targetSize}
-                    onChange={(e) => setTargetSize(Number(e.target.value))}
-                    className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Team Pitch *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={teamPitch}
-                  onChange={(e) => setTeamPitch(e.target.value)}
-                  placeholder="What are you building and who are you looking for?"
-                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                />
-              </div>
-
-              <div>
-                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Project Idea (Optional)
-                </label>
-                <input
-                  type="text"
-                  value={projectIdea}
-                  onChange={(e) => setProjectIdea(e.target.value)}
-                  placeholder="Optional technical direction or problem statement"
-                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                />
-              </div>
-
-              <div>
-                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Roles Needed
-                </label>
-                <div className="flex flex-wrap gap-1.5">
-                  {ROLE_TAXONOMY.map((role) => {
-                    const active = rolesNeeded.includes(role);
-                    return (
-                      <button
-                        key={role}
-                        type="button"
-                        onClick={() =>
-                          toggleListItem(role, rolesNeeded, setRolesNeeded)
-                        }
-                        className={`px-2.5 py-1 rounded-lg font-medium border cursor-pointer ${
-                          active
-                            ? 'bg-blue-600 text-white border-blue-600'
-                            : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700'
-                        }`}
-                      >
-                        {role}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div>
-                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Specializations (Optional)
-                </label>
-                <div className="flex flex-wrap gap-1.5">
-                  {SUGGESTED_CUSTOM_SPECIALIZATIONS.slice(0, 6).map((spec) => {
-                    const active = customSpecs.includes(spec);
-                    return (
-                      <button
-                        key={spec}
-                        type="button"
-                        onClick={() =>
-                          toggleListItem(spec, customSpecs, setCustomSpecs)
-                        }
-                        className={`px-2 py-1 rounded-md font-medium border cursor-pointer ${
-                          active
-                            ? 'bg-slate-900 text-white border-slate-900'
-                            : 'bg-white dark:bg-slate-900 text-slate-600 border-slate-200'
-                        }`}
-                      >
-                        {spec}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="flex justify-end pt-2 border-t border-slate-100 dark:border-slate-800">
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer"
-                >
-                  Create Team
-                </button>
-              </div>
-            </form>
-          </Modal>
         )}
       </div>
     );

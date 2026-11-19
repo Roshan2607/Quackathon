@@ -1,4 +1,4 @@
-# Quackathon — PES University Hackathon Teammate Finder
+# Quackathon 
 
 A student platform for finding hackathon teammates at PES University: discover
 **people** and **teams** for a verified hackathon, **Pass/Connect** on candidates,

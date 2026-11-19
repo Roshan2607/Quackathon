@@ -119,13 +119,20 @@ const DiagnosticTelemetryCard: React.FC<{
       </div>
       {(diagnostics.stateFingerprint ||
         diagnostics.transactionStatus ||
-        diagnostics.callbackOutcome) && (
+        diagnostics.callbackOutcome ||
+        diagnostics.initiatingOrigin ||
+        diagnostics.configuredCallbackOrigin ||
+        diagnostics.initiationCookieStatus ||
+        diagnostics.callbackCookieStatus) && (
         <>
           <div>
             <span className="text-slate-400 block font-sans text-[10px] uppercase">
-              State Fingerprint
+              State / Session FP
             </span>
-            <span className="font-semibold">{diagnostics.stateFingerprint ?? 'n/a'}</span>
+            <span className="font-semibold">
+              {diagnostics.stateFingerprint ?? 'n/a'} /{' '}
+              {diagnostics.sessionFingerprint ?? 'n/a'}
+            </span>
           </div>
           <div>
             <span className="text-slate-400 block font-sans text-[10px] uppercase">
@@ -138,6 +145,46 @@ const DiagnosticTelemetryCard: React.FC<{
               Callback Outcome
             </span>
             <span className="font-semibold">{diagnostics.callbackOutcome ?? 'n/a'}</span>
+          </div>
+          <div>
+            <span className="text-slate-400 block font-sans text-[10px] uppercase">
+              Initiating Origin
+            </span>
+            <span className="font-semibold break-all">
+              {diagnostics.initiatingOrigin ?? 'n/a'}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block font-sans text-[10px] uppercase">
+              Callback Origin
+            </span>
+            <span className="font-semibold break-all">
+              {diagnostics.configuredCallbackOrigin ?? 'n/a'}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block font-sans text-[10px] uppercase">
+              Cookie (Init / Cb)
+            </span>
+            <span className="font-semibold">
+              {diagnostics.initiationCookieStatus ?? 'n/a'} /{' '}
+              {diagnostics.callbackCookieStatus ?? 'n/a'}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block font-sans text-[10px] uppercase">
+              Session Match / Multi-Inst
+            </span>
+            <span className="font-semibold">
+              {diagnostics.sessionBindingMatched === null ||
+              diagnostics.sessionBindingMatched === undefined
+                ? 'n/a'
+                : diagnostics.sessionBindingMatched
+                ? 'matched'
+                : 'mismatch'}{' '}
+              /{' '}
+              {diagnostics.handledByDifferentInstance ? 'cross-instance' : 'same-instance'}
+            </span>
           </div>
         </>
       )}
@@ -731,12 +778,42 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
     const scopeToRequest = overrideScope ?? oauthScopes;
 
     try {
+      let isEmbedded = false;
+      try {
+        isEmbedded = window.self !== window.top;
+      } catch {
+        isEmbedded = true;
+      }
+
+      if (deliveryMode === 'redirect' && isEmbedded) {
+        const canonicalBase =
+          oauthSessionInfo?.canonicalAppOrigin ||
+          (serverConfig?.registeredRedirectUri
+            ? new URL(serverConfig.registeredRedirectUri).origin
+            : window.location.origin);
+        const topLevelUrl = `${canonicalBase}/?start_pesu_oauth=redirect#/dev/integrations`;
+        const opened = window.open(topLevelUrl, '_blank', 'noopener');
+        setOauthFlowNotice({
+          tone: 'info',
+          message: opened
+            ? `Opened top-level tab (${canonicalBase}) to execute full-page PESU OAuth2 sign-in with first-party session cookies.`
+            : `Popup blocked. Open ${canonicalBase} in a top-level browser tab to complete full-page PESU OAuth2 sign-in.`,
+        });
+        return;
+      }
+
       const query = new URLSearchParams({
         scope: scopeToRequest,
         mode: deliveryMode,
+        client_origin: window.location.origin,
+        frame_context: isEmbedded ? 'embedded' : 'top-level',
       });
       const res = await fetch(`/api/pesu-oauth/url?${query.toString()}`, {
         credentials: 'include',
+        headers: {
+          'X-Client-Origin': window.location.origin,
+          'X-Frame-Context': isEmbedded ? 'embedded' : 'top-level',
+        },
       });
       const data = (await res.json()) as PesuOAuthUrlResponse;
 
@@ -749,6 +826,7 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
           tone: 'error',
           message: `${data.errorCategory || 'OAUTH_ERROR'}: ${data.userMessage || 'Failed to construct OAuth authorization URL.'}`,
         });
+        await fetchServerStatus();
         return;
       }
 
@@ -794,9 +872,10 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
         // Problem D fix: never label authentication successful merely because a popup opened
         setOauthFlowNotice({
           tone: 'info',
-          message: `Authorization window opened (state=${data.state?.slice(0, 8)}...). Authentication is NOT complete until the callback exchanges the code for tokens and verifies identity.`,
+          message: `Authorization window opened (state=${data.state?.slice(0, 8)}..., cookie=${data.initiationCookieStatus ?? 'existing'}). Authentication is NOT complete until the callback exchanges the code for tokens and verifies identity.`,
         });
       }
+      await fetchServerStatus();
     } catch (err) {
       setOauthFlowNotice({
         tone: 'error',
@@ -1535,6 +1614,10 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
               )}
               <span>{oauthFlowNotice.message}</span>
             </div>
+          )}
+
+          {oauthSessionInfo?.lastDiagnostics && (
+            <DiagnosticTelemetryCard diagnostics={oauthSessionInfo.lastDiagnostics} />
           )}
 
           {oauthSessionInfo?.authenticated && oauthSessionInfo.identity && (

@@ -11,6 +11,7 @@ import {
   Calendar,
   ChevronDown,
   Compass,
+  ExternalLink,
   Lock,
   LogIn,
   LogOut,
@@ -47,6 +48,9 @@ import {
   Profile,
   ReportRecord,
   Team,
+  TeamProposal,
+  TeamRegistration,
+  TeamRegistrationStatus,
   User,
 } from './types/domain';
 
@@ -62,7 +66,7 @@ type NavTab =
   | 'discover'
   | 'hackathons'
   | 'matches'
-  | 'teams'
+  | 'my_team'
   | 'profile'
   | 'admin'
   | 'integrations';
@@ -116,16 +120,19 @@ const ViewSkeleton: React.FC = () => (
 interface BootstrapPayload {
   ok: boolean;
   users: User[];
-  profiles: Record<string, Profile>;
+  profiles: Record<string, Profile> | Profile[];
   hackathons: Hackathon[];
   eventCandidates: EventCandidate[];
   participations: Participation[];
   teams: Team[];
   memberships: Membership[];
   joinRequests: JoinRequest[];
+  teamProposals?: TeamProposal[];
+  teamRegistrations?: TeamRegistration[];
   interests: Interest[];
   conversations: Conversation[];
   messages: Message[];
+  blocks?: string[];
 }
 
 const LoginPage: React.FC<{
@@ -190,9 +197,9 @@ export function App() {
     if (hash === '#/admin') return 'admin';
     if (hash === '#/dev/integrations') return 'integrations';
     if (hash === '#/profile') return 'profile';
-    if (hash === '#/teams') return 'teams';
-    if (hash === '#/hackathons') return 'hackathons';
+    if (hash === '#/hackathons' || hash === '#/events') return 'hackathons';
     if (hash === '#/matches') return 'matches';
+    if (hash === '#/team' || hash === '#/my-team' || hash === '#/teams') return 'my_team';
     return 'discover';
   };
 
@@ -216,6 +223,10 @@ export function App() {
   const [teams, setTeams] = useState<Team[]>([]);
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([]);
+  const [teamProposals, setTeamProposals] = useState<TeamProposal[]>([]);
+  const [teamRegistrations, setTeamRegistrations] = useState<
+    TeamRegistration[]
+  >([]);
   const [interests, setInterests] = useState<Interest[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -224,6 +235,23 @@ export function App() {
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [unregisteredRedirectInfo, setUnregisteredRedirectInfo] = useState<{
+    redirectUri: string;
+    clientId: string;
+    portalUrl: string;
+  } | null>(null);
+  const [copiedRedirectUri, setCopiedRedirectUri] = useState(false);
+  const [canonicalAppOrigin, setCanonicalAppOrigin] = useState<string>(() =>
+    typeof window !== 'undefined' ? window.location.origin : ''
+  );
+  const isEmbeddedPreview = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return window.self !== window.top;
+    } catch {
+      return true;
+    }
+  }, []);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const pesuPopupRef = useRef<Window | null>(null);
   const pesuPopupPollRef = useRef<number | null>(null);
@@ -274,24 +302,46 @@ export function App() {
     const res = await apiFetch<BootstrapPayload>('/api/bootstrap');
     if (res.ok && res.data?.ok) {
       setUsers(res.data.users ?? []);
-      setProfiles(res.data.profiles ?? {});
+      const rawProfiles = res.data.profiles;
+      if (Array.isArray(rawProfiles)) {
+        const map: Record<string, Profile> = {};
+        for (const p of rawProfiles) {
+          map[p.uid] = p;
+        }
+        setProfiles(map);
+      } else {
+        setProfiles(rawProfiles ?? {});
+      }
       setHackathons(res.data.hackathons ?? []);
       setEventCandidates(res.data.eventCandidates ?? []);
       setParticipations(res.data.participations ?? []);
       setTeams(res.data.teams ?? []);
       setMemberships(res.data.memberships ?? []);
       setJoinRequests(res.data.joinRequests ?? []);
+      setTeamProposals(res.data.teamProposals ?? []);
+      setTeamRegistrations(res.data.teamRegistrations ?? []);
       setInterests(res.data.interests ?? []);
       setConversations(res.data.conversations ?? []);
       setMessages(res.data.messages ?? []);
+      if (Array.isArray(res.data.blocks)) {
+        setBlocks(
+          res.data.blocks.map((targetUid) => ({
+            id: `block_${targetUid}`,
+            blockerUid: authenticatedUser?.uid ?? 'self',
+            blockedUid: targetUid,
+            createdAt: new Date().toISOString(),
+          }))
+        );
+      }
       setSelectedHackathonId((prev) => {
         if (prev && res.data!.hackathons.some((h) => h.id === prev)) {
           return prev;
         }
-        return res.data!.hackathons[0]?.id ?? '';
+        const firstMatchable = res.data!.hackathons.find((h) => h.matchable);
+        return firstMatchable?.id ?? res.data!.hackathons[0]?.id ?? '';
       });
     }
-  }, []);
+  }, [authenticatedUser?.uid]);
 
   const restoreAuthSession = useCallback(async (): Promise<User | null> => {
     const res = await apiFetch<{
@@ -300,6 +350,16 @@ export function App() {
       user: User | null;
       profile: Profile | null;
     }>('/api/auth/session');
+
+    // Also fetch canonical callback origin from /api/pesu-oauth/session
+    void apiFetch<{
+      ok: boolean;
+      canonicalAppOrigin?: string;
+    }>('/api/pesu-oauth/session').then((oauthSess) => {
+      if (oauthSess.ok && oauthSess.data?.canonicalAppOrigin) {
+        setCanonicalAppOrigin(oauthSess.data.canonicalAppOrigin);
+      }
+    });
 
     if (res.ok && res.data?.authenticated && res.data.user) {
       setAuthenticatedUser(res.data.user);
@@ -317,6 +377,20 @@ export function App() {
   // Initial session restoration without unauthenticated bootstrap flash
   useEffect(() => {
     let isMounted = true;
+    const params = new URLSearchParams(window.location.search);
+    const shouldAutoRedirect = params.get('start_pesu_oauth') === 'redirect';
+    const wantAnnouncementsScope = params.get('pesu_scope') === 'announcements';
+    if (shouldAutoRedirect) {
+      params.delete('start_pesu_oauth');
+      params.delete('pesu_scope');
+      const remaining = params.toString();
+      const cleanUrl =
+        window.location.pathname +
+        (remaining ? `?${remaining}` : '') +
+        window.location.hash;
+      window.history.replaceState(null, '', cleanUrl);
+    }
+
     void (async () => {
       try {
         const restoredUser = await restoreAuthSession();
@@ -486,9 +560,11 @@ export function App() {
       if (hash === '#/admin') setActiveTab('admin');
       else if (hash === '#/dev/integrations') setActiveTab('integrations');
       else if (hash === '#/profile') setActiveTab('profile');
-      else if (hash === '#/teams') setActiveTab('teams');
-      else if (hash === '#/hackathons') setActiveTab('hackathons');
+      else if (hash === '#/hackathons' || hash === '#/events')
+        setActiveTab('hackathons');
       else if (hash === '#/matches') setActiveTab('matches');
+      else if (hash === '#/team' || hash === '#/my-team' || hash === '#/teams')
+        setActiveTab('my_team');
       else setActiveTab('discover');
     };
     window.addEventListener('hashchange', onHashChange);
@@ -517,8 +593,8 @@ export function App() {
       window.history.replaceState(null, '', '#/admin');
     } else if (tab === 'integrations') {
       window.history.replaceState(null, '', '#/dev/integrations');
-    } else if (tab === 'teams') {
-      window.history.replaceState(null, '', '#/teams');
+    } else if (tab === 'my_team') {
+      window.history.replaceState(null, '', '#/my-team');
     } else if (tab === 'hackathons') {
       window.history.replaceState(null, '', '#/hackathons');
     } else if (tab === 'matches') {
@@ -531,109 +607,154 @@ export function App() {
   }, []);
 
   // Authentication Handlers
-  const handleSignInWithPesu = useCallback(async () => {
-    if (isSigningIn) {
-      return;
-    }
-    if (pesuPopupRef.current && !pesuPopupRef.current.closed) {
-      pesuPopupRef.current.focus();
-      return;
-    }
-
-    setIsSigningIn(true);
-    clearPesuPopupMonitor();
-
-    try {
-      if (
-        window.location.hash &&
-        window.location.hash !== '#/' &&
-        window.location.hash !== '#/discover'
-      ) {
-        sessionStorage.setItem('quackathon_post_auth_route', window.location.hash);
-      }
-
-      const res = await startPesuOAuthSignIn(['openid', 'profile', 'email']);
-      if (!res.ok || !res.authUrl) {
-        setIsSigningIn(false);
-        showToast(res.errorMessage || 'Could not start PESU OAuth2 sign-in.');
-        return;
-      }
-
-      if (res.state) {
-        activeOAuthStateRef.current = res.state;
-        try {
-          sessionStorage.setItem('quackathon_oauth_state', res.state);
-        } catch {
-          // ignore storage error
-        }
-      }
-
-      // Check for embedded iframe/preview environments
-      const isEmbedded = window.top !== window.self;
-      if (!isEmbedded) {
-        // Normal direct top-level redirect
-        window.location.href = res.authUrl;
-        return;
-      }
-
-      // Graceful fallback for embedded previews
-      const popup = window.open(
-        res.authUrl,
-        'pesu_oauth_popup',
-        'width=520,height=660,menubar=no,toolbar=no'
-      );
-
-      if (!popup) {
-        try {
-          window.top?.location.assign(res.authUrl);
-        } catch {
-          setIsSigningIn(false);
+  const handleSignInWithPesu = useCallback(
+    async (
+      mode: 'popup' | 'redirect' = 'redirect',
+      requestedScopes: string[] = ['openid', 'profile', 'email']
+    ) => {
+      // If full-page redirect mode is requested from inside an embedded iframe,
+      // launch the canonical application URL in a top-level tab so cookies are 1st-party.
+      if (mode === 'redirect' && isEmbeddedPreview) {
+        const targetBase = canonicalAppOrigin || window.location.origin;
+        const scopeParam = requestedScopes.includes('announcements:read')
+          ? '&pesu_scope=announcements'
+          : '';
+        const topLevelAuthUrl = `${targetBase}/?start_pesu_oauth=redirect${scopeParam}${window.location.hash || ''}`;
+        const opened = window.open(topLevelAuthUrl, '_blank', 'noopener');
+        if (!opened) {
           showToast(
-            'Sign-in popup was blocked. Please allow popups or open in a full window.'
+            `Please open ${targetBase} in a new browser tab to complete full-page PESU sign-in.`
+          );
+        } else {
+          showToast(
+            'Opened top-level tab for PESU OAuth2 full-page sign-in.'
           );
         }
         return;
       }
 
-      pesuPopupRef.current = popup;
-      const launchedState = res.state || '';
+      // Prevent duplicate login launches if a popup is already open or a request is in flight
+      if (
+        mode === 'popup' &&
+        pesuPopupRef.current &&
+        !pesuPopupRef.current.closed
+      ) {
+        pesuPopupRef.current.focus();
+        return;
+      }
+      if (isSigningIn) {
+        return;
+      }
 
-      pesuPopupPollRef.current = window.setInterval(() => {
-        if (!pesuPopupRef.current || pesuPopupRef.current.closed) {
-          clearPesuPopupMonitor();
-          pesuPopupRef.current = null;
-          window.setTimeout(async () => {
-            if (
-              launchedState &&
-              handledOAuthStatesRef.current.has(launchedState)
-            ) {
-              return;
-            }
-            const restored = await restoreAuthSession();
-            setIsSigningIn(false);
-            if (restored) {
-              if (launchedState) {
-                handledOAuthStatesRef.current.add(launchedState);
-              }
-              await refreshBootstrap();
-              showToast(`Signed in with PESU as ${restored.displayName}.`);
-            } else {
-              showToast('PESU sign-in was cancelled before completion.');
-            }
-          }, 450);
+      setIsSigningIn(true);
+      clearPesuPopupMonitor();
+
+      try {
+        if (
+          window.location.hash &&
+          window.location.hash !== '#/' &&
+          window.location.hash !== '#/discover'
+        ) {
+          sessionStorage.setItem('quackathon_post_auth_route', window.location.hash);
         }
-      }, 450);
-    } catch {
-      setIsSigningIn(false);
-      showToast('Could not start PESU OAuth2 sign-in.');
-    }
-  }, [
-    clearPesuPopupMonitor,
-    isSigningIn,
-    refreshBootstrap,
-    restoreAuthSession,
-    showToast,
-  ]);
+
+        const res = await startPesuOAuthSignIn(requestedScopes, mode);
+        if (res.canonicalAppOrigin) {
+          setCanonicalAppOrigin(res.canonicalAppOrigin);
+        }
+        if (res.providerRedirectUriRegistered === false && res.redirectUri) {
+          setUnregisteredRedirectInfo({
+            redirectUri: res.redirectUri,
+            clientId: res.publicClientId || 'configured client',
+            portalUrl:
+              res.portalManageUrl || 'https://pesu-oauth2.onrender.com/portal',
+          });
+          setIsSigningIn(false);
+          showToast(
+            'Register the callback URI in PESU OAuth2 Portal and click "Save Changes" first.'
+          );
+          return;
+        } else if (res.providerRedirectUriRegistered === true) {
+          setUnregisteredRedirectInfo(null);
+        }
+        if (!res.ok || !res.authUrl) {
+          setIsSigningIn(false);
+          showToast(res.errorMessage || 'Could not start PESU OAuth2 sign-in.');
+          return;
+        }
+
+        if (res.state) {
+          activeOAuthStateRef.current = res.state;
+          try {
+            sessionStorage.setItem('quackathon_oauth_state', res.state);
+          } catch {
+            // ignore storage error
+          }
+        }
+
+        if (mode === 'redirect') {
+          window.location.assign(res.authUrl);
+          return;
+        }
+
+        const popup = window.open(
+          res.authUrl,
+          'pesu_oauth_popup',
+          'width=520,height=660,menubar=no,toolbar=no'
+        );
+
+        if (!popup) {
+          setIsSigningIn(false);
+          showToast(
+            'Sign-in popup was blocked by your browser. Use "Full-Page Sign In" in the account menu or allow popups.'
+          );
+          return;
+        }
+
+        pesuPopupRef.current = popup;
+        const launchedState = res.state || '';
+
+        // Monitor popup closure to distinguish user cancellation from completed/failed callback
+        pesuPopupPollRef.current = window.setInterval(() => {
+          if (!pesuPopupRef.current || pesuPopupRef.current.closed) {
+            clearPesuPopupMonitor();
+            pesuPopupRef.current = null;
+            window.setTimeout(async () => {
+              if (
+                launchedState &&
+                handledOAuthStatesRef.current.has(launchedState)
+              ) {
+                return;
+              }
+              const restored = await restoreAuthSession();
+              setIsSigningIn(false);
+              if (restored) {
+                if (launchedState) {
+                  handledOAuthStatesRef.current.add(launchedState);
+                }
+                await refreshBootstrap();
+                showToast(`Signed in with PESU as ${restored.displayName}.`);
+              } else {
+                showToast('PESU sign-in was cancelled before completion.');
+              }
+            }, 450);
+          }
+        }, 450);
+      } catch {
+        setIsSigningIn(false);
+        showToast('Could not start PESU OAuth2 sign-in.');
+      }
+    },
+    [
+      canonicalAppOrigin,
+      clearPesuPopupMonitor,
+      isEmbeddedPreview,
+      isSigningIn,
+      refreshBootstrap,
+      restoreAuthSession,
+      showToast,
+    ]
+  );
 
   const handleSignInWithGoogle = useCallback(async () => {
     setIsSigningIn(true);
@@ -739,11 +860,15 @@ export function App() {
         matchedConversation?: Conversation;
         createdJoinRequest?: JoinRequest;
         initialMessage?: Message;
+        autoCreatedTeam?: Team;
+        autoCreatedMemberships?: Membership[];
+        teamRosterConversation?: Conversation;
+        teamProposal?: TeamProposal;
       }>('/api/swipes', {
         method: 'POST',
         body: {
           hackathonId: card.hackathonId,
-          targetType: card.type === 'person' ? 'user' : 'team',
+          targetType: 'user',
           targetId: card.id,
           decision,
           proposedRole: card.rolesOfferedOrNeeded[0] ?? 'Builder',
@@ -764,18 +889,38 @@ export function App() {
 
       if (decision === 'passed') return;
 
-      if (res.data.createdJoinRequest) {
-        const jr = res.data.createdJoinRequest;
-        setJoinRequests((prev) => [
-          jr,
-          ...prev.filter((r) => r.id !== jr.id),
+      if (res.data.autoCreatedTeam) {
+        const newTeam = res.data.autoCreatedTeam;
+        setTeams((prev) => [
+          newTeam,
+          ...prev.filter((t) => t.id !== newTeam.id),
         ]);
-        showToast(
-          jr.direction === 'application'
-            ? `Application sent to "${card.title}".`
-            : `Team invitation sent to ${card.title}.`
-        );
-        return;
+        if (res.data.autoCreatedMemberships) {
+          setMemberships((prev) => [
+            ...prev.filter(
+              (m) =>
+                !res.data!.autoCreatedMemberships!.some(
+                  (nm) => nm.id === m.id
+                )
+            ),
+            ...res.data!.autoCreatedMemberships!,
+          ]);
+        }
+        if (res.data.teamRosterConversation) {
+          const tc = res.data.teamRosterConversation;
+          setConversations((prev) => [
+            tc,
+            ...prev.filter((c) => c.id !== tc.id),
+          ]);
+        }
+      }
+
+      if (res.data.teamProposal) {
+        const tp = res.data.teamProposal;
+        setTeamProposals((prev) => [
+          tp,
+          ...prev.filter((p) => p.id !== tp.id),
+        ]);
       }
 
       if (res.data.matchedConversation) {
@@ -787,12 +932,71 @@ export function App() {
         if (res.data.initialMessage) {
           setMessages((prev) => [...prev, res.data!.initialMessage!]);
         }
-        showToast(`Mutual match with ${card.title}! Open Matches to chat.`);
+        if (res.data.autoCreatedTeam) {
+          showToast(
+            `Mutual match with ${card.title}! A 2-person team "${res.data.autoCreatedTeam.name}" was automatically created in My Team.`
+          );
+        } else if (res.data.teamProposal) {
+          showToast(
+            `Mutual match with ${card.title}! Team proposal created — check My Team for unanimous member voting.`
+          );
+        } else {
+          showToast(`Mutual match with ${card.title}! Open Matches to chat.`);
+        }
       } else {
-        showToast(`Connection sent to ${card.title}.`);
+        showToast(`Interested in ${card.title} — added to your Shortlist.`);
       }
     },
     [authenticatedUser, showToast]
+  );
+
+  const handleSwipeBack = useCallback(
+    async (targetUid: string, hackathonId: string) => {
+      if (!authenticatedUser) {
+        showToast('Sign in with PESU or Google to match back.');
+        return;
+      }
+      const targetUser = users.find((u) => u.uid === targetUid);
+      const targetName = targetUser?.displayName ?? 'Student';
+      const res = await apiFetch<{
+        ok: boolean;
+        interest?: Interest;
+        matchedConversation?: Conversation;
+        initialMessage?: Message;
+        autoCreatedTeam?: Team;
+        autoCreatedMemberships?: Membership[];
+        teamRosterConversation?: Conversation;
+        teamProposal?: TeamProposal;
+      }>('/api/swipes', {
+        method: 'POST',
+        body: {
+          hackathonId,
+          targetType: 'user',
+          targetId: targetUid,
+          decision: 'interested',
+          proposedRole: 'Builder',
+        },
+      });
+
+      if (!res.ok || !res.data?.interest) {
+        showToast(res.errorMessage || 'Could not match back.');
+        return;
+      }
+
+      await refreshBootstrap();
+      if (res.data.autoCreatedTeam) {
+        showToast(
+          `Mutual match with ${targetName}! Created 2-person team "${res.data.autoCreatedTeam.name}".`
+        );
+      } else if (res.data.teamProposal) {
+        showToast(
+          `Mutual match with ${targetName}! Team candidate proposal created in My Team.`
+        );
+      } else {
+        showToast(`Matched with ${targetName}!`);
+      }
+    },
+    [authenticatedUser, refreshBootstrap, showToast, users]
   );
 
   const handleResetPassedCards = useCallback(
@@ -825,7 +1029,7 @@ export function App() {
   );
 
   const handleBlockUser = useCallback(
-    (targetUid: string) => {
+    async (targetUid: string) => {
       setBlocks((prev) => [
         ...prev,
         {
@@ -835,9 +1039,15 @@ export function App() {
           createdAt: new Date().toISOString(),
         },
       ]);
-      showToast('User hidden from your Discover feed.');
+      if (authenticatedUser) {
+        await apiFetch('/api/blocks', {
+          method: 'POST',
+          body: { targetUid },
+        });
+      }
+      showToast('Student hidden from your Discover feed.');
     },
-    [currentUser.uid, showToast]
+    [authenticatedUser, currentUser.uid, showToast]
   );
 
   const handleSaveProfile = useCallback(
@@ -920,6 +1130,213 @@ export function App() {
       }
     },
     [authenticatedUser, showToast]
+  );
+
+  const handleUpdateTeamDetails = useCallback(
+    async (
+      teamId: string,
+      updates: {
+        name?: string;
+        pitch?: string;
+        projectIdea?: string | null;
+        rolesNeeded?: string[];
+        targetSize?: number;
+      }
+    ) => {
+      if (!authenticatedUser) return;
+      const res = await apiFetch<{ ok: boolean; team?: Team }>(
+        `/api/teams/${encodeURIComponent(teamId)}`,
+        {
+          method: 'PATCH',
+          body: updates,
+        }
+      );
+      if (res.ok && res.data?.team) {
+        const updatedTeam = res.data.team;
+        setTeams((prev) =>
+          prev.map((t) => (t.id === updatedTeam.id ? updatedTeam : t))
+        );
+        showToast('Team details updated.');
+      } else {
+        showToast(res.errorMessage || 'Could not update team details.');
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleVoteTeamProposal = useCallback(
+    async (proposalId: string, vote: 'approve' | 'reject') => {
+      if (!authenticatedUser) return;
+      const res = await apiFetch<{
+        ok: boolean;
+        proposal?: TeamProposal;
+        unanimouslyApproved?: boolean;
+      }>(`/api/teams/proposals/${encodeURIComponent(proposalId)}/vote`, {
+        method: 'POST',
+        body: { vote },
+      });
+      if (res.ok && res.data?.proposal) {
+        const updatedProposal = res.data.proposal;
+        setTeamProposals((prev) =>
+          prev.map((p) => (p.id === updatedProposal.id ? updatedProposal : p))
+        );
+        if (vote === 'reject') {
+          showToast('Proposal rejected.');
+        } else if (res.data.unanimouslyApproved) {
+          showToast(
+            'All team members approved! Official invitation sent to candidate.'
+          );
+        } else {
+          showToast('Approval vote recorded.');
+        }
+      } else {
+        showToast(res.errorMessage || 'Could not record vote.');
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleRespondTeamProposal = useCallback(
+    async (proposalId: string, decision: 'accept' | 'decline') => {
+      if (!authenticatedUser) return;
+      const res = await apiFetch<{
+        ok: boolean;
+        proposal?: TeamProposal;
+        membership?: Membership;
+        team?: Team;
+      }>(`/api/teams/proposals/${encodeURIComponent(proposalId)}/accept`, {
+        method: 'POST',
+        body: { decision },
+      });
+      if (res.ok) {
+        await refreshBootstrap();
+        if (decision === 'accept') {
+          showToast(
+            res.data?.team
+              ? `Joined team "${res.data.team.name}"!`
+              : 'Team invitation accepted!'
+          );
+        } else {
+          showToast('Invitation declined.');
+        }
+      } else {
+        showToast(res.errorMessage || 'Could not respond to team invitation.');
+      }
+    },
+    [authenticatedUser, refreshBootstrap, showToast]
+  );
+
+  const handleLeaveTeam = useCallback(
+    async (teamId: string) => {
+      if (!authenticatedUser) return;
+      const res = await apiFetch<{
+        ok: boolean;
+        remainingMembers?: number;
+        dissolved?: boolean;
+      }>(`/api/teams/${encodeURIComponent(teamId)}/leave`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        await refreshBootstrap();
+        showToast(
+          res.data?.dissolved
+            ? 'You left the team and it was dissolved.'
+            : 'You left the team. Recruitment reopened for remaining members.'
+        );
+      } else {
+        showToast(res.errorMessage || 'Could not leave team.');
+      }
+    },
+    [authenticatedUser, refreshBootstrap, showToast]
+  );
+
+  const handleUpdateTeamRegistration = useCallback(
+    async (
+      teamId: string,
+      updates: {
+        registrationStatus: TeamRegistrationStatus;
+        externalRegistrationReference?: string | null;
+        confirmationNotes?: string | null;
+      }
+    ) => {
+      if (!authenticatedUser) return;
+      const res = await apiFetch<{
+        ok: boolean;
+        registration?: TeamRegistration;
+      }>(`/api/teams/${encodeURIComponent(teamId)}/registration`, {
+        method: 'POST',
+        body: updates,
+      });
+      if (res.ok && res.data?.registration) {
+        const reg = res.data.registration;
+        setTeamRegistrations((prev) => [
+          reg,
+          ...prev.filter((r) => r.teamId !== reg.teamId),
+        ]);
+        showToast('Hackathon registration status updated.');
+      } else {
+        showToast(
+          res.errorMessage || 'Could not update hackathon registration status.'
+        );
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleSendTeamMessage = useCallback(
+    async (teamId: string, body: string) => {
+      if (!authenticatedUser) {
+        showToast('Sign in to send team messages.');
+        return;
+      }
+      const res = await apiFetch<{
+        ok: boolean;
+        message?: Message;
+        conversationId?: string;
+      }>(`/api/teams/${encodeURIComponent(teamId)}/messages`, {
+        method: 'POST',
+        body: { body },
+      });
+      if (res.ok && res.data?.message) {
+        const msg = res.data.message;
+        setMessages((prev) => [
+          ...prev.filter((m) => m.id !== msg.id),
+          msg,
+        ]);
+      } else {
+        showToast(res.errorMessage || 'Could not send team message.');
+      }
+    },
+    [authenticatedUser, showToast]
+  );
+
+  const handleRefreshTeamMessages = useCallback(
+    async (teamId: string) => {
+      if (!authenticatedUser) return;
+      const res = await apiFetch<{
+        ok: boolean;
+        conversation?: Conversation;
+        messages?: Message[];
+      }>(`/api/teams/${encodeURIComponent(teamId)}/messages`);
+      if (res.ok && res.data?.messages) {
+        const fetchedMsgs = res.data.messages;
+        setMessages((prev) => {
+          const map = new Map(prev.map((m) => [m.id, m]));
+          for (const m of fetchedMsgs) {
+            map.set(m.id, m);
+          }
+          return Array.from(map.values());
+        });
+        if (res.data.conversation) {
+          const conv = res.data.conversation;
+          setConversations((prev) => [
+            conv,
+            ...prev.filter((c) => c.id !== conv.id),
+          ]);
+        }
+      }
+    },
+    [authenticatedUser]
   );
 
   const handleResolveJoinRequest = useCallback(
@@ -1131,13 +1548,25 @@ export function App() {
       (c) => c.reviewStatus === 'new' || c.reviewStatus === 'needs_confirmation'
     ).length + reports.filter((r) => r.status === 'open').length;
 
-  const pendingTeamRequestsCount = joinRequests.filter((r) => {
-    if (r.status !== 'pending') return false;
-    const team = teams.find((t) => t.id === r.teamId);
-    return (
-      team?.leaderId === currentUser.uid || r.applicantUid === currentUser.uid
-    );
-  }).length;
+  const myActiveTeamIds = useMemo(
+    () =>
+      new Set(
+        memberships
+          .filter((m) => m.uid === currentUser.uid && m.status === 'active')
+          .map((m) => m.teamId)
+      ),
+    [currentUser.uid, memberships]
+  );
+
+  const pendingProposalsOrInvitesCount = useMemo(
+    () =>
+      teamProposals.filter(
+        (p) =>
+          (p.status === 'pending_votes' && myActiveTeamIds.has(p.teamId)) ||
+          (p.status === 'invited' && p.candidateUid === currentUser.uid)
+      ).length,
+    [currentUser.uid, myActiveTeamIds, teamProposals]
+  );
 
   const myConversationsCount = conversations.filter((c) =>
     c.participantUids.includes(currentUser.uid)
@@ -1230,24 +1659,31 @@ export function App() {
             >
               <MessageSquare className="w-3.5 h-3.5" />
               <span>Matches</span>
-              {(myConversationsCount > 0 || pendingTeamRequestsCount > 0) && (
+              {myConversationsCount > 0 && (
                 <span className="font-mono tabular-nums text-[11px] opacity-80">
-                  {myConversationsCount + pendingTeamRequestsCount}
+                  {myConversationsCount}
                 </span>
               )}
             </button>
 
             <button
               type="button"
-              onClick={() => navigateToTab('teams')}
+              onClick={() => navigateToTab('my_team')}
               className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'teams'
+                activeTab === 'my_team'
                   ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               <Users className="w-3.5 h-3.5" />
               <span>My Team</span>
+              {(myActiveTeamIds.size > 0 || pendingProposalsOrInvitesCount > 0) && (
+                <span className="font-mono tabular-nums text-[11px] opacity-80">
+                  {pendingProposalsOrInvitesCount > 0
+                    ? pendingProposalsOrInvitesCount
+                    : myActiveTeamIds.size}
+                </span>
+              )}
             </button>
 
             <button
@@ -1383,6 +1819,67 @@ export function App() {
 
       {/* Main Content Workspace */}
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6">
+        {unregisteredRedirectInfo && (
+          <div className="mb-6 rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50/90 dark:bg-amber-950/40 p-4 text-xs text-slate-800 dark:text-slate-200 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-2 flex-1">
+                <div className="font-bold text-sm text-amber-900 dark:text-amber-300">
+                  PESU OAuth2 Redirect URI Registration Required
+                </div>
+                <p className="leading-relaxed text-slate-700 dark:text-slate-300">
+                  The PESU OAuth2 provider rejected sign-in with{' '}
+                  <span className="font-mono font-semibold">
+                    &ldquo;Redirect URI is not registered for this client application.&rdquo;
+                  </span>{' '}
+                  for client{' '}
+                  <code className="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 font-mono">
+                    {unregisteredRedirectInfo.clientId}
+                  </code>
+                  . Register the exact callback URL below in the PESU OAuth2 Developer Portal:
+                </p>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <code className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-800 font-mono text-xs select-all break-all">
+                    {unregisteredRedirectInfo.redirectUri}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(
+                        unregisteredRedirectInfo.redirectUri
+                      );
+                      setCopiedRedirectUri(true);
+                      setTimeout(() => setCopiedRedirectUri(false), 2000);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-semibold cursor-pointer"
+                  >
+                    {copiedRedirectUri ? 'Copied URI!' : 'Copy Callback URI'}
+                  </button>
+                  <a
+                    href={unregisteredRedirectInfo.portalUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+                  >
+                    <span>Open PESU Developer Portal</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+                <p className="text-[11px] text-amber-900/90 dark:text-amber-300/90 pt-1">
+                  Important: In the PESU Developer Portal, paste the URI under{' '}
+                  <strong>Redirect URIs</strong>, click <strong>+ Add</strong>, and then click{' '}
+                  <strong>Save Changes</strong> (clicking + Add alone does not persist the URI).
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setUnregisteredRedirectInfo(null)}
+                className="text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 font-semibold px-2 py-1 cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
         <Suspense fallback={<ViewSkeleton />}>
           {activeTab === 'discover' && (
             <DiscoverView
@@ -1409,6 +1906,7 @@ export function App() {
           {activeTab === 'hackathons' && (
             <HackathonsView
               currentUser={currentUser}
+              currentProfile={currentProfile}
               executionMode={executionMode}
               hackathons={hackathons}
               privateAcademyHints={[]}
@@ -1417,6 +1915,17 @@ export function App() {
                 navigateToTab('discover');
               }}
               onSubmitEventCandidate={handleSubmitEventCandidate}
+              onSaveProfile={handleSaveProfile}
+              onConnectPesuAcademy={(mode) =>
+                void handleSignInWithPesu(mode, [
+                  'openid',
+                  'profile',
+                  'email',
+                  'announcements:read',
+                ])
+              }
+              onRefreshCatalog={refreshBootstrap}
+              onNotify={showToast}
             />
           )}
 
@@ -1431,29 +1940,41 @@ export function App() {
               joinRequests={joinRequests}
               teams={teams}
               memberships={memberships}
+              interests={interests}
+              selectedHackathonId={selectedHackathonId}
               onSendMessage={handleSendMessage}
               onResolveJoinRequest={handleResolveJoinRequest}
               onCreateTeam={handleCreateTeam}
               onReportTarget={handleReportTarget}
+              onSwipeBack={handleSwipeBack}
+              onOpenMyTeam={() => navigateToTab('my_team')}
             />
           )}
 
-          {activeTab === 'teams' && (
+          {activeTab === 'my_team' && (
             <TeamsAndRequestsView
               currentUser={currentUser}
               hackathons={hackathons}
+              selectedHackathonId={selectedHackathonId}
+              onSelectHackathon={setSelectedHackathonId}
               teams={teams}
               memberships={memberships}
               joinRequests={joinRequests}
+              teamProposals={teamProposals}
+              teamRegistrations={teamRegistrations}
+              conversations={conversations}
+              messages={messages}
               users={users}
-              onCreateTeam={handleCreateTeam}
+              profiles={profiles}
               onResolveJoinRequest={handleResolveJoinRequest}
-              onSimulateConcurrentLastSlotRace={() => {
-                showToast('Simulated concurrent last-slot race guarded by DB transaction.');
-              }}
-              onSimulateDoubleTeamAttempt={() => {
-                showToast('Simulated double-team attempt guarded by membership checks.');
-              }}
+              onUpdateTeamDetails={handleUpdateTeamDetails}
+              onVoteTeamProposal={handleVoteTeamProposal}
+              onRespondTeamProposal={handleRespondTeamProposal}
+              onLeaveTeam={handleLeaveTeam}
+              onUpdateTeamRegistration={handleUpdateTeamRegistration}
+              onSendTeamMessage={handleSendTeamMessage}
+              onRefreshTeamMessages={handleRefreshTeamMessages}
+              onOpenDiscover={() => navigateToTab('discover')}
             />
           )}
 

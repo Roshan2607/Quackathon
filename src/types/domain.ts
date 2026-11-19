@@ -20,6 +20,7 @@ export type EventType =
   | 'team_competition'
   | 'workshop'
   | 'tech_talk'
+  | 'conference'
   | 'other'
   | 'unknown';
 
@@ -40,16 +41,29 @@ export type ReviewQueueStatus =
 
 export type EventSourceType =
   | 'pes_public_events'
+  | 'paasha_microservice'
   | 'approved_organizer'
   | 'academy_opt_in_hint'
   | 'submitted_public_url'
   | 'uploaded_brochure_or_poster';
 
+export type RegistrationHighLevelStatus = 'OPEN' | 'CLOSED' | 'UNKNOWN';
+
+export type RegistrationDetailStatus =
+  | 'open_confirmed'
+  | 'deadline_known'
+  | 'link_available'
+  | 'unknown'
+  | 'closed'
+  | 'ended';
+
 export type SourceUrlVerificationStatus =
   | 'verified'
   | 'redirected_valid'
   | 'unverified'
-  | 'unavailable';
+  | 'unavailable'
+  | 'blocked_policy'
+  | 'broken';
 
 export type RequestDirection = 'application' | 'invitation';
 export type RequestStatus = 'pending' | 'accepted' | 'rejected' | 'withdrawn' | 'expired';
@@ -60,6 +74,7 @@ export interface User {
   campus: CampusType;
   program?: string;
   graduationYear?: number;
+  verified?: boolean;
   verificationStatus: 'verified_pesu_oidc' | 'pilot_invite' | 'unverified';
   pesuOidcSub: string;
   isAdmin?: boolean;
@@ -88,6 +103,7 @@ export interface Profile {
   uid: string;
   headline: string;
   about: string;
+  bio?: string;
   skillTags: string[];
   interestTags: string[];
   projectDomains: string[];
@@ -149,9 +165,15 @@ export interface FieldProvenanceEntry {
 export interface Hackathon {
   id: string;
   name: string;
+  shortDescription?: string;
   description: string;
   eventType: EventType;
+  categoryLabel?: string;
+  isHackathon?: boolean;
+  teamParticipationVerified?: boolean;
+  publicSourceVerified?: boolean;
   matchable: boolean;
+  findTeammatesEligible?: boolean;
   themes: string[];
   venue: {
     name: string | null;
@@ -163,8 +185,12 @@ export interface Hackathon {
   startAt: string | null;
   datePrecision: 'exact_instant' | 'date_only' | 'unknown';
   endAt: string | null;
+  dateDisplay?: string;
   timezone: string;
   registrationDeadline: string | null;
+  registrationStatus?: RegistrationHighLevelStatus;
+  registrationStatusDetail?: RegistrationDetailStatus;
+  registrationStatusLabel?: string;
   // Distinct URL tracking (Requirement #4)
   originalSubmissionUrl?: string | null;
   verifiedCanonicalUrl?: string | null;
@@ -172,8 +198,14 @@ export interface Hackathon {
   sourceUrlStatus?: SourceUrlVerificationStatus;
   minTeamSize: number | null;
   maxTeamSize: number | null;
+  teamSize?: {
+    min: number | null;
+    max: number | null;
+  };
   eligibilityNotes: string | null;
   organizer: string;
+  sourceType?: EventSourceType;
+  sources?: (EventSourceType | string)[];
   sourceIds: string[];
   fieldProvenance: Record<string, FieldProvenanceEntry>;
   suggestedByCount: number;
@@ -184,6 +216,7 @@ export interface Hackathon {
     reason: string;
   };
   lastVerifiedAt: string | null;
+  extractedAt?: string | null;
   verificationStatus: 'verified' | 'unconfirmed_constraints';
   status: EventLifecycleStatus;
   createdBy: string;
@@ -285,7 +318,7 @@ export interface Team {
   workStyleTags: string[];
   targetSize: number;
   memberCount: number;
-  status: 'open' | 'full' | 'locked';
+  status: 'open' | 'full' | 'locked' | 'dissolved';
   visibility: 'public' | 'unlisted';
   createdAt: string;
 }
@@ -307,6 +340,7 @@ export interface Interest {
   targetType: 'user' | 'team';
   targetId: string;
   decision: 'interested' | 'passed';
+  note?: string;
   createdAt: string;
 }
 
@@ -358,8 +392,16 @@ export interface CandidateCard {
   customSpecializations?: string[];
   matchedSpecializations?: string[];
   rolesWantToLearn?: string[];
-  featuredEvidence: { title: string; description: string; url?: string; isCoursework?: boolean }[];
+  featuredEvidence: {
+    title: string;
+    description: string;
+    url?: string;
+    isCoursework?: boolean;
+    tech?: string[];
+  }[];
   compatibilityReasons: string[];
+  overallScore?: number;
+  reasons?: string[];
   remainingSlots?: number;
   targetSize?: number;
   memberCount?: number;
@@ -378,7 +420,121 @@ export interface CandidateCard {
     availabilitySim: number;
     collabOrSkillSim: number;
     coldStartRedistributed: boolean;
+    skillComplementarity?: number;
+    skillComplementarityScore?: number;
+    sharedInterestsScore?: number;
+    pastSwipeAffinityScore?: number;
+    totalScore?: number;
+    evaluatedAgainstTeamId?: string;
+    evaluatedAgainstMemberCount?: number;
+    complementarySkills?: string[];
   };
+}
+
+export type TeamProposalStatus =
+  | 'pending_votes'
+  | 'invited'
+  | 'accepted'
+  | 'rejected'
+  | 'declined'
+  | 'expired';
+
+export interface TeamProposalVote {
+  id: string;
+  proposalId: string;
+  teamId: string;
+  voterUid: string;
+  voterName?: string;
+  decision: 'approve' | 'reject';
+  comment?: string;
+  votedAt: string;
+}
+
+export interface TeamProposal {
+  id: string;
+  hackathonId: string;
+  teamId: string;
+  teamName?: string;
+  candidateUid: string;
+  candidateName?: string;
+  candidateHeadline?: string;
+  candidateSkills?: string[];
+  proposedByUid: string;
+  proposerUid?: string;
+  proposedByName?: string;
+  proposedRole: string;
+  message?: string;
+  note?: string;
+  status: TeamProposalStatus;
+  resolutionNote?: string;
+  votes: TeamProposalVote[];
+  requiredVoterUids: string[];
+  approvedCount: number;
+  requiredCount: number;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+}
+
+export type TeamRegistrationStatus =
+  | 'forming'
+  | 'ready_to_register'
+  | 'registration_in_progress'
+  | 'registered'
+  | 'registration_closed';
+
+export interface TeamRegistration {
+  teamId: string;
+  hackathonId: string;
+  registrationStatus: TeamRegistrationStatus;
+  officialRegistrationUrl: string | null;
+  registrationUrlSnapshot?: string | null;
+  externalRegistrationReference?: string | null;
+  confirmationNotes?: string | null;
+  registeredByUid?: string | null;
+  registeredAt?: string | null;
+  minRequiredMembers: number;
+  maxAllowedMembers: number;
+  currentMemberCount: number;
+  isEligibleToRegister: boolean;
+  readinessReason: string;
+  minTeamSizeSnapshot?: number;
+  maxTeamSizeSnapshot?: number;
+  currentMemberCountSnapshot?: number;
+  memberCountAtCheck?: number;
+  eligibleToRegister?: boolean;
+  eligibilityReason?: string;
+  updatedAt: string;
+}
+
+export interface ShortlistEntry {
+  uid: string;
+  displayName: string;
+  campus: CampusType;
+  program?: string;
+  graduationYear?: number;
+  headline: string;
+  skillTags: string[];
+  interestTags: string[];
+  preferredRoles: string[];
+  swipedAt: string;
+  status:
+    | 'awaiting_response'
+    | 'interested_in_you'
+    | 'mutual_match'
+    | 'in_your_team'
+    | 'proposal_pending_votes'
+    | 'proposal_invited';
+  conversationId?: string;
+  teamId?: string;
+  proposalId?: string;
+}
+
+export interface ShortlistPayload {
+  hackathonId: string;
+  interested: ShortlistEntry[];
+  interestedInYou: ShortlistEntry[];
+  mutualMatches: ShortlistEntry[];
 }
 
 export interface InterestCircle {
@@ -415,3 +571,4 @@ export interface AuditLog {
   summary: string;
   createdAt: string;
 }
+

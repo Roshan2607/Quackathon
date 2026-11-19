@@ -77,6 +77,20 @@ export async function apiFetch<T = Record<string, unknown>>(
     ...(customHeaders as Record<string, string> | undefined),
   };
 
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    if (!headers['X-Client-Origin'] && !headers['x-client-origin']) {
+      headers['X-Client-Origin'] = window.location.origin;
+    }
+    if (!headers['X-Frame-Context'] && !headers['x-frame-context']) {
+      try {
+        headers['X-Frame-Context'] =
+          window.self !== window.top ? 'embedded' : 'top-level';
+      } catch {
+        headers['X-Frame-Context'] = 'embedded';
+      }
+    }
+  }
+
   const isJsonObjectBody = isPlainJsonBody(restOptions.body);
   const body: BodyInit | null | undefined = isJsonObjectBody
     ? JSON.stringify(restOptions.body)

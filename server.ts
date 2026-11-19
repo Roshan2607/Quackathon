@@ -12,6 +12,8 @@ import {
   EventType,
   ParticipationIntent,
   Profile,
+  TeamRegistration,
+  TeamRegistrationStatus,
   User,
 } from './src/types/domain.ts';
 import {
@@ -21,43 +23,82 @@ import {
   ExtractedEventFields,
   ExtractionMethodUsed,
   IntegrationErrorCategory,
+  PesuAnnouncementsResponse,
   PesuOAuthCallbackPostMessage,
   PesuOAuthDiscoveryResponse,
   PesuOAuthSessionStatusResponse,
   PesuOAuthStageStatuses,
   PesuOAuthUrlResponse,
+  PesuPublicEventsSyncResponse,
   PesuVerifiedIdentity,
   UrlVerificationStatus,
   VerifyUrlResponse,
 } from './src/types/apiContracts.ts';
 import {
+  evaluateHackathonEligibilityAndStates,
+  extractPesuEventsPaginationLinks,
+  filterAndSortEventsByTime,
+  formatEventDateDisplayIST,
+  normalizePesuAnnouncementPayload,
+  parseDateRangeFromText,
+  parsePesuEventDetailHtml,
+  parsePesuEventsHtmlListing,
+  PESU_HOMEPAGE_BANNERS_NOTE,
+  sanitizeTextForPublicCandidate,
+  TimeFilterPreset,
+} from './src/lib/eventsAndAnnouncements.ts';
+import {
+  checkPaashaConnectionStatus,
+  fetchPaashaHackathons,
+  setPaashaClientFetchOverride,
+} from './src/services/paashaClient.ts';
+import {
+  computeTeamCombinedCapabilities,
+  countEligiblePeopleForHackathon,
+  rankStudentsForHackathon,
+} from './src/services/matchingEngine.ts';
+import {
   approveEventCandidateRecord,
+  blockUserRecord,
   claimOrInspectOAuthTransactionRecord,
   completeOAuthTransactionRecord,
+  computeTeamRegistrationReadiness,
   consumeOAuthTransactionRecord,
   createEventCandidateRecord,
   createMessageRecord,
   createOAuthSessionRecord,
   createOAuthTransactionRecord,
   createPublishedHackathonDirect,
+  createTeamMessageRecord,
+  createTeamProposalRecord,
   createTeamWithLeaderRecord,
+  getShortlistForUserRecord,
+  getTeamMessagesRecord,
   getUserAndProfileByUid,
   getValidOAuthSessionByInitiatingSessionId,
   getValidOAuthSessionRecord,
+  ingestPaashaHackathonsToDatabase,
+  leaveTeamRecord,
   loadBootstrapData,
   recordSwipeAndProcessMatchRecord,
   rejectEventCandidateRecord,
   isPesuSrnOrPrn,
   resetPassedSwipesForHackathon,
   resolveJoinRequestRecord,
+  respondToTeamProposalRecord,
   revokeOAuthSessionRecord,
+  updateTeamDetailsRecord,
+  updateTeamRegistrationRecord,
   updateUserProfileAndPrivacy,
   upsertParticipationRecord,
   upsertUserAndProfile,
+  voteOnTeamProposalRecord,
   waitForOAuthTransactionCompletion,
 } from './src/db/repository.ts';
 import {
+  inspectSessionCookieHeader,
   SESSION_COOKIE_NAME,
+  SessionCookieInspection,
   signSessionId,
   verifySignedSessionCookie,
 } from './src/lib/crypto.ts';
@@ -104,12 +145,16 @@ let testOverrides: ServerTestOverrides = {};
 
 export function setServerTestOverrides(overrides: ServerTestOverrides) {
   testOverrides = { ...testOverrides, ...overrides };
+  setPaashaClientFetchOverride(
+    testOverrides.fetchImpl ?? testOverrides.fetchFn ?? null
+  );
   oidcDiscoveryCache = null;
   githubRepoCache.clear();
 }
 
 export function resetServerTestOverrides() {
   testOverrides = {};
+  setPaashaClientFetchOverride(null);
   oidcDiscoveryCache = null;
   githubRepoCache.clear();
 }
@@ -1515,7 +1560,48 @@ function parseHtmlEventMetadataDeterministically(html: string, finalUrl: string)
     .trim()
     .slice(0, 10000);
 
+  const isPesuEventsHost = /(?:^|\.)events\.pes\.edu$/i.test(
+    (() => {
+      try {
+        return new URL(finalUrl).hostname;
+      } catch {
+        return '';
+      }
+    })()
+  );
+
+  if (isPesuEventsHost) {
+    const pesDetail = parsePesuEventDetailHtml(html, finalUrl);
+    if (pesDetail.title) {
+      return {
+        title: pesDetail.title,
+        organizer: pesDetail.organizer ?? 'PES University',
+        description: pesDetail.description ?? ogDescription ?? null,
+        startAt: pesDetail.startAt,
+        endAt: pesDetail.endAt,
+        registrationDeadline: pesDetail.registrationDeadline,
+        campus: pesDetail.campus,
+        venueName: pesDetail.venueName,
+        eventType: pesDetail.eventType,
+        themes: pesDetail.themes,
+        format: pesDetail.format,
+        canonicalUrl: pesDetail.canonicalUrl,
+        verifiedCanonicalUrl: pesDetail.canonicalUrl,
+        minTeamSize: pesDetail.minTeamSize,
+        maxTeamSize: pesDetail.maxTeamSize,
+        teamSizeExcerpt: pesDetail.extractedEvidenceQuote,
+        visibleTextExcerpt: visibleText.slice(0, 3500),
+        hasJsonLdEvent: Boolean(eventJsonLd),
+        registrationUrl: pesDetail.registrationUrl,
+      };
+    }
+  }
+
   const detTextFields = parseDeterministicEventText(visibleText, finalUrl);
+  const fallbackRange =
+    !detTextFields.startAt
+      ? parseDateRangeFromText(visibleText)
+      : { startAt: detTextFields.startAt, endAt: detTextFields.endAt };
 
   const resolvedCanonical = canonicalUrlRaw
     ? new URL(canonicalUrlRaw, finalUrl).toString()
@@ -1543,10 +1629,12 @@ function parseHtmlEventMetadataDeterministically(html: string, finalUrl: string)
     startAt:
       (eventJsonLd?.startDate as string | undefined) ??
       detTextFields.startAt ??
+      fallbackRange.startAt ??
       null,
     endAt:
       (eventJsonLd?.endDate as string | undefined) ??
       detTextFields.endAt ??
+      fallbackRange.endAt ??
       null,
     registrationDeadline: detTextFields.registrationDeadline,
     campus: detTextFields.campus,
@@ -1561,6 +1649,7 @@ function parseHtmlEventMetadataDeterministically(html: string, finalUrl: string)
     teamSizeExcerpt: detTextFields.extractedTextEvidence,
     visibleTextExcerpt: visibleText.slice(0, 3500),
     hasJsonLdEvent: Boolean(eventJsonLd),
+    registrationUrl: detTextFields.registrationUrl ?? resolvedCanonical,
   };
 }
 
@@ -1827,7 +1916,8 @@ ${det.visibleTextExcerpt}`,
     minTeamSize: aiSupplement?.minTeamSize ?? det.minTeamSize ?? null,
     maxTeamSize: aiSupplement?.maxTeamSize ?? det.maxTeamSize ?? null,
     eligibilityNotes: aiSupplement?.eligibilityNotes ?? null,
-    registrationUrl: aiSupplement?.registrationUrl ?? resolvedCanonical,
+    registrationUrl:
+      aiSupplement?.registrationUrl ?? det.registrationUrl ?? resolvedCanonical,
     officialSourceUrl: resolvedCanonical,
     extractedTextEvidence:
       aiSupplement?.extractedTextEvidence ??
@@ -2209,7 +2299,9 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
     if (idx > 0) {
       const k = pair.slice(0, idx).trim();
       const v = decodeURIComponent(pair.slice(idx + 1).trim());
-      result[k] = v;
+      if (!(k in result)) {
+        result[k] = v;
+      }
     }
   }
   return result;
@@ -2227,9 +2319,14 @@ function isHttpsRequest(req: express.Request): boolean {
   );
 }
 
+/**
+ * Builds cookie attributes for `quackathon_sid` and `quackathon_oauth_token`.
+ * Intentionally omits `Partitioned` so that cookies set inside the AI Studio preview
+ * are not isolated in an iframe-only CHIPS partition separate from top-level OAuth popups.
+ */
 function buildSessionCookieFlags(req: express.Request, maxAgeSeconds = 3600): string {
   return isHttpsRequest(req)
-    ? `Path=/; HttpOnly; SameSite=None; Secure; Partitioned; Max-Age=${maxAgeSeconds}`
+    ? `Path=/; HttpOnly; SameSite=None; Secure; Max-Age=${maxAgeSeconds}`
     : `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
 }
 
@@ -2255,6 +2352,12 @@ function logOAuthStructuredEvent(params: {
   callbackOutcome: string;
   httpStatus: number;
   durationMs: number;
+  initiatingOrigin?: string | null;
+  configuredCallbackOrigin?: string | null;
+  initiationCookieStatus?: 'existing' | 'new' | null;
+  callbackCookieStatus?: 'valid' | 'missing' | 'invalid_signature' | null;
+  sessionBindingMatched?: boolean | null;
+  handledByDifferentInstance?: boolean;
   note?: string;
 }): void {
   const entry = {
@@ -2268,30 +2371,34 @@ function logOAuthStructuredEvent(params: {
     callbackOutcome: params.callbackOutcome,
     httpStatus: params.httpStatus,
     durationMs: params.durationMs,
+    ...(params.initiatingOrigin !== undefined
+      ? { initiatingOrigin: params.initiatingOrigin }
+      : {}),
+    ...(params.configuredCallbackOrigin !== undefined
+      ? { configuredCallbackOrigin: params.configuredCallbackOrigin }
+      : {}),
+    ...(params.initiationCookieStatus !== undefined
+      ? { initiationCookieStatus: params.initiationCookieStatus }
+      : {}),
+    ...(params.callbackCookieStatus !== undefined
+      ? { callbackCookieStatus: params.callbackCookieStatus }
+      : {}),
+    ...(params.sessionBindingMatched !== undefined
+      ? { sessionBindingMatched: params.sessionBindingMatched }
+      : {}),
+    ...(params.handledByDifferentInstance !== undefined
+      ? { handledByDifferentInstance: params.handledByDifferentInstance }
+      : {}),
     ...(params.note ? { note: params.note } : {}),
   };
   console.info(`[PESU OAuth Diagnostic] ${JSON.stringify(entry)}`);
 }
 
-function getOrCreateSession(req: express.Request, res: express.Response): StoredAuthSession {
-  pruneExpiredOAuthStores();
-  const cookies = parseCookies(req.headers.cookie);
-  let sessionId = verifySignedSessionCookie(cookies[SESSION_COOKIE_NAME]);
-
-  if (!sessionId) {
-    sessionId = crypto.randomBytes(18).toString('base64url');
-    const signed = signSessionId(sessionId);
-    const cookieFlags = buildSessionCookieFlags(req, 3600);
-    res.append(
-      'Set-Cookie',
-      `${SESSION_COOKIE_NAME}=${encodeURIComponent(signed)}; ${cookieFlags}`
-    );
-  }
-
+function ensureStoredAuthSession(sessionId: string): StoredAuthSession {
+  const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
+  const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
   let session = serverAuthSessions.get(sessionId);
   if (!session) {
-    const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
-    const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
     session = {
       sessionId,
       stages: {
@@ -2314,8 +2421,6 @@ function getOrCreateSession(req: express.Request, res: express.Response): Stored
     };
     serverAuthSessions.set(sessionId, session);
   } else {
-    const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
-    const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
     session.stages.configuration = hasClientId
       ? hasClientSecret
         ? 'configured'
@@ -2323,17 +2428,87 @@ function getOrCreateSession(req: express.Request, res: express.Response): Stored
       : 'missing_client_id';
     session.updatedAt = Date.now();
   }
-
   return session;
 }
 
+function getOrCreateSessionWithDiagnostics(
+  req: express.Request,
+  res: express.Response
+): {
+  session: StoredAuthSession;
+  initiationCookieStatus: 'existing' | 'new';
+  cookieInspection: SessionCookieInspection;
+} {
+  pruneExpiredOAuthStores();
+  const cookieInspection = inspectSessionCookieHeader(
+    req.headers.cookie,
+    SESSION_COOKIE_NAME
+  );
+  let sessionId = cookieInspection.primarySessionId;
+  const initiationCookieStatus: 'existing' | 'new' = sessionId ? 'existing' : 'new';
+
+  if (!sessionId) {
+    sessionId = crypto.randomBytes(18).toString('base64url');
+  }
+
+  // Always set/refresh the unpartitioned session cookie so top-level popups and
+  // redirects share the exact same `quackathon_sid` value.
+  const signed = signSessionId(sessionId);
+  const cookieFlags = buildSessionCookieFlags(req, 3600);
+  res.append(
+    'Set-Cookie',
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(signed)}; ${cookieFlags}`
+  );
+
+  // If the browser sent multiple quackathon_sid cookies (e.g. a legacy Partitioned
+  // cookie alongside a top-level cookie), explicitly expire the legacy Partitioned cookie.
+  if (cookieInspection.rawCount > 1 && isHttpsRequest(req)) {
+    res.append(
+      'Set-Cookie',
+      `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=None; Secure; Partitioned; Max-Age=0`
+    );
+  }
+
+  const session = ensureStoredAuthSession(sessionId);
+  return { session, initiationCookieStatus, cookieInspection };
+}
+
+function getOrCreateSession(req: express.Request, res: express.Response): StoredAuthSession {
+  return getOrCreateSessionWithDiagnostics(req, res).session;
+}
+
+function isLocalTestEphemeralRequest(req: express.Request): boolean {
+  const forwardedHost = req.headers['x-forwarded-host'];
+  if (forwardedHost) return false;
+  const host = (req.get('host') || '').toLowerCase();
+  const isLoopback =
+    host.startsWith('127.0.0.1:') || host.startsWith('localhost:');
+  if (!isLoopback) return false;
+  const portPart = host.split(':')[1] || '';
+  return Boolean(portPart && portPart !== String(PORT));
+}
+
 function resolveTrustedAppOrigin(req: express.Request): string {
+  const configuredRedirect = process.env.PESU_OAUTH_REDIRECT_URI?.trim();
+  if (configuredRedirect && isValidHttpUrl(configuredRedirect)) {
+    try {
+      return new URL(configuredRedirect).origin;
+    } catch {
+      // fall through
+    }
+  }
   if (
     process.env.APP_URL &&
     process.env.APP_URL !== 'MY_APP_URL' &&
-    process.env.APP_URL.trim().startsWith('http')
+    process.env.APP_URL.trim().startsWith('http') &&
+    (!isLocalTestEphemeralRequest(req) ||
+      process.env.QUACKATHON_ENFORCE_APP_URL_IN_TEST === 'true')
   ) {
-    return process.env.APP_URL.trim().replace(/\/$/, '');
+    try {
+      return new URL(process.env.APP_URL.trim()).origin;
+    } catch {
+      return process.env.APP_URL.trim().replace(/\/$/, '');
+    }
   }
   const proto =
     (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim() ||
@@ -2344,6 +2519,22 @@ function resolveTrustedAppOrigin(req: express.Request): string {
 }
 
 function resolveInitiatingClientOrigin(req: express.Request): string {
+  const explicitHeaderOrigin = req.headers['x-client-origin'];
+  if (typeof explicitHeaderOrigin === 'string' && isValidHttpUrl(explicitHeaderOrigin)) {
+    try {
+      return new URL(explicitHeaderOrigin.trim()).origin;
+    } catch {
+      // fall through
+    }
+  }
+  const explicitQueryOrigin = req.query?.client_origin;
+  if (typeof explicitQueryOrigin === 'string' && isValidHttpUrl(explicitQueryOrigin)) {
+    try {
+      return new URL(explicitQueryOrigin.trim()).origin;
+    } catch {
+      // fall through
+    }
+  }
   const originHeader = req.headers.origin;
   if (typeof originHeader === 'string' && isValidHttpUrl(originHeader)) {
     try {
@@ -2362,7 +2553,10 @@ function resolveInitiatingClientOrigin(req: express.Request): string {
       // fall through
     }
   }
-  const host = req.get('host');
+  const forwardedHost = (req.headers['x-forwarded-host'] as string | undefined)
+    ?.split(',')[0]
+    ?.trim();
+  const host = forwardedHost || req.get('host');
   if (host) {
     const proto =
       (req.headers['x-forwarded-proto'] as string | undefined)
@@ -2453,38 +2647,29 @@ export function resolveAndValidatePesuIssuerUrl(req?: express.Request): {
 function getAllowedRedirectUris(req: express.Request): {
   expectedRedirectUri: string;
   allowedRedirectUris: string[];
+  configuredCallbackOrigin: string;
+  canonicalAppOrigin: string;
 } {
-  const origin = resolveTrustedAppOrigin(req);
-  const defaultCallback = `${origin}/auth/pesu/callback`;
   const configuredRedirect = process.env.PESU_OAUTH_REDIRECT_URI?.trim();
-  const issuerResolution = resolveAndValidatePesuIssuerUrl(req);
+  if (configuredRedirect && isValidHttpUrl(configuredRedirect)) {
+    const normalizedRedirect = configuredRedirect.replace(/\/+$/, '');
+    const callbackOrigin = new URL(normalizedRedirect).origin;
+    return {
+      expectedRedirectUri: normalizedRedirect,
+      allowedRedirectUris: [normalizedRedirect],
+      configuredCallbackOrigin: callbackOrigin,
+      canonicalAppOrigin: callbackOrigin,
+    };
+  }
 
-  const reqProto =
-    (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim() ||
-    req.protocol ||
-    'http';
-  const reqHost = req.get('host');
-  const reqOriginCallback = reqHost
-    ? `${reqProto}://${reqHost}/auth/pesu/callback`
-    : undefined;
-
-  const allowed = Array.from(
-    new Set(
-      [
-        configuredRedirect,
-        issuerResolution.misconfiguredCallbackUrl ?? undefined,
-        defaultCallback,
-        reqOriginCallback,
-        `http://localhost:${PORT}/auth/pesu/callback`,
-        `http://127.0.0.1:${PORT}/auth/pesu/callback`,
-      ].filter((u): u is string => Boolean(u && u.length > 0))
-    )
-  );
+  const canonicalOrigin = resolveTrustedAppOrigin(req);
+  const expectedRedirectUri = `${canonicalOrigin}/auth/pesu/callback`;
 
   return {
-    expectedRedirectUri:
-      configuredRedirect || issuerResolution.misconfiguredCallbackUrl || defaultCallback,
-    allowedRedirectUris: allowed,
+    expectedRedirectUri,
+    allowedRedirectUris: [expectedRedirectUri],
+    configuredCallbackOrigin: canonicalOrigin,
+    canonicalAppOrigin: canonicalOrigin,
   };
 }
 
@@ -2906,20 +3091,86 @@ async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
   }
 }
 
+async function checkProviderRedirectUriRegistration(params: {
+  authorizationEndpoint: string | null;
+  clientId: string | undefined;
+  redirectUri: string;
+}): Promise<boolean | null> {
+  if (
+    !params.authorizationEndpoint ||
+    !params.clientId ||
+    process.env.QUACKATHON_TEST_MODE === 'true' ||
+    Boolean(testOverrides.fetchImpl) ||
+    Boolean(testOverrides.fetchFn)
+  ) {
+    return null;
+  }
+  try {
+    const probeUrl = new URL(params.authorizationEndpoint);
+    probeUrl.searchParams.set('response_type', 'code');
+    probeUrl.searchParams.set('client_id', params.clientId);
+    probeUrl.searchParams.set('redirect_uri', params.redirectUri);
+    probeUrl.searchParams.set('scope', 'openid profile');
+    probeUrl.searchParams.set('state', 'probe_redirect_uri_check');
+    probeUrl.searchParams.set(
+      'code_challenge',
+      'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM'
+    );
+    probeUrl.searchParams.set('code_challenge_method', 'S256');
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const resp = await fetch(probeUrl.toString(), {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if ([301, 302, 303, 307, 308].includes(resp.status)) {
+        return true;
+      }
+      const body = await resp.text();
+      if (body.includes('Redirect URI is not registered')) {
+        return false;
+      }
+      return true;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
 app.get('/api/pesu-oauth/discovery', async (req, res) => {
   const startTime = Date.now();
   const session = getOrCreateSession(req, res);
   const { expectedRedirectUri, allowedRedirectUris } = getAllowedRedirectUris(req);
-  const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
+  const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
+  const hasClientId = Boolean(clientId);
   const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
 
   const disc = await discoverPesuOidcEndpoints(req);
+  const providerRedirectUriRegistered = await checkProviderRedirectUriRegistration({
+    authorizationEndpoint: disc.authorizationEndpoint,
+    clientId,
+    redirectUri: expectedRedirectUri,
+  });
+  const portalManageUrl =
+    clientId && disc.issuer
+      ? `${disc.issuer.replace(/\/+$/, '')}/portal/${encodeURIComponent(clientId)}`
+      : `${CANONICAL_PESU_OAUTH_ISSUER}/portal`;
+
   session.stages.providerDiscovery = disc.oidcDiscoveryAvailable
     ? 'ok'
     : disc.errorCategory === 'INVALID_DISCOVERY_HTML' ||
       disc.errorCategory === 'INVALID_DISCOVERY_METADATA'
     ? 'invalid_response'
     : 'unreachable';
+
+  if (providerRedirectUriRegistered === false) {
+    session.stages.redirectUriValidation = 'mismatch';
+  }
 
   const statusToReturn = disc.oidcDiscoveryAvailable
     ? 200
@@ -2958,12 +3209,18 @@ app.get('/api/pesu-oauth/discovery', async (req, res) => {
     supportedScopes: disc.supportedScopes,
     clientConfigured: hasClientId,
     clientSecretConfigured: hasClientSecret,
+    publicClientId: clientId ?? null,
+    portalManageUrl,
+    providerRedirectUriRegistered,
     expectedRedirectUri,
     allowedRedirectUris,
     stages: session.stages,
-    userMessage: disc.oidcDiscoveryAvailable
-      ? `Discovered valid OIDC metadata from ${disc.issuer} (HTTP ${disc.httpStatus}, Content-Type: ${disc.contentType}).`
-      : disc.note || `PESU OAuth2 OIDC discovery failed (${disc.requestedUrl}).`,
+    userMessage:
+      providerRedirectUriRegistered === false
+        ? `Redirect URI "${expectedRedirectUri}" is not registered on ${disc.issuer} for client "${clientId}". Add "${expectedRedirectUri}" in ${portalManageUrl}, click "+ Add", and then click "Save Changes".`
+        : disc.oidcDiscoveryAvailable
+        ? `Discovered valid OIDC metadata from ${disc.issuer} (HTTP ${disc.httpStatus}, Content-Type: ${disc.contentType}).`
+        : disc.note || `PESU OAuth2 OIDC discovery failed (${disc.requestedUrl}).`,
     note: disc.note,
     configWarning: disc.configWarning,
     diagnosticSnippet: disc.diagnosticSnippet,
@@ -2975,7 +3232,8 @@ app.get('/api/pesu-oauth/discovery', async (req, res) => {
 });
 
 app.get('/api/pesu-oauth/session', async (req, res) => {
-  const session = getOrCreateSession(req, res);
+  const { session } = getOrCreateSessionWithDiagnostics(req, res);
+  const { canonicalAppOrigin, configuredCallbackOrigin } = getAllowedRedirectUris(req);
   let dbUser = session.dbUser ?? null;
   let dbProfile = session.dbProfile ?? null;
   let identity = session.identity;
@@ -3030,6 +3288,8 @@ app.get('/api/pesu-oauth/session', async (req, res) => {
     profile: dbProfile,
     lastError: session.lastError,
     lastDiagnostics: session.lastDiagnostics,
+    canonicalAppOrigin,
+    configuredCallbackOrigin,
   };
   res.json(resp);
 });
@@ -3066,30 +3326,114 @@ app.post('/api/pesu-oauth/logout', async (req, res) => {
 
 app.get('/api/pesu-oauth/url', async (req, res) => {
   const startTime = Date.now();
-  const session = getOrCreateSession(req, res);
+  const requestId = createRequestId('oauth_url');
+  const { session, initiationCookieStatus } = getOrCreateSessionWithDiagnostics(
+    req,
+    res
+  );
   const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
-  const { expectedRedirectUri, allowedRedirectUris } = getAllowedRedirectUris(req);
+  const {
+    expectedRedirectUri,
+    allowedRedirectUris,
+    configuredCallbackOrigin,
+    canonicalAppOrigin,
+  } = getAllowedRedirectUris(req);
+  const initiatingOrigin = resolveInitiatingClientOrigin(req);
+  const sessionFp = createSafeFingerprint(session.sessionId);
 
   const requestedRedirectUri =
     typeof req.query.redirect_uri === 'string' && req.query.redirect_uri.trim()
       ? req.query.redirect_uri.trim()
       : expectedRedirectUri;
 
-  // Validate redirect_uri against registered/allowed callback URLs
-  if (!allowedRedirectUris.includes(requestedRedirectUri)) {
+  // 1. Prevent OAuth initiation from one preview origin and callback completion on another
+  if (initiatingOrigin.toLowerCase() !== configuredCallbackOrigin.toLowerCase()) {
     session.stages.redirectUriValidation = 'mismatch';
+    const durationMs = Date.now() - startTime;
     const diag: DeveloperDiagnosticTelemetry = {
       serviceName: 'pesu_oauth2',
       httpStatus: 400,
       errorCategory: 'OAUTH_REDIRECT_URI_MISMATCH',
       retryAttempts: 0,
-      durationMs: Date.now() - startTime,
+      durationMs,
+      requestId,
+      timestamp: new Date().toISOString(),
+      stateFingerprint: null,
+      sessionFingerprint: sessionFp,
+      transactionStatus: 'not_found',
+      callbackOutcome: 'rejected_origin_mismatch',
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
+    };
+    session.lastDiagnostics = diag;
+
+    logOAuthStructuredEvent({
+      requestId,
+      event: 'oauth_url_rejected_origin_mismatch',
+      stateFingerprint: null,
+      sessionFingerprint: sessionFp,
+      transactionStatus: 'not_found',
+      callbackOutcome: 'rejected_origin_mismatch',
+      httpStatus: 400,
+      durationMs,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
+    });
+
+    const resp: PesuOAuthUrlResponse = {
+      ok: false,
+      live: true,
+      redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      stages: session.stages,
+      userMessage: `Origin mismatch: OAuth sign-in was initiated from "${initiatingOrigin}", but the registered callback origin is "${configuredCallbackOrigin}". Please open ${canonicalAppOrigin} directly so your browser session cookie and callback share the same origin.`,
+      errorCategory: 'OAUTH_REDIRECT_URI_MISMATCH',
+      diagnostics: diag,
+    };
+    res.status(400).json(resp);
+    return;
+  }
+
+  // 2. Validate exact redirect_uri against registered canonical callback URL
+  if (!allowedRedirectUris.includes(requestedRedirectUri)) {
+    session.stages.redirectUriValidation = 'mismatch';
+    const durationMs = Date.now() - startTime;
+    const diag: DeveloperDiagnosticTelemetry = {
+      serviceName: 'pesu_oauth2',
+      httpStatus: 400,
+      errorCategory: 'OAUTH_REDIRECT_URI_MISMATCH',
+      retryAttempts: 0,
+      durationMs,
+      requestId,
+      timestamp: new Date().toISOString(),
+      stateFingerprint: null,
+      sessionFingerprint: sessionFp,
+      transactionStatus: 'not_found',
+      callbackOutcome: 'rejected_redirect_uri_mismatch',
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
     };
     session.lastDiagnostics = diag;
     const resp: PesuOAuthUrlResponse = {
       ok: false,
       live: true,
       redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
       stages: session.stages,
       userMessage: `Redirect URI mismatch: "${requestedRedirectUri}" does not match the registered callback URL (${expectedRedirectUri}).`,
       errorCategory: 'OAUTH_REDIRECT_URI_MISMATCH',
@@ -3142,12 +3486,24 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       errorCategory: disc.errorCategory,
       retryAttempts: 0,
       durationMs: Date.now() - startTime,
+      requestId,
+      timestamp: new Date().toISOString(),
+      sessionFingerprint: sessionFp,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
     };
     session.lastDiagnostics = diag;
     const resp: PesuOAuthUrlResponse = {
       ok: false,
       live: true,
       redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
       scopes: requestedScopes,
       scope: requestedScopes.join(' '),
       stages: session.stages,
@@ -3172,12 +3528,24 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       errorCategory: 'OAUTH_SCOPE_REJECTED',
       retryAttempts: 0,
       durationMs: Date.now() - startTime,
+      requestId,
+      timestamp: new Date().toISOString(),
+      sessionFingerprint: sessionFp,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
     };
     session.lastDiagnostics = diag;
     const resp: PesuOAuthUrlResponse = {
       ok: false,
       live: true,
       redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
       scopes: requestedScopes,
       scope: requestedScopes.join(' '),
       stages: session.stages,
@@ -3199,12 +3567,24 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       errorCategory: 'MISSING_CONFIG',
       retryAttempts: 0,
       durationMs: Date.now() - startTime,
+      requestId,
+      timestamp: new Date().toISOString(),
+      sessionFingerprint: sessionFp,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
     };
     session.lastDiagnostics = diag;
     const resp: PesuOAuthUrlResponse = {
       ok: false,
       live: true,
       redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
       scopes: requestedScopes,
       scope: requestedScopes.join(' '),
       stages: session.stages,
@@ -3218,7 +3598,6 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
   }
 
   // Generate PKCE S256 code_verifier, code_challenge, and cryptographic state
-  const requestId = createRequestId('oauth_url');
   const codeVerifier = crypto.randomBytes(32).toString('base64url');
   const codeChallenge = crypto
     .createHash('sha256')
@@ -3226,9 +3605,7 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     .digest('base64url');
   const state = crypto.randomBytes(24).toString('base64url');
   const normalizedScopeStr = requestedScopes.join(' ');
-  const clientOrigin = resolveInitiatingClientOrigin(req);
   const stateFp = createSafeFingerprint(state);
-  const sessionFp = createSafeFingerprint(session.sessionId);
 
   // Persist OAuth authorization transaction in PostgreSQL so it survives server
   // restarts and callbacks handled by any backend instance.
@@ -3237,7 +3614,7 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     sessionId: session.sessionId,
     codeVerifier,
     redirectUri: requestedRedirectUri,
-    clientOrigin,
+    clientOrigin: initiatingOrigin,
     scopes: requestedScopes,
     issuer: disc.issuer,
     authorizationEndpoint: disc.authorizationEndpoint,
@@ -3261,6 +3638,17 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
   });
 
   const authorizationUrl = `${disc.authorizationEndpoint}?${params.toString()}`;
+  const providerRedirectUriRegistered = await checkProviderRedirectUriRegistration({
+    authorizationEndpoint: disc.authorizationEndpoint,
+    clientId,
+    redirectUri: requestedRedirectUri,
+  });
+  const portalManageUrl = disc.issuer
+    ? `${disc.issuer.replace(/\/+$/, '')}/portal/${encodeURIComponent(clientId)}`
+    : `${CANONICAL_PESU_OAUTH_ISSUER}/portal/${encodeURIComponent(clientId)}`;
+  if (providerRedirectUriRegistered === false) {
+    session.stages.redirectUriValidation = 'mismatch';
+  }
   const durationMs = Date.now() - startTime;
   const diag: DeveloperDiagnosticTelemetry = {
     serviceName: 'pesu_oauth2',
@@ -3273,7 +3661,15 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     stateFingerprint: stateFp,
     sessionFingerprint: sessionFp,
     transactionStatus: 'pending',
-    callbackOutcome: 'authorization_url_issued',
+    callbackOutcome:
+      providerRedirectUriRegistered === false
+        ? 'provider_redirect_uri_unregistered'
+        : 'authorization_url_issued',
+    initiatingOrigin,
+    configuredCallbackOrigin,
+    initiationCookieStatus,
+    sessionBindingMatched: null,
+    handledByDifferentInstance: false,
   };
   session.lastDiagnostics = diag;
 
@@ -3283,9 +3679,17 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     stateFingerprint: stateFp,
     sessionFingerprint: sessionFp,
     transactionStatus: 'pending',
-    callbackOutcome: 'authorization_url_issued',
+    callbackOutcome:
+      providerRedirectUriRegistered === false
+        ? 'provider_redirect_uri_unregistered'
+        : 'authorization_url_issued',
     httpStatus: 200,
     durationMs,
+    initiatingOrigin,
+    configuredCallbackOrigin,
+    initiationCookieStatus,
+    sessionBindingMatched: null,
+    handledByDifferentInstance: false,
   });
 
   const resp: PesuOAuthUrlResponse = {
@@ -3295,12 +3699,21 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     authUrl: authorizationUrl,
     state,
     redirectUri: requestedRedirectUri,
+    canonicalAppOrigin,
+    initiatingOrigin,
+    configuredCallbackOrigin,
+    initiationCookieStatus,
+    publicClientId: clientId,
+    portalManageUrl,
+    providerRedirectUriRegistered,
     scope: normalizedScopeStr,
     scopes: requestedScopes,
     codeChallengeMethod: 'S256',
     stages: session.stages,
     userMessage:
-      'Generated PKCE S256 authorization URL. Waiting for user consent and token exchange.',
+      providerRedirectUriRegistered === false
+        ? `Redirect URI "${requestedRedirectUri}" is not registered on ${disc.issuer} for client "${clientId}". Add "${requestedRedirectUri}" in ${portalManageUrl}, click "+ Add", and then click "Save Changes".`
+        : 'Generated PKCE S256 authorization URL. Waiting for user consent and token exchange.',
     diagnostics: diag,
   };
 
@@ -3379,57 +3792,92 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
   const requestId = createRequestId('oauth_cb');
   pruneExpiredOAuthStores();
 
-  // Inspect incoming cookies BEFORE getOrCreateSession mints a new sessionId
-  const incomingCookies = parseCookies(req.headers.cookie);
-  const incomingVerifiedSid = verifySignedSessionCookie(
-    incomingCookies[SESSION_COOKIE_NAME]
+  const { configuredCallbackOrigin } = getAllowedRedirectUris(req);
+
+  // Inspect incoming cookies WITHOUT minting a new `quackathon_sid` cookie before validation
+  const cookieInspection = inspectSessionCookieHeader(
+    req.headers.cookie,
+    SESSION_COOKIE_NAME
   );
+  const incomingVerifiedSid = cookieInspection.primarySessionId;
+  const callbackCookieStatus = cookieInspection.cookieStatus;
+  const hadLocalSession = cookieInspection.verifiedSessionIds.some((sid) =>
+    serverAuthSessions.has(sid)
+  );
+  const handledByDifferentInstance = !hadLocalSession;
+
+  const incomingCookies = parseCookies(req.headers.cookie);
   const incomingOAuthToken = incomingCookies[OAUTH_SESSION_COOKIE];
   const existingAuthSession = incomingOAuthToken
     ? await getValidOAuthSessionRecord(incomingOAuthToken).catch(() => null)
     : null;
 
-  const session = getOrCreateSession(req, res);
+  // Create/attach in-memory session state only if the browser presented a valid session cookie,
+  // or create a transient non-cookie-setting holder for error stage reporting.
+  const hasClientId = Boolean(process.env.PESU_OAUTH_CLIENT_ID?.trim());
+  const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
+  const transientStages: PesuOAuthStageStatuses = {
+    providerDiscovery: 'ok',
+    configuration: hasClientId
+      ? hasClientSecret
+        ? 'configured'
+        : 'public_client_only'
+      : 'missing_client_id',
+    redirectUriValidation: 'valid',
+    authorizationRedirect: 'idle',
+    tokenExchange: 'idle',
+    verifiedIdentity: 'unverified',
+  };
+
   const { code, state, error, error_description } = req.query as Record<
     string,
     string | undefined
   >;
 
   const stateFp = createSafeFingerprint(state);
-  const sessionFp = createSafeFingerprint(
-    incomingVerifiedSid ?? session.sessionId
-  );
+  const sessionFp = createSafeFingerprint(incomingVerifiedSid);
 
   // Case 1: Provider returned an OAuth error (e.g., access_denied, testing mode restriction)
   if (error) {
-    let trustedOrigin = resolveTrustedAppOrigin(req);
+    let trustedOrigin = configuredCallbackOrigin;
+    let sessionBindingMatched = false;
     if (state) {
       const claimed = await claimOrInspectOAuthTransactionRecord({
         state,
         incomingSessionId: incomingVerifiedSid,
+        candidateSessionIds: cookieInspection.verifiedSessionIds,
+        callbackCookieStatus,
       }).catch(() => null);
-      if (claimed?.transaction?.clientOrigin) {
-        trustedOrigin = claimed.transaction.clientOrigin;
+      if (claimed?.transactionMeta?.clientOrigin) {
+        trustedOrigin = claimed.transactionMeta.clientOrigin;
       }
-      await completeOAuthTransactionRecord({
-        state,
-        status: 'failed',
-        outcomeStatus: 400,
-        outcomeErrorCategory: 'OAUTH_CONSENT_ERROR',
-        outcomeMessage: `OAuth provider returned "${error}".`,
-      }).catch(() => {});
+      sessionBindingMatched = Boolean(claimed?.sessionBindingMatched);
+      if (sessionBindingMatched) {
+        await completeOAuthTransactionRecord({
+          state,
+          status: 'failed',
+          outcomeStatus: 400,
+          outcomeErrorCategory: 'OAUTH_CONSENT_ERROR',
+          outcomeMessage: `OAuth provider returned "${error}".`,
+        }).catch(() => {});
+      }
     }
 
-    session.stages.authorizationRedirect = 'consent_denied_or_error';
-    session.stages.tokenExchange = 'idle';
-    session.stages.verifiedIdentity = 'unverified';
+    const activeSession = incomingVerifiedSid
+      ? ensureStoredAuthSession(incomingVerifiedSid)
+      : null;
+    const stages = activeSession ? activeSession.stages : transientStages;
+
+    stages.authorizationRedirect = 'consent_denied_or_error';
+    stages.tokenExchange = 'idle';
+    stages.verifiedIdentity = 'unverified';
     const userMsg =
       error === 'access_denied'
         ? 'Authorization was declined or restricted (e.g., testing-mode user restriction).'
         : `OAuth provider returned "${error}"${
             error_description ? `: ${error_description}` : ''
           }.`;
-    session.lastError = userMsg;
+    if (activeSession) activeSession.lastError = userMsg;
 
     const durationMs = Date.now() - startTime;
     const diag: DeveloperDiagnosticTelemetry = {
@@ -3444,8 +3892,13 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       sessionFingerprint: sessionFp,
       transactionStatus: 'failed',
       callbackOutcome: 'provider_consent_error',
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched,
+      handledByDifferentInstance,
     };
-    session.lastDiagnostics = diag;
+    if (activeSession) activeSession.lastDiagnostics = diag;
 
     logOAuthStructuredEvent({
       requestId,
@@ -3456,6 +3909,11 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       callbackOutcome: 'provider_consent_error',
       httpStatus: 400,
       durationMs,
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched,
+      handledByDifferentInstance,
       note: error,
     });
 
@@ -3464,7 +3922,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       status: 'error',
       ok: false,
       state: state ?? '',
-      stages: session.stages,
+      stages,
       identity: null,
       userMessage: userMsg,
       error: userMsg,
@@ -3483,21 +3941,34 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         state,
         code: code ?? null,
         incomingSessionId: incomingVerifiedSid,
+        candidateSessionIds: cookieInspection.verifiedSessionIds,
+        callbackCookieStatus,
         authenticatedUid: existingAuthSession?.uid ?? null,
       })
     : {
         status: 'invalid' as const,
         transactionStatus: 'not_found' as const,
+        sessionBindingMatched: false,
+        matchedSessionId: null,
         transaction: null,
+        transactionMeta: null,
       };
 
   const trustedOrigin =
-    txLookup.transaction?.clientOrigin || resolveTrustedAppOrigin(req);
+    txLookup.transaction?.clientOrigin ||
+    txLookup.transactionMeta?.clientOrigin ||
+    configuredCallbackOrigin;
+  const resolvedMatchedSid = txLookup.matchedSessionId ?? incomingVerifiedSid;
+  const effectiveSessionFp = createSafeFingerprint(resolvedMatchedSid);
 
   // Case 2: Concurrent duplicate callback arrived while first callback is still in 'processing'
   if (state && code && txLookup.status === 'processing') {
     const waitedOutcome = await waitForOAuthTransactionCompletion(state, 4500);
     const durationMs = Date.now() - startTime;
+    const session = resolvedMatchedSid
+      ? ensureStoredAuthSession(resolvedMatchedSid)
+      : null;
+    const stages = session ? session.stages : transientStages;
 
     if (waitedOutcome && waitedOutcome.status === 'completed') {
       const userRecord = waitedOutcome.completedUid
@@ -3505,13 +3976,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
             () => null
           )
         : null;
-      session.stages.authorizationRedirect = 'callback_received';
-      session.stages.tokenExchange = 'succeeded';
-      session.stages.verifiedIdentity = 'verified';
-      session.dbUser = userRecord?.user ?? null;
-      session.dbProfile = userRecord?.profile ?? null;
-      session.identity =
+      stages.authorizationRedirect = 'callback_received';
+      stages.tokenExchange = 'succeeded';
+      stages.verifiedIdentity = 'verified';
+      const identity =
         (waitedOutcome.outcomeIdentity as PesuVerifiedIdentity | null) ?? null;
+      if (session) {
+        session.dbUser = userRecord?.user ?? null;
+        session.dbProfile = userRecord?.profile ?? null;
+        session.identity = identity;
+      }
 
       const diag: DeveloperDiagnosticTelemetry = {
         serviceName: 'pesu_oauth2',
@@ -3522,21 +3996,31 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         requestId,
         timestamp: new Date().toISOString(),
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'completed',
         callbackOutcome: 'duplicate_inflight_joined',
+        initiatingOrigin: trustedOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: txLookup.sessionBindingMatched,
+        handledByDifferentInstance,
       };
-      session.lastDiagnostics = diag;
+      if (session) session.lastDiagnostics = diag;
 
       logOAuthStructuredEvent({
         requestId,
         event: 'oauth_callback_duplicate_inflight_joined',
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'completed',
         callbackOutcome: 'duplicate_inflight_joined',
         httpStatus: 200,
         durationMs,
+        initiatingOrigin: trustedOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: txLookup.sessionBindingMatched,
+        handledByDifferentInstance,
       });
 
       const payload: PesuOAuthCallbackPostMessage = {
@@ -3545,8 +4029,8 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         ok: true,
         state,
         duplicateCallback: true,
-        stages: session.stages,
-        identity: session.identity,
+        stages,
+        identity,
         user: userRecord?.user ?? null,
         profile: userRecord?.profile ?? null,
         userMessage:
@@ -3560,13 +4044,13 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     }
 
     if (waitedOutcome && waitedOutcome.status === 'failed') {
-      session.stages.authorizationRedirect = 'callback_received';
-      session.stages.tokenExchange = 'failed';
-      session.stages.verifiedIdentity = 'unverified';
+      stages.authorizationRedirect = 'callback_received';
+      stages.tokenExchange = 'failed';
+      stages.verifiedIdentity = 'unverified';
       const userMsg =
         waitedOutcome.outcomeMessage ||
         'Token exchange with PESU OAuth2 failed. Please start a fresh sign-in flow.';
-      session.lastError = userMsg;
+      if (session) session.lastError = userMsg;
 
       const statusToSend = waitedOutcome.outcomeStatus || 502;
       const diag: DeveloperDiagnosticTelemetry = {
@@ -3580,21 +4064,31 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         requestId,
         timestamp: new Date().toISOString(),
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
         callbackOutcome: 'duplicate_failed_reported',
+        initiatingOrigin: trustedOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: txLookup.sessionBindingMatched,
+        handledByDifferentInstance,
       };
-      session.lastDiagnostics = diag;
+      if (session) session.lastDiagnostics = diag;
 
       logOAuthStructuredEvent({
         requestId,
         event: 'oauth_callback_duplicate_failed',
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
         callbackOutcome: 'duplicate_failed_reported',
         httpStatus: statusToSend,
         durationMs,
+        initiatingOrigin: trustedOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: txLookup.sessionBindingMatched,
+        handledByDifferentInstance,
       });
 
       const payload: PesuOAuthCallbackPostMessage = {
@@ -3603,7 +4097,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         ok: false,
         state,
         duplicateCallback: true,
-        stages: session.stages,
+        stages,
         identity: null,
         userMessage: userMsg,
         error: userMsg,
@@ -3626,13 +4120,21 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       ? await getUserAndProfileByUid(completedUid).catch(() => null)
       : null;
 
-    session.stages.authorizationRedirect = 'callback_received';
-    session.stages.tokenExchange = 'succeeded';
-    session.stages.verifiedIdentity = 'verified';
-    session.dbUser = userRecord?.user ?? null;
-    session.dbProfile = userRecord?.profile ?? null;
-    session.identity =
+    const session = resolvedMatchedSid
+      ? ensureStoredAuthSession(resolvedMatchedSid)
+      : null;
+    const stages = session ? session.stages : transientStages;
+
+    stages.authorizationRedirect = 'callback_received';
+    stages.tokenExchange = 'succeeded';
+    stages.verifiedIdentity = 'verified';
+    const identity =
       (txLookup.outcome.outcomeIdentity as PesuVerifiedIdentity | null) ?? null;
+    if (session) {
+      session.dbUser = userRecord?.user ?? null;
+      session.dbProfile = userRecord?.profile ?? null;
+      session.identity = identity;
+    }
 
     const diag: DeveloperDiagnosticTelemetry = {
       serviceName: 'pesu_oauth2',
@@ -3643,21 +4145,31 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       timestamp: new Date().toISOString(),
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'completed',
       callbackOutcome: 'duplicate_completed_reused',
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: txLookup.sessionBindingMatched,
+      handledByDifferentInstance,
     };
-    session.lastDiagnostics = diag;
+    if (session) session.lastDiagnostics = diag;
 
     logOAuthStructuredEvent({
       requestId,
       event: 'oauth_callback_duplicate_completed_reused',
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'completed',
       callbackOutcome: 'duplicate_completed_reused',
       httpStatus: 200,
       durationMs,
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: txLookup.sessionBindingMatched,
+      handledByDifferentInstance,
     });
 
     const payload: PesuOAuthCallbackPostMessage = {
@@ -3666,8 +4178,8 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       ok: true,
       state,
       duplicateCallback: true,
-      stages: session.stages,
-      identity: session.identity,
+      stages,
+      identity,
       user: userRecord?.user ?? null,
       profile: userRecord?.profile ?? null,
       userMessage:
@@ -3682,15 +4194,24 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
 
   const tx = txLookup.status === 'claimed' ? txLookup.transaction : null;
 
-  // Case 4: Missing, expired, replayed, session-mismatched, or previously-failed state parameter or missing code
+  // Case 4: Missing, expired, replayed, session-missing, session-invalid, session-mismatched, or previously-failed state parameter or missing code
   if (!state || !tx || !code) {
-    session.stages.authorizationRedirect = 'consent_denied_or_error';
-    session.stages.tokenExchange = 'failed';
-    session.stages.verifiedIdentity = 'unverified';
+    const activeSession = incomingVerifiedSid
+      ? ensureStoredAuthSession(incomingVerifiedSid)
+      : null;
+    const stages = activeSession ? activeSession.stages : transientStages;
+
+    stages.authorizationRedirect = 'consent_denied_or_error';
+    stages.tokenExchange = 'failed';
+    stages.verifiedIdentity = 'unverified';
     const userMsg = !state
       ? 'Invalid or expired OAuth2 state parameter. Please start a fresh sign-in flow.'
       : txLookup.status === 'expired'
       ? 'Invalid or expired OAuth2 state parameter. Your 10-minute sign-in window expired; please start a fresh sign-in flow.'
+      : txLookup.status === 'session_missing'
+      ? `Invalid OAuth2 state parameter: no browser session cookie (${SESSION_COOKIE_NAME}) was sent with the callback. If you are inside an embedded preview that blocks cookies, use Full-Page Sign-In or open ${configuredCallbackOrigin} in a top-level tab.`
+      : txLookup.status === 'session_invalid'
+      ? 'Invalid OAuth2 state parameter: the browser session cookie signature is invalid. Please start a fresh sign-in flow.'
       : txLookup.status === 'session_mismatch'
       ? 'Invalid OAuth2 state parameter: this authorization request belongs to a different browser session. Please start a fresh sign-in flow.'
       : txLookup.status === 'failed_previously'
@@ -3702,11 +4223,15 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       : !tx
       ? 'Invalid or expired OAuth2 state parameter. Please start a fresh sign-in flow.'
       : 'Authorization callback did not include an authorization code.';
-    session.lastError = userMsg;
+    if (activeSession) activeSession.lastError = userMsg;
 
     const outcomeLabel =
       txLookup.status === 'expired'
         ? 'rejected_expired'
+        : txLookup.status === 'session_missing'
+        ? 'rejected_missing_session_cookie'
+        : txLookup.status === 'session_invalid'
+        ? 'rejected_invalid_session_cookie'
         : txLookup.status === 'session_mismatch'
         ? 'rejected_session_mismatch'
         : txLookup.status === 'failed_previously'
@@ -3716,7 +4241,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         : 'rejected_invalid_state';
 
     console.warn(
-      `[PESU OAuth Callback] Rejected callback: stateStatus=${txLookup.status}, outcome=${outcomeLabel}, hasCode=${Boolean(
+      `[PESU OAuth Callback] Rejected callback: stateStatus=${txLookup.status}, outcome=${outcomeLabel}, cookieStatus=${callbackCookieStatus}, sessionMatched=${txLookup.sessionBindingMatched}, hasCode=${Boolean(
         code
       )}`
     );
@@ -3731,21 +4256,31 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       timestamp: new Date().toISOString(),
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: txLookup.transactionStatus,
       callbackOutcome: outcomeLabel,
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: txLookup.sessionBindingMatched,
+      handledByDifferentInstance,
     };
-    session.lastDiagnostics = diag;
+    if (activeSession) activeSession.lastDiagnostics = diag;
 
     logOAuthStructuredEvent({
       requestId,
       event: 'oauth_callback_rejected',
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: txLookup.transactionStatus,
       callbackOutcome: outcomeLabel,
       httpStatus: 400,
       durationMs,
+      initiatingOrigin: trustedOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: txLookup.sessionBindingMatched,
+      handledByDifferentInstance,
     });
 
     const payload: PesuOAuthCallbackPostMessage = {
@@ -3753,7 +4288,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       status: 'error',
       ok: false,
       state: state ?? '',
-      stages: session.stages,
+      stages,
       identity: null,
       userMessage: userMsg,
       error: userMsg,
@@ -3765,8 +4300,20 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     return;
   }
 
-  // Correlate session with the current request session
-  const targetSession = session;
+  // Correlate session with the verified matched session ID
+  const verifiedSidForCallback =
+    resolvedMatchedSid ?? crypto.randomBytes(18).toString('base64url');
+  const targetSession = ensureStoredAuthSession(verifiedSidForCallback);
+  // Refresh the verified unpartitioned session cookie on successful claim
+  const signedSid = signSessionId(verifiedSidForCallback);
+  res.append(
+    'Set-Cookie',
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(signedSid)}; ${buildSessionCookieFlags(
+      req,
+      3600
+    )}`
+  );
+
   targetSession.stages.authorizationRedirect = 'callback_received';
   targetSession.stages.tokenExchange = 'exchanging';
 
@@ -3841,9 +4388,14 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         requestId,
         timestamp: new Date().toISOString(),
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
         callbackOutcome: 'token_exchange_failed',
+        initiatingOrigin: tx.clientOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: true,
+        handledByDifferentInstance,
       };
       targetSession.lastDiagnostics = diag;
 
@@ -3851,11 +4403,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         requestId,
         event: 'oauth_callback_token_exchange_failed',
         stateFingerprint: stateFp,
-        sessionFingerprint: sessionFp,
+        sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
         callbackOutcome: 'token_exchange_failed',
         httpStatus: tokenResp.status || 502,
         durationMs,
+        initiatingOrigin: tx.clientOrigin,
+        configuredCallbackOrigin,
+        callbackCookieStatus,
+        sessionBindingMatched: true,
+        handledByDifferentInstance,
         note: upstreamErr,
       });
 
@@ -4076,9 +4633,14 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       timestamp: new Date().toISOString(),
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'completed',
       callbackOutcome: 'token_exchanged_success',
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
     };
     targetSession.lastDiagnostics = diag;
 
@@ -4086,11 +4648,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       event: 'oauth_callback_succeeded',
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'completed',
       callbackOutcome: 'token_exchanged_success',
       httpStatus: 200,
       durationMs,
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
     });
 
     // Never include bearer session tokens or provider credentials in postMessage!
@@ -4134,9 +4701,14 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       timestamp: new Date().toISOString(),
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'failed',
       callbackOutcome: 'token_exchange_failed',
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
     };
     targetSession.lastDiagnostics = diag;
 
@@ -4144,11 +4716,16 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       requestId,
       event: 'oauth_callback_exception',
       stateFingerprint: stateFp,
-      sessionFingerprint: sessionFp,
+      sessionFingerprint: effectiveSessionFp,
       transactionStatus: 'failed',
       callbackOutcome: 'token_exchange_failed',
       httpStatus: 502,
       durationMs,
+      initiatingOrigin: tx.clientOrigin,
+      configuredCallbackOrigin,
+      callbackCookieStatus,
+      sessionBindingMatched: true,
+      handledByDifferentInstance,
       note: userMsg,
     });
 
@@ -4298,101 +4875,910 @@ app.post('/api/auth/logout', async (req: AuthenticatedRequest, res) => {
   }
 });
 
+// Per-user in-flight deduplication and short TTL cache for PESU Academy announcements
+const inFlightAnnouncementsByUid = new Map<
+  string,
+  Promise<{ status: number; payload: PesuAnnouncementsResponse }>
+>();
+const announcementsCacheByUid = new Map<
+  string,
+  { expiresAt: number; payload: PesuAnnouncementsResponse }
+>();
+const ANNOUNCEMENTS_CACHE_TTL_MS = 90 * 1000;
+
 /**
  * Consent-based PESU Academy announcement retrieval using server-stored OAuth token.
- * Never exposes Academy tokens to the frontend, and never generates fake announcements.
+ * - Parses `{ resource: "announcements", data: [...], fetched_at }` as well as legacy formats.
+ * - Never exposes Academy access tokens to the frontend.
+ * - Never reports missing scope, expired sessions, or provider failures as "0 announcements".
  */
-app.get('/api/pesu/announcements', requireAuth, async (req: AuthenticatedRequest, res) => {
-  try {
-    const authUser = req.user!;
-    const record = await getUserAndProfileByUid(authUser.uid);
-    if (!record?.user.privacyPreferences.academyAnnouncementsOptIn) {
-      res.status(403).json({
+app.get(
+  '/api/pesu/announcements',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    const startTime = Date.now();
+    try {
+      const authUser = req.user!;
+      const forceRefresh = req.query.refresh === 'true';
+      const record = await getUserAndProfileByUid(authUser.uid);
+
+      if (!record?.user.privacyPreferences.academyAnnouncementsOptIn) {
+        const payload: PesuAnnouncementsResponse = {
+          ok: false,
+          errorCode: 'OPT_IN_REQUIRED',
+          requiresOptIn: true,
+          userMessage:
+            'PESU Academy announcement retrieval is optional and requires your explicit opt-in consent.',
+          error: 'Opt-in consent required for PESU Academy announcements.',
+        };
+        res.status(403).json(payload);
+        return;
+      }
+
+      if (!authUser.pesuSessionToken) {
+        const payload: PesuAnnouncementsResponse = {
+          ok: false,
+          errorCode: 'AUTH_REQUIRED',
+          requiresReauth: true,
+          requiresScopeGrant: true,
+          userMessage:
+            'No active PESU OAuth2 session found. Connect your PESU account with the announcements:read scope to view your Academy announcements.',
+          error: 'No active PESU OAuth2 session token.',
+        };
+        res.status(401).json(payload);
+        return;
+      }
+
+      const oauthSess =
+        (await getValidOAuthSessionRecord(authUser.pesuSessionToken)) ??
+        (await getValidOAuthSessionByInitiatingSessionId(
+          authUser.pesuSessionToken
+        ));
+      if (!oauthSess || !oauthSess.accessToken) {
+        const payload: PesuAnnouncementsResponse = {
+          ok: false,
+          errorCode: 'TOKEN_EXPIRED_OR_REVOKED',
+          requiresReauth: true,
+          userMessage:
+            'Your PESU OAuth2 session has expired or been revoked. Please sign in with PESU again.',
+          error: 'PESU OAuth2 token expired or revoked.',
+        };
+        res.status(401).json(payload);
+        return;
+      }
+
+      if (!oauthSess.scopes.includes('announcements:read')) {
+        const payload: PesuAnnouncementsResponse = {
+          ok: false,
+          errorCode: 'MISSING_ANNOUNCEMENTS_SCOPE',
+          requiresScopeGrant: true,
+          grantedScopes: oauthSess.scopes,
+          userMessage:
+            'Your current PESU sign-in only granted basic identity verification. Authorize the optional announcements:read scope to fetch PESU Academy announcements.',
+          error: 'Missing announcements:read OAuth scope.',
+        };
+        res.status(403).json(payload);
+        return;
+      }
+
+      const useCache =
+        !forceRefresh && !testOverrides.fetchImpl && !testOverrides.fetchFn;
+      if (useCache) {
+        const cached = announcementsCacheByUid.get(authUser.uid);
+        if (cached && cached.expiresAt > Date.now()) {
+          res.status(200).json({ ...cached.payload, cached: true });
+          return;
+        }
+      }
+
+      let inFlight = inFlightAnnouncementsByUid.get(authUser.uid);
+      if (!inFlight) {
+        inFlight = (async (): Promise<{
+          status: number;
+          payload: PesuAnnouncementsResponse;
+        }> => {
+          const { issuerBaseUrl } = resolveAndValidatePesuIssuerUrl(req);
+          const announcementsUrl = `${issuerBaseUrl}/api/v1/announcements`;
+          const fetchFn = getFetch();
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 12000);
+
+          let upstreamResp: Response;
+          try {
+            upstreamResp = await fetchFn(announcementsUrl, {
+              headers: {
+                Authorization: `Bearer ${oauthSess.accessToken}`,
+                Accept: 'application/json',
+              },
+              signal: controller.signal,
+            });
+          } catch (netErr) {
+            clearTimeout(timer);
+            const msg =
+              netErr instanceof Error ? netErr.message : String(netErr);
+            return {
+              status: 502,
+              payload: {
+                ok: false,
+                errorCode: 'NETWORK_ERROR',
+                grantedScopes: oauthSess.scopes,
+                userMessage:
+                  'Could not reach the PESU OAuth2 announcements endpoint. Please try again shortly.',
+                error: msg,
+                diagnostics: {
+                  serviceName: 'pesu_oauth2',
+                  httpStatus: 502,
+                  errorCategory: 'NETWORK_ERROR',
+                  retryAttempts: 0,
+                  durationMs: Date.now() - startTime,
+                },
+              },
+            };
+          }
+          clearTimeout(timer);
+
+          const contentType =
+            (typeof upstreamResp.headers?.get === 'function'
+              ? upstreamResp.headers.get('content-type')
+              : '') || '';
+          let rawBody: unknown = null;
+          let rawTextSnippet = '';
+          if (
+            typeof upstreamResp.text === 'function' &&
+            contentType.toLowerCase().includes('text/html')
+          ) {
+            const txt = await upstreamResp.text().catch(() => '');
+            rawTextSnippet = txt.slice(0, 240);
+          } else if (typeof upstreamResp.json === 'function') {
+            rawBody = await upstreamResp.json().catch(async () => {
+              if (typeof upstreamResp.text === 'function') {
+                const txt = await upstreamResp.text().catch(() => '');
+                rawTextSnippet = txt.slice(0, 240);
+              }
+              return null;
+            });
+          }
+          const isHtmlUpstream =
+            contentType.toLowerCase().includes('text/html') ||
+            /^\s*<!doctype html|^\s*<html/i.test(rawTextSnippet);
+
+          if (!upstreamResp.ok) {
+            const errObj =
+              rawBody && typeof rawBody === 'object'
+                ? (rawBody as Record<string, unknown>)
+                : {};
+            const upstreamError =
+              typeof errObj.error === 'string' ? errObj.error : '';
+            const upstreamDesc =
+              typeof errObj.error_description === 'string'
+                ? errObj.error_description
+                : typeof errObj.message === 'string'
+                  ? errObj.message
+                  : '';
+
+            if (upstreamResp.status === 401 || upstreamError === 'invalid_token') {
+              return {
+                status: 401,
+                payload: {
+                  ok: false,
+                  errorCode: 'TOKEN_EXPIRED_OR_REVOKED',
+                  requiresReauth: true,
+                  grantedScopes: oauthSess.scopes,
+                  homepageBannersSupported: false,
+                  homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
+                  userMessage:
+                    upstreamDesc ||
+                    'Your PESU OAuth2 access token expired or was rejected by the provider. Please sign in again.',
+                  error: upstreamError || 'invalid_token',
+                  diagnostics: {
+                    serviceName: 'pesu_oauth2',
+                    httpStatus: 401,
+                    errorCategory: 'AUTH_ERROR',
+                    retryAttempts: 0,
+                    durationMs: Date.now() - startTime,
+                  },
+                },
+              };
+            }
+
+            if (
+              upstreamResp.status === 403 &&
+              upstreamError === 'consent_required'
+            ) {
+              return {
+                status: 403,
+                payload: {
+                  ok: false,
+                  errorCode: 'DELEGATED_CREDENTIALS_REQUIRED',
+                  requiresScopeGrant: true,
+                  requiresReauth: true,
+                  grantedScopes: oauthSess.scopes,
+                  homepageBannersSupported: false,
+                  homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
+                  userMessage:
+                    upstreamDesc ||
+                    'Delegated PESU Academy credentials are required on the PESU-Dev provider to fetch announcements. Please re-connect and authorize delegated access.',
+                  error: 'consent_required',
+                  diagnostics: {
+                    serviceName: 'pesu_oauth2',
+                    httpStatus: 403,
+                    errorCategory: 'OAUTH_CONSENT_ERROR',
+                    retryAttempts: 0,
+                    durationMs: Date.now() - startTime,
+                  },
+                },
+              };
+            }
+
+            if (
+              upstreamError === 'insufficient_scope' ||
+              (upstreamResp.status === 403 &&
+                !isHtmlUpstream &&
+                rawBody !== null &&
+                upstreamDesc.toLowerCase().includes('scope'))
+            ) {
+              return {
+                status: 403,
+                payload: {
+                  ok: false,
+                  errorCode: 'MISSING_ANNOUNCEMENTS_SCOPE',
+                  requiresScopeGrant: true,
+                  grantedScopes: oauthSess.scopes,
+                  homepageBannersSupported: false,
+                  homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
+                  userMessage:
+                    upstreamDesc ||
+                    'The PESU OAuth2 provider rejected the request because announcements:read scope is missing.',
+                  error: upstreamError || 'insufficient_scope',
+                  diagnostics: {
+                    serviceName: 'pesu_oauth2',
+                    httpStatus: 403,
+                    errorCategory: 'OAUTH_SCOPE_REJECTED',
+                    retryAttempts: 0,
+                    durationMs: Date.now() - startTime,
+                  },
+                },
+              };
+            }
+
+            if (upstreamResp.status === 403 && (isHtmlUpstream || rawBody === null)) {
+              return {
+                status: 502,
+                payload: {
+                  ok: false,
+                  errorCode: 'PROVIDER_UNAVAILABLE',
+                  grantedScopes: oauthSess.scopes,
+                  homepageBannersSupported: false,
+                  homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
+                  userMessage:
+                    'The upstream PESU Academy provider returned an HTML 403 error page (gateway/proxy block). Your announcements:read permission is intact — please retry shortly or use Public PESU Events / Submit Event Link.',
+                  error: 'UPSTREAM_HTML_403',
+                  diagnostics: {
+                    serviceName: 'pesu_oauth2',
+                    httpStatus: 403,
+                    errorCategory: 'TRANSIENT_UNAVAILABLE',
+                    retryAttempts: 0,
+                    durationMs: Date.now() - startTime,
+                  },
+                },
+              };
+            }
+
+            const statusOut =
+              upstreamResp.status >= 500 ? 502 : upstreamResp.status;
+            return {
+              status: statusOut,
+              payload: {
+                ok: false,
+                errorCode: 'PROVIDER_UNAVAILABLE',
+                grantedScopes: oauthSess.scopes,
+                homepageBannersSupported: false,
+                homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
+                userMessage:
+                  upstreamDesc ||
+                  `PESU Academy announcements provider returned HTTP ${upstreamResp.status}.`,
+                error: upstreamError || `HTTP_${upstreamResp.status}`,
+                diagnostics: {
+                  serviceName: 'pesu_oauth2',
+                  httpStatus: upstreamResp.status,
+                  errorCategory: 'UPSTREAM_5XX',
+                  retryAttempts: 0,
+                  durationMs: Date.now() - startTime,
+                },
+              },
+            };
+          }
+
+          const normalized = normalizePesuAnnouncementPayload(rawBody);
+          if (!normalized.validEnvelope) {
+            return {
+              status: 502,
+              payload: {
+                ok: false,
+                errorCode: 'MALFORMED_PROVIDER_PAYLOAD',
+                grantedScopes: oauthSess.scopes,
+                homepageBannersSupported: false,
+                homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
+                userMessage:
+                  'PESU Academy provider returned a malformed response payload.',
+                error: 'Invalid announcements JSON envelope.',
+                diagnostics: {
+                  serviceName: 'pesu_oauth2',
+                  httpStatus: 502,
+                  errorCategory: 'VALIDATION_ERROR',
+                  retryAttempts: 0,
+                  durationMs: Date.now() - startTime,
+                },
+              },
+            };
+          }
+
+          const successPayload: PesuAnnouncementsResponse = {
+            ok: true,
+            resource: normalized.resource,
+            announcements: normalized.announcements.map((a) => ({
+              id: a.id,
+              title: a.title,
+              date: a.date,
+              description: a.description,
+              image: a.image,
+              attachments: a.attachments,
+            })),
+            fetchedAt: normalized.fetchedAt,
+            grantedScopes: oauthSess.scopes,
+            homepageBannersSupported: false,
+            homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
+            userMessage:
+              normalized.announcements.length > 0
+                ? `Retrieved ${normalized.announcements.length} announcement(s) from PESU Academy.`
+                : 'No announcements are currently posted on your PESU Academy feed.',
+            diagnostics: {
+              serviceName: 'pesu_oauth2',
+              httpStatus: 200,
+              errorCategory: 'NONE',
+              retryAttempts: 0,
+              durationMs: Date.now() - startTime,
+            },
+          };
+
+          if (useCache) {
+            announcementsCacheByUid.set(authUser.uid, {
+              expiresAt: Date.now() + ANNOUNCEMENTS_CACHE_TTL_MS,
+              payload: successPayload,
+            });
+          }
+
+          return { status: 200, payload: successPayload };
+        })().finally(() => {
+          inFlightAnnouncementsByUid.delete(authUser.uid);
+        });
+        inFlightAnnouncementsByUid.set(authUser.uid, inFlight);
+      }
+
+      const result = await inFlight;
+      res.status(result.status).json(result.payload);
+    } catch (error) {
+      console.error('Error in GET /api/pesu/announcements:', error);
+      res.status(502).json({
         ok: false,
-        available: false,
-        announcements: [],
+        errorCode: 'NETWORK_ERROR',
+        homepageBannersSupported: false,
+        homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
         userMessage:
-          'PESU Academy announcement retrieval requires explicit opt-in in your Profile privacy settings.',
-      });
-      return;
+          'PESU Academy announcement retrieval encountered an unexpected error.',
+      } satisfies PesuAnnouncementsResponse);
+    }
+  }
+);
+
+// ============================================================================
+// PESU Public Events (`https://events.pes.edu`) Live Discovery & Sync Pipeline
+// ============================================================================
+const PESU_PUBLIC_SOURCE_URLS = [
+  'https://events.pes.edu/browse/?tag=hackathon',
+  'https://events.pes.edu/browse/?q=hackathon',
+  'https://events.pes.edu/browse/?q=ideathon',
+  'https://events.pes.edu/browse/?q=ctf',
+  'https://events.pes.edu/browse/?tag=coding',
+  'https://events.pes.edu/browse/?status=upcoming',
+  'https://events.pes.edu/browse/?department=computer-science',
+];
+
+const MAX_PESU_BROWSE_PAGES = 15;
+const MAX_PESU_DETAIL_EVENTS = 100;
+
+let inFlightPesuPublicSync: Promise<PesuPublicEventsSyncResponse> | null = null;
+let lastPesuPublicSyncResult: {
+  expiresAt: number;
+  response: PesuPublicEventsSyncResponse;
+} | null = null;
+const PESU_PUBLIC_SYNC_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+export async function syncPublicPesuEventsCatalog(options?: {
+  forceRefresh?: boolean;
+  actorUid?: string;
+}): Promise<PesuPublicEventsSyncResponse> {
+  const forceRefresh = Boolean(options?.forceRefresh);
+  const useCache =
+    !forceRefresh && !testOverrides.fetchImpl && !testOverrides.fetchFn;
+
+  if (
+    useCache &&
+    lastPesuPublicSyncResult &&
+    lastPesuPublicSyncResult.expiresAt > Date.now()
+  ) {
+    return lastPesuPublicSyncResult.response;
+  }
+
+  if (inFlightPesuPublicSync) {
+    return inFlightPesuPublicSync;
+  }
+
+  inFlightPesuPublicSync = (async (): Promise<PesuPublicEventsSyncResponse> => {
+    const fetchedAt = new Date().toISOString();
+    const warnings: string[] = [];
+    let reachablePagesCount = 0;
+
+    const listingMap = new Map<
+      string,
+      ReturnType<typeof parsePesuEventsHtmlListing>[number]
+    >();
+
+    const browseQueue: string[] = [...PESU_PUBLIC_SOURCE_URLS];
+    const visitedBrowseUrls = new Set<string>();
+    const checkedBrowseUrls: string[] = [];
+
+    while (
+      browseQueue.length > 0 &&
+      visitedBrowseUrls.size < MAX_PESU_BROWSE_PAGES
+    ) {
+      const browseUrl = browseQueue.shift()!;
+      if (visitedBrowseUrls.has(browseUrl)) continue;
+      visitedBrowseUrls.add(browseUrl);
+      checkedBrowseUrls.push(browseUrl);
+
+      const res = await safeFetchFollowRedirects(browseUrl);
+      if (!res.ok || !res.bodyText) {
+        warnings.push(
+          `Could not fetch ${browseUrl} (${res.error || `HTTP ${res.status}`}).`
+        );
+        continue;
+      }
+      reachablePagesCount++;
+      const cards = parsePesuEventsHtmlListing(res.bodyText);
+      for (const card of cards) {
+        if (!listingMap.has(card.eventId)) {
+          listingMap.set(card.eventId, card);
+        } else {
+          // Merge tags if seen across multiple browse views
+          const existing = listingMap.get(card.eventId)!;
+          for (const t of card.tags) {
+            if (!existing.tags.includes(t)) existing.tags.push(t);
+          }
+        }
+      }
+
+      // Discover and enqueue bounded pagination links (?page=2, etc.)
+      const paginationUrls = extractPesuEventsPaginationLinks(
+        res.bodyText,
+        browseUrl,
+        4
+      );
+      for (const nextUrl of paginationUrls) {
+        if (
+          !visitedBrowseUrls.has(nextUrl) &&
+          !browseQueue.includes(nextUrl) &&
+          visitedBrowseUrls.size + browseQueue.length < MAX_PESU_BROWSE_PAGES
+        ) {
+          browseQueue.push(nextUrl);
+        }
+      }
     }
 
-    if (!authUser.pesuSessionToken) {
-      res.status(200).json({
+    if (reachablePagesCount === 0) {
+      return {
         ok: false,
-        available: false,
-        announcements: [],
+        live: true,
+        fetchedAt,
+        sourcePagesChecked: checkedBrowseUrls,
+        reachablePagesCount: 0,
+        discoveredCount: 0,
+        publishedOrUpdatedCount: 0,
+        stagedForReviewCount: 0,
+        duplicatesSkippedCount: 0,
         userMessage:
-          'No active PESU OAuth2 session token found. Sign in via PESU OAuth2 with the announcements:read scope to retrieve campus announcements.',
-      });
-      return;
+          'events.pes.edu is currently unreachable. No synthetic or fallback events were generated.',
+        warnings,
+      };
     }
 
-    const oauthSess = await getValidOAuthSessionRecord(authUser.pesuSessionToken);
-    if (!oauthSess || !oauthSess.accessToken) {
-      res.status(200).json({
-        ok: false,
-        available: false,
-        announcements: [],
-        userMessage:
-          'Your PESU OAuth2 token has expired or been revoked. Please sign in again.',
+    const discoveredCards = Array.from(listingMap.values());
+    let publishedOrUpdatedCount = 0;
+    let stagedForReviewCount = 0;
+    let duplicatesSkippedCount = 0;
+
+    // Fetch all discovered detail pages (bounded by MAX_PESU_DETAIL_EVENTS = 100)
+    for (const card of discoveredCards.slice(0, MAX_PESU_DETAIL_EVENTS)) {
+      const detailFetch = await safeFetchFollowRedirects(card.detailUrl);
+      const detail =
+        detailFetch.ok && detailFetch.bodyText
+          ? parsePesuEventDetailHtml(detailFetch.bodyText, card.detailUrl)
+          : null;
+
+      const resolvedTitle = detail?.title || card.title;
+      const resolvedOrganizer =
+        detail?.organizer || card.organizer || 'PES University';
+      const resolvedDescription =
+        detail?.description ||
+        card.summary ||
+        `Official event listed on ${card.detailUrl}`;
+      const resolvedStartAt = detail?.startAt ?? card.startAt ?? null;
+      const resolvedEndAt = detail?.endAt ?? card.endAt ?? resolvedStartAt;
+      const resolvedDeadline = detail?.registrationDeadline ?? null;
+      const resolvedCampus = detail?.campus ?? card.campus ?? null;
+      const resolvedVenueName = detail?.venueName ?? card.venueName ?? null;
+      const resolvedEventType =
+        detail && detail.eventType !== 'unknown'
+          ? detail.eventType
+          : card.eventType !== 'unknown'
+            ? card.eventType
+            : 'other';
+      const resolvedThemes =
+        detail && detail.themes.length > 0
+          ? detail.themes
+          : card.tags.length > 0
+            ? card.tags.map((t) => t.replace(/^#/, ''))
+            : ['PESU Event'];
+      const resolvedRegUrl = detail?.registrationUrl ?? null;
+      const canonicalUrl = detail?.canonicalUrl || card.detailUrl;
+      const resolvedReason =
+        detail?.classificationReason ||
+        `Classified from events.pes.edu tags (${card.tags.join(', ') || resolvedEventType}).`;
+
+      const evaluated = evaluateHackathonEligibilityAndStates({
+        name: resolvedTitle,
+        description: resolvedDescription,
+        eventType: resolvedEventType,
+        themes: resolvedThemes.filter((t) => t !== 'PESU Event'),
+        minTeamSize: detail?.minTeamSize ?? null,
+        maxTeamSize: detail?.maxTeamSize ?? null,
+        startAt: resolvedStartAt,
+        endAt: resolvedEndAt,
+        registrationDeadline: resolvedDeadline,
+        registrationUrl: resolvedRegUrl,
+        verifiedCanonicalUrl: canonicalUrl,
+        sourceUrlStatus: 'verified',
+        sourceType: 'pes_public_events',
       });
-      return;
+
+      const targetSlug = `pes_event_${card.eventId}`;
+
+      const candidateReviewStatus = !evaluated.isHackathon
+        ? 'rejected'
+        : evaluated.teamParticipationVerified
+          ? 'approved'
+          : 'needs_confirmation';
+
+      if (candidateReviewStatus === 'needs_confirmation') {
+        stagedForReviewCount++;
+      }
+
+      // Stage record in event_candidates for provenance and admin review auditability
+      const staged = await createEventCandidateRecord({
+        id: `cand_pes_public_${card.eventId}`,
+        source: 'pes_public_events',
+        sourceUrl: canonicalUrl,
+        originalSubmissionUrl: canonicalUrl,
+        verifiedCanonicalUrl: canonicalUrl,
+        sourceUrlStatus: 'verified',
+        submittedByUid: options?.actorUid,
+        externalFingerprint: `pes_events_${card.eventId}`,
+        title: resolvedTitle,
+        organizer: resolvedOrganizer,
+        eventType: evaluated.eventType,
+        matchable: evaluated.matchable,
+        themes: resolvedThemes,
+        description: resolvedDescription,
+        startAt: resolvedStartAt,
+        endAt: resolvedEndAt,
+        registrationDeadline: resolvedDeadline,
+        timezone: 'Asia/Kolkata',
+        venue: {
+          campus: resolvedCampus,
+          name: resolvedVenueName,
+        },
+        format:
+          detail?.format && detail.format !== 'unknown'
+            ? detail.format
+            : resolvedCampus === 'Online / Multi-Campus'
+              ? 'online'
+              : 'onsite',
+        teamSize: {
+          min: evaluated.minTeamSize,
+          max: evaluated.maxTeamSize,
+        },
+        registrationUrl: resolvedRegUrl,
+        eligibilityNotes: null,
+        fieldEvidence: {
+          source: [
+            {
+              sourceUrl: canonicalUrl,
+              excerpt:
+                detail?.extractedEvidenceQuote ||
+                `Listed on events.pes.edu (${card.dateText || 'Date TBA'})`,
+            },
+          ],
+        },
+        classification: {
+          ruleGatePassed: evaluated.matchable,
+          mlScore: evaluated.matchable ? 1 : 0,
+          reason: resolvedReason,
+        },
+        reviewStatus: candidateReviewStatus,
+        warnings: evaluated.teamParticipationVerified
+          ? []
+          : [evaluated.teamEligibilityReason],
+        lastSeenAt: fetchedAt,
+      });
+
+      // Publish/update verified official events.pes.edu listing in hackathons table
+      // (Non-hackathon events are stored with matchable: false, status: 'archived';
+      //  hackathons with unknown team size are stored with matchable: false, teamParticipationVerified: false)
+      const persisted = await createPublishedHackathonDirect({
+        slug: targetSlug,
+        name: resolvedTitle,
+        organizer: resolvedOrganizer,
+        description: resolvedDescription,
+        eventType: evaluated.eventType,
+        matchable: evaluated.matchable,
+        themes: resolvedThemes,
+        campus: resolvedCampus,
+        venueName: resolvedVenueName,
+        format:
+          detail?.format && detail.format !== 'unknown'
+            ? detail.format
+            : resolvedCampus === 'Online / Multi-Campus'
+              ? 'online'
+              : 'onsite',
+        startAt: resolvedStartAt,
+        endAt: resolvedEndAt,
+        registrationDeadline: resolvedDeadline,
+        minTeamSize: evaluated.minTeamSize,
+        maxTeamSize: evaluated.maxTeamSize,
+        registrationUrl: resolvedRegUrl,
+        verifiedCanonicalUrl: canonicalUrl,
+        sourceUrlStatus: 'verified',
+        sourceType: 'pes_public_events',
+        extractedAt: fetchedAt,
+        classificationReason: resolvedReason,
+        status: evaluated.isHackathon ? 'published' : 'archived',
+        createdByUid: options?.actorUid || 'system_pes_events_sync',
+      });
+
+      const isCrossPageDuplicate =
+        persisted.id !== targetSlug ||
+        (staged.duplicateOfHackathonId &&
+          staged.duplicateOfHackathonId !== targetSlug &&
+          !staged.updatesExistingHackathonId);
+
+      if (isCrossPageDuplicate) {
+        duplicatesSkippedCount++;
+      } else if (persisted.isHackathon) {
+        publishedOrUpdatedCount++;
+      }
     }
 
-    if (!oauthSess.scopes.includes('announcements:read')) {
-      res.status(200).json({
-        ok: false,
-        available: false,
-        announcements: [],
-        userMessage:
-          'Your current PESU OAuth2 session was not granted the announcements:read scope.',
-      });
-      return;
-    }
-
-    const { issuerBaseUrl } = resolveAndValidatePesuIssuerUrl(req);
-    const announcementsUrl = `${issuerBaseUrl}/api/v1/announcements`;
-    const fetchFn = getFetch();
-    const upstreamResp = await fetchFn(announcementsUrl, {
-      headers: {
-        Authorization: `Bearer ${oauthSess.accessToken}`,
-        Accept: 'application/json',
-      },
-    });
-
-    if (!upstreamResp.ok) {
-      res.status(200).json({
-        ok: false,
-        available: false,
-        httpStatus: upstreamResp.status,
-        announcements: [],
-        userMessage: `PESU Academy announcements endpoint (${announcementsUrl}) returned HTTP ${upstreamResp.status}.`,
-      });
-      return;
-    }
-
-    const rawBody = await upstreamResp.json().catch(() => null);
-    const list = Array.isArray(rawBody)
-      ? rawBody
-      : Array.isArray((rawBody as Record<string, unknown> | null)?.announcements)
-      ? ((rawBody as Record<string, unknown>).announcements as unknown[])
-      : [];
-
-    res.json({
+    const syncResponse: PesuPublicEventsSyncResponse = {
       ok: true,
-      available: true,
-      announcements: list,
-      userMessage: `Retrieved ${list.length} announcement(s) from PESU-Dev resource server.`,
+      live: true,
+      fetchedAt,
+      sourcePagesChecked: checkedBrowseUrls,
+      reachablePagesCount,
+      discoveredCount: discoveredCards.length,
+      publishedOrUpdatedCount,
+      stagedForReviewCount,
+      duplicatesSkippedCount,
+      userMessage: `Synced ${publishedOrUpdatedCount} eligible PESU hackathon(s) from events.pes.edu (${reachablePagesCount}/${checkedBrowseUrls.length} listing pages reachable).`,
+      warnings,
+    };
+
+    if (useCache) {
+      lastPesuPublicSyncResult = {
+        expiresAt: Date.now() + PESU_PUBLIC_SYNC_COOLDOWN_MS,
+        response: syncResponse,
+      };
+    }
+
+    return syncResponse;
+  })().finally(() => {
+    inFlightPesuPublicSync = null;
+  });
+
+  return inFlightPesuPublicSync;
+}
+
+export async function syncPaashaHackathonsCatalog(options?: {
+  actorUid?: string;
+  includeUnverified?: boolean;
+}) {
+  const paashaRes = await fetchPaashaHackathons({
+    matchableOnly: false,
+    includeUnverified: options?.includeUnverified ?? true,
+  });
+
+  if (!paashaRes.ok) {
+    return {
+      ok: false,
+      paashaReachable: false,
+      statusCode: paashaRes.statusCode,
+      errorCode: paashaRes.errorCode ?? 'PAASHA_UNAVAILABLE',
+      userMessage: paashaRes.userMessage,
+      fetchedAt: paashaRes.fetchedAt,
+      totalFromPaasha: 0,
+      ingestion: null,
+    };
+  }
+
+  const ingestion = await ingestPaashaHackathonsToDatabase({
+    items: paashaRes.items,
+    actorUid: options?.actorUid ?? 'system_paasha_sync',
+  });
+
+  return {
+    ok: true,
+    paashaReachable: true,
+    statusCode: 200,
+    errorCode: undefined,
+    userMessage: `Synced ${paashaRes.items.length} record(s) from PAASHA microservice (${ingestion.publishedCount} newly published, ${ingestion.mergedWithExistingCount} merged with existing events, ${ingestion.heldForReviewCount} held for review, ${ingestion.excludedNonHackathonCount} non-hackathons excluded).`,
+    fetchedAt: paashaRes.fetchedAt,
+    totalFromPaasha: paashaRes.total,
+    ingestion,
+  };
+}
+
+app.get('/api/events/paasha/status', async (_req, res) => {
+  try {
+    const status = await checkPaashaConnectionStatus();
+    res.status(200).json({
+      ok: status.ok,
+      configured: status.configured,
+      reachable: status.reachable,
+      authenticated: status.authenticated,
+      serviceUrl: status.serviceUrl,
+      statusCode: status.statusCode,
+      errorCode: status.errorCode,
+      userMessage: status.userMessage,
+      upstreamStatus: status.upstreamStatus,
     });
   } catch (error) {
-    console.error('Error in GET /api/pesu/announcements:', error);
+    console.error('Error in GET /api/events/paasha/status:', error);
     res.status(200).json({
       ok: false,
-      available: false,
-      announcements: [],
+      configured: false,
+      reachable: false,
+      authenticated: false,
+      statusCode: 503,
+      errorCode: 'PAASHA_UNAVAILABLE',
+      userMessage: 'Failed to inspect PAASHA microservice connection status.',
+    });
+  }
+});
+
+app.post('/api/events/sync-paasha', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const paashaSync = await syncPaashaHackathonsCatalog({
+      actorUid: authUser?.uid,
+      includeUnverified: true,
+    });
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    res.status(paashaSync.ok ? 200 : paashaSync.statusCode || 503).json({
+      ...paashaSync,
+      hackathons: data.hackathons,
+    });
+  } catch (error) {
+    console.error('Error in POST /api/events/sync-paasha:', error);
+    const data = await loadBootstrapData(null).catch(() => ({ hackathons: [] }));
+    res.status(503).json({
+      ok: false,
+      paashaReachable: false,
+      errorCode: 'PAASHA_UNAVAILABLE',
       userMessage:
-        'PESU Academy announcement retrieval is currently unreachable.',
+        'PAASHA microservice sync failed; continuing with existing Quackathon catalog.',
+      hackathons: data.hackathons,
+    });
+  }
+});
+
+app.post('/api/events/sync-all', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const forceRefresh = Boolean(req.body?.forceRefresh);
+
+    const pesuSync = await syncPublicPesuEventsCatalog({
+      forceRefresh,
+      actorUid: authUser?.uid,
+    });
+    const paashaSync = await syncPaashaHackathonsCatalog({
+      actorUid: authUser?.uid,
+      includeUnverified: true,
+    });
+
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    const anySourceSucceeded = pesuSync.ok || paashaSync.ok;
+    const degradedSources: string[] = [];
+    if (!pesuSync.ok) degradedSources.push('pes_public_events');
+    if (!paashaSync.ok) degradedSources.push('paasha_microservice');
+
+    res.status(anySourceSucceeded ? 200 : 502).json({
+      ok: anySourceSucceeded,
+      degradedSources,
+      pesuPublic: pesuSync,
+      paasha: paashaSync,
+      hackathons: data.hackathons,
+      userMessage:
+        degradedSources.length === 0
+          ? 'Synchronized hackathons from both events.pes.edu and PAASHA microservice.'
+          : anySourceSucceeded
+            ? `Synchronized hackathons using available source(s); degraded source(s): ${degradedSources.join(', ')}.`
+            : 'Both events.pes.edu and PAASHA microservice are currently unavailable.',
+    });
+  } catch (error) {
+    console.error('Error in POST /api/events/sync-all:', error);
+    res.status(500).json({
+      ok: false,
+      userMessage: 'Failed to run unified hackathon synchronization.',
+    });
+  }
+});
+
+app.post('/api/events/sync-pesu-public', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const forceRefresh = Boolean(req.body?.forceRefresh);
+    const syncRes = await syncPublicPesuEventsCatalog({
+      forceRefresh,
+      actorUid: authUser?.uid,
+    });
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    res.status(syncRes.ok ? 200 : 502).json({
+      ...syncRes,
+      hackathons: data.hackathons,
+    });
+  } catch (error) {
+    console.error('Error in POST /api/events/sync-pesu-public:', error);
+    res.status(500).json({
+      ok: false,
+      live: true,
+      userMessage: 'Failed to synchronize public PESU events.',
+    });
+  }
+});
+
+app.get('/api/events/pesu-public', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = await resolveOptionalUser(req);
+    const forceRefresh = req.query.refresh === 'true';
+    const syncRes = await syncPublicPesuEventsCatalog({
+      forceRefresh,
+      actorUid: authUser?.uid,
+    });
+    const data = await loadBootstrapData(authUser?.uid ?? null);
+    const pesPublicEvents = data.hackathons.filter(
+      (h) =>
+        h.sourceType === 'pes_public_events' ||
+        h.verifiedCanonicalUrl?.includes('events.pes.edu')
+    );
+    res.status(syncRes.ok ? 200 : 502).json({
+      ...syncRes,
+      events: pesPublicEvents,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/events/pesu-public:', error);
+    res.status(500).json({
+      ok: false,
+      live: true,
+      userMessage: 'Failed to retrieve public PESU events.',
     });
   }
 });
@@ -4421,45 +5807,316 @@ app.get('/api/bootstrap', async (req: AuthenticatedRequest, res) => {
   }
 });
 
+function formatTeamSizeDisplayLabel(
+  min?: number | null,
+  max?: number | null
+): string {
+  if (
+    typeof min === 'number' &&
+    typeof max === 'number' &&
+    Number.isFinite(min) &&
+    Number.isFinite(max)
+  ) {
+    if (min === max) {
+      return `${min} member${min === 1 ? '' : 's'}`;
+    }
+    return `${min}–${max} members`;
+  }
+  if (typeof max === 'number' && Number.isFinite(max)) {
+    return `Up to ${max} members`;
+  }
+  return 'Team size not specified';
+}
+
 /**
- * Server-side paginated hackathons catalog endpoint backed by PostgreSQL (zero synthetic data).
+ * Phase 6 Normalized Hackathons Discovery Endpoint (`GET /api/hackathons`):
+ * - Returns unique, deduplicated, team-eligible hackathon records (`isHackathon === true && teamParticipationVerified === true` by default).
+ * - Supports time filtering (`time` / `preset` / `filter`: `UPCOMING` default, `THIS_WEEK`, `THIS_MONTH`, `PAST`, `ALL`, `CUSTOM`).
+ * - Never fabricates today's date when event dates are missing (`startAt: null`, `dateDisplay: "Date TBA"`).
+ * - Never marks unknown registration status as `OPEN` (`OPEN` | `CLOSED` | `UNKNOWN`).
+ * - Never marks unknown team eligibility as `matchable: true`.
+ * - Keeps raw fieldProvenance out of card-list responses unless `includeProvenance=true` is requested.
  */
 app.get('/api/hackathons', async (req, res) => {
   try {
     const data = await loadBootstrapData(null);
     const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
     const filter = typeof req.query.filter === 'string' ? req.query.filter : 'all';
+    const includeUnverifiedTeamSize =
+      req.query.includeUnverifiedTeamSize === 'true';
+    const matchableOnly =
+      req.query.matchableOnly === 'true' || filter === 'matchable';
     const campus = typeof req.query.campus === 'string' ? req.query.campus : 'ALL';
-    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+    const q =
+      typeof req.query.q === 'string'
+        ? req.query.q.trim().toLowerCase()
+        : typeof req.query.search === 'string'
+          ? req.query.search.trim().toLowerCase()
+          : '';
+    const includeProvenance = req.query.includeProvenance === 'true';
 
-    const filtered = data.hackathons.filter((h) => {
-      if (filter === 'matchable' && !h.matchable) return false;
-      if (filter === 'non_matchable' && h.matchable) return false;
-      if (campus !== 'ALL' && h.venue.campus !== campus) return false;
-      if (q) {
-        const hay = `${h.name} ${h.organizer} ${h.themes.join(' ')}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
+    const validPresets = new Set<TimeFilterPreset>([
+      'UPCOMING',
+      'THIS_WEEK',
+      'THIS_MONTH',
+      'PAST',
+      'ALL',
+      'CUSTOM',
+    ]);
+    const filterUpper = filter.trim().toUpperCase();
+    const rawTimeParam = (
+      (typeof req.query.time === 'string'
+        ? req.query.time
+        : typeof req.query.preset === 'string'
+          ? req.query.preset
+          : validPresets.has(filterUpper as TimeFilterPreset)
+            ? filterUpper
+            : 'UPCOMING') || 'UPCOMING'
+    )
+      .trim()
+      .toUpperCase();
+
+    const preset: TimeFilterPreset = validPresets.has(
+      rawTimeParam as TimeFilterPreset
+    )
+      ? (rawTimeParam as TimeFilterPreset)
+      : 'UPCOMING';
+
+    const refDateStr =
+      typeof req.query.referenceDate === 'string' &&
+      /^\d{4}-\d{2}-\d{2}$/.test(req.query.referenceDate.trim())
+        ? req.query.referenceDate.trim()
+        : null;
+    const referenceDate = refDateStr
+      ? new Date(`${refDateStr}T12:00:00+05:30`)
+      : new Date();
+
+    const customStart =
+      typeof req.query.customStart === 'string' ? req.query.customStart : null;
+    const customEnd =
+      typeof req.query.customEnd === 'string' ? req.query.customEnd : null;
+    const openRegistrationOnly = req.query.openRegistrationOnly === 'true';
+
+    // Re-evaluate states against referenceDate when provided and filter by campus / search / team eligibility
+    const preFiltered = data.hackathons
+      .map((h) => {
+        if (!refDateStr) return h;
+        const reeval = evaluateHackathonEligibilityAndStates({
+          name: h.name,
+          description: h.description,
+          eventType: h.eventType,
+          themes: h.themes,
+          minTeamSize: h.minTeamSize,
+          maxTeamSize: h.maxTeamSize,
+          startAt: h.startAt,
+          endAt: h.endAt,
+          registrationDeadline: h.registrationDeadline,
+          registrationUrl: h.registrationUrl,
+          verifiedCanonicalUrl: h.verifiedCanonicalUrl,
+          originalSubmissionUrl: h.originalSubmissionUrl,
+          sourceUrlStatus: h.sourceUrlStatus,
+          sourceType: h.sourceType,
+          status: h.status,
+          todayIstYmd: refDateStr,
+        });
+        return {
+          ...h,
+          isHackathon: reeval.isHackathon,
+          teamParticipationVerified: reeval.teamParticipationVerified,
+          publicSourceVerified: reeval.publicSourceVerified,
+          matchable: reeval.matchable,
+          findTeammatesEligible: reeval.findTeammatesEligible,
+          registrationStatus: reeval.registrationStatus,
+          registrationStatusDetail: reeval.registrationStatusDetail,
+          registrationStatusLabel: reeval.registrationStatusLabel,
+        };
+      })
+      .filter((h) => {
+        if (!h.isHackathon) return false;
+        // Per confirmed product rule: show only verified team-eligible hackathons in the catalog by default
+        if (!includeUnverifiedTeamSize && !h.teamParticipationVerified) {
+          return false;
+        }
+        if (matchableOnly && !h.matchable) return false;
+        if (filter === 'non_matchable' && h.matchable) return false;
+        if (campus !== 'ALL' && h.venue.campus !== campus) return false;
+        if (q) {
+          const hay =
+            `${h.name} ${h.organizer} ${h.description} ${h.themes.join(' ')}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+
+    const timeFiltered = filterAndSortEventsByTime(preFiltered, {
+      preset,
+      customStart,
+      customEnd,
+      openRegistrationOnly,
+      referenceDate,
     });
 
     const startIndex = (page - 1) * limit;
-    const items = filtered.slice(startIndex, startIndex + limit);
+    const sliced = timeFiltered.slice(startIndex, startIndex + limit);
+
+    const items = sliced.map((h) => {
+      const cardItem: Record<string, unknown> = {
+        id: h.id,
+        title: h.name,
+        name: h.name,
+        organizer: h.organizer,
+        shortDescription: h.shortDescription ?? h.description.slice(0, 220),
+        description: h.description,
+        eventType: h.eventType,
+        categoryLabel: h.categoryLabel,
+        isHackathon: Boolean(h.isHackathon),
+        teamParticipationVerified: Boolean(h.teamParticipationVerified),
+        publicSourceVerified: Boolean(h.publicSourceVerified),
+        startAt: h.startAt ?? null,
+        endAt: h.endAt ?? null,
+        dateDisplay: h.dateDisplay ?? formatEventDateDisplayIST(h),
+        campus: h.venue?.campus ?? null,
+        venue: {
+          campus: h.venue?.campus ?? null,
+          name: h.venue?.name ?? null,
+        },
+        format: h.format,
+        registrationDeadline: h.registrationDeadline ?? null,
+        registrationStatus: h.registrationStatus ?? 'UNKNOWN',
+        registrationStatusDetail: h.registrationStatusDetail ?? 'unknown',
+        registrationStatusLabel:
+          h.registrationStatusLabel ?? 'Registration Status Unknown',
+        teamSize: {
+          min: h.minTeamSize ?? null,
+          max: h.maxTeamSize ?? null,
+          label: formatTeamSizeDisplayLabel(h.minTeamSize, h.maxTeamSize),
+        },
+        minTeamSize: h.minTeamSize ?? null,
+        maxTeamSize: h.maxTeamSize ?? null,
+        registrationUrl: h.registrationUrl ?? null,
+        verifiedCanonicalUrl: h.verifiedCanonicalUrl ?? null,
+        matchable: Boolean(h.matchable),
+        findTeammatesEligible: Boolean(h.findTeammatesEligible),
+        sourceType: h.sourceType ?? 'pes_public_events',
+        sources: h.sources ?? h.sourceIds ?? [],
+        sourceIds: h.sourceIds ?? [],
+        themes: h.themes,
+      };
+      if (includeProvenance) {
+        cardItem.fieldProvenance = h.fieldProvenance;
+      }
+      return cardItem;
+    });
 
     res.json({
       ok: true,
+      preset,
       page,
       limit,
-      total: filtered.length,
-      hasMore: startIndex + limit < filtered.length,
+      total: timeFiltered.length,
+      hasMore: startIndex + limit < timeFiltered.length,
       items,
+      hackathons: items,
     });
   } catch (error) {
     console.error('Error in GET /api/hackathons:', error);
     res.status(500).json({
       ok: false,
       error: 'Failed to query hackathons.',
+    });
+  }
+});
+
+/**
+ * Phase 6 Separate Hackathon Detail Endpoint (`GET /api/hackathons/:id`):
+ * Exposes full event description, provenance, source URLs, verification details, and team constraints.
+ */
+app.get('/api/hackathons/:id', async (req, res, next) => {
+  const requestedId = String(req.params.id || '').trim();
+  // Delegate static sub-routes like `/api/hackathons/candidates` to their dedicated handlers
+  if (requestedId === 'candidates') {
+    next();
+    return;
+  }
+  try {
+    const data = await loadBootstrapData(null);
+    const hackathon = data.hackathons.find((h) => h.id === requestedId);
+    if (!hackathon || !hackathon.isHackathon) {
+      res.status(404).json({
+        ok: false,
+        errorCode: 'HACKATHON_NOT_FOUND',
+        userMessage: `Hackathon "${requestedId}" was not found in the active catalog.`,
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      hackathon: {
+        id: hackathon.id,
+        title: hackathon.name,
+        name: hackathon.name,
+        organizer: hackathon.organizer,
+        shortDescription:
+          hackathon.shortDescription ?? hackathon.description.slice(0, 220),
+        description: hackathon.description,
+        eventType: hackathon.eventType,
+        categoryLabel: hackathon.categoryLabel,
+        isHackathon: Boolean(hackathon.isHackathon),
+        teamParticipationVerified: Boolean(hackathon.teamParticipationVerified),
+        publicSourceVerified: Boolean(hackathon.publicSourceVerified),
+        startAt: hackathon.startAt ?? null,
+        endAt: hackathon.endAt ?? null,
+        dateDisplay:
+          hackathon.dateDisplay ?? formatEventDateDisplayIST(hackathon),
+        campus: hackathon.venue?.campus ?? null,
+        venue: {
+          campus: hackathon.venue?.campus ?? null,
+          name: hackathon.venue?.name ?? null,
+        },
+        format: hackathon.format,
+        registrationDeadline: hackathon.registrationDeadline ?? null,
+        registrationStatus: hackathon.registrationStatus ?? 'UNKNOWN',
+        registrationStatusDetail:
+          hackathon.registrationStatusDetail ?? 'unknown',
+        registrationStatusLabel:
+          hackathon.registrationStatusLabel ?? 'Registration Status Unknown',
+        teamSize: {
+          min: hackathon.minTeamSize ?? null,
+          max: hackathon.maxTeamSize ?? null,
+          label: formatTeamSizeDisplayLabel(
+            hackathon.minTeamSize,
+            hackathon.maxTeamSize
+          ),
+        },
+        minTeamSize: hackathon.minTeamSize ?? null,
+        maxTeamSize: hackathon.maxTeamSize ?? null,
+        registrationUrl: hackathon.registrationUrl ?? null,
+        verifiedCanonicalUrl: hackathon.verifiedCanonicalUrl ?? null,
+        matchable: Boolean(hackathon.matchable),
+        findTeammatesEligible: Boolean(hackathon.findTeammatesEligible),
+        sourceType: hackathon.sourceType ?? 'pes_public_events',
+        sources: hackathon.sources ?? hackathon.sourceIds ?? [],
+        sourceIds: hackathon.sourceIds ?? [],
+        themes: hackathon.themes,
+        fieldProvenance: hackathon.fieldProvenance,
+        provenance: {
+          sources: hackathon.sources ?? hackathon.sourceIds ?? [],
+          sourceIds: hackathon.sourceIds ?? [],
+          fieldProvenance: hackathon.fieldProvenance,
+        },
+        classification: hackathon.classification,
+        verificationStatus: hackathon.verificationStatus,
+        lastVerifiedAt: hackathon.lastVerifiedAt,
+        extractedAt: hackathon.extractedAt,
+      },
+    });
+  } catch (error) {
+    console.error('Error in GET /api/hackathons/:id:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to load hackathon details.',
     });
   }
 });
@@ -4590,8 +6247,53 @@ app.post(
         return;
       }
 
+      // Strip personal student identifiers from announcement-derived candidates
+      const isAnnouncementHint = candidate.source === 'academy_opt_in_hint';
+      const sanitizedTitle = isAnnouncementHint
+        ? sanitizeTextForPublicCandidate(candidate.title)
+        : candidate.title.trim();
+      const sanitizedOrganizer = isAnnouncementHint
+        ? sanitizeTextForPublicCandidate(candidate.organizer)
+        : candidate.organizer.trim();
+      const sanitizedDescription = isAnnouncementHint
+        ? sanitizeTextForPublicCandidate(candidate.description || '')
+        : candidate.description || '';
+
+      // If candidate has a public URL that hasn't been verified yet, verify it against public source if reachable
+      let verifiedCanonicalUrl = candidate.verifiedCanonicalUrl ?? null;
+      let sourceUrlStatus = candidate.sourceUrlStatus ?? 'unverified';
+      const publicUrlToCheck =
+        candidate.originalSubmissionUrl ||
+        candidate.sourceUrl ||
+        candidate.registrationUrl ||
+        null;
+
+      if (
+        !verifiedCanonicalUrl &&
+        publicUrlToCheck &&
+        publicUrlToCheck.startsWith('http') &&
+        !publicUrlToCheck.includes('pesuacademy.com')
+      ) {
+        const check = checkSafePublicUrl(publicUrlToCheck);
+        if (check.safe) {
+          const verifyFetch = await safeFetchFollowRedirects(publicUrlToCheck, 3);
+          if (verifyFetch.ok) {
+            verifiedCanonicalUrl = verifyFetch.finalUrl;
+            sourceUrlStatus =
+              verifyFetch.redirectChain.length > 1
+                ? 'redirected_valid'
+                : 'verified';
+          }
+        }
+      }
+
       const savedCandidate = await createEventCandidateRecord({
         ...candidate,
+        title: sanitizedTitle,
+        organizer: sanitizedOrganizer,
+        description: sanitizedDescription,
+        verifiedCanonicalUrl,
+        sourceUrlStatus,
         submittedByUid: authUser.uid,
       });
 
@@ -4819,9 +6521,189 @@ app.post('/api/teams', requireAuth, async (req: AuthenticatedRequest, res) => {
 });
 
 /**
- * Records a Pass or Connect swipe on a Person or Team.
- * - Creates a mutual `direct_match` conversation when two users both swipe 'interested'.
- * - Creates a team `join_request` when a user swipes 'interested' on an open team.
+ * Helper to map structured repository error prefixes to HTTP status codes.
+ */
+function handleRepositoryError(
+  error: unknown,
+  res: express.Response,
+  fallbackMessage: string
+): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message;
+  if (msg.startsWith('FORBIDDEN:') || msg.startsWith('BLOCKED_USER:')) {
+    const clean = msg.replace(/^[A-Z_]+:\s*/, '');
+    res.status(403).json({ ok: false, error: clean, userMessage: clean });
+    return true;
+  }
+  if (msg.startsWith('NOT_FOUND:')) {
+    const clean = msg.replace(/^NOT_FOUND:\s*/, '');
+    res.status(404).json({ ok: false, error: clean, userMessage: clean });
+    return true;
+  }
+  if (
+    msg.startsWith('TEAM_FULL:') ||
+    msg.startsWith('ALREADY_IN_TEAM:') ||
+    msg.startsWith('ALREADY_RESOLVED:') ||
+    msg.startsWith('ALREADY_REGISTERED:') ||
+    msg.startsWith('UNANIMOUS_APPROVAL_REQUIRED:') ||
+    msg.startsWith('TEAM_REGISTERED_LOCKED:') ||
+    msg.startsWith('DUPLICATE_PROPOSAL:') ||
+    msg.startsWith('INELIGIBLE_TEAM_SIZE:')
+  ) {
+    const clean = msg.replace(/^[A-Z_]+:\s*/, '');
+    res.status(409).json({ ok: false, error: clean, userMessage: clean });
+    return true;
+  }
+  if (
+    msg.startsWith('VALIDATION_ERROR:') ||
+    msg.startsWith('SELF_SWIPE:') ||
+    msg.startsWith('INELIGIBLE_EVENT:') ||
+    msg.startsWith('EVENT_') ||
+    msg.startsWith('EMPTY_MESSAGE:') ||
+    msg.startsWith('INVALID_BLOCK:') ||
+    msg.startsWith('INVALID_PROPOSAL:')
+  ) {
+    const clean = msg.replace(/^[A-Z_]+:\s*/, '');
+    res.status(400).json({ ok: false, error: clean, userMessage: clean });
+    return true;
+  }
+  console.error(fallbackMessage, error);
+  res.status(500).json({ ok: false, error: fallbackMessage, userMessage: fallbackMessage });
+  return true;
+}
+
+/**
+ * Student-only Discovery Feed (`GET /api/discovery/students`)
+ * Ranks eligible individual students for the selected hackathon using:
+ *  - 45% Skill Complementarity (evaluated against the viewer's solo skills OR combined active team skills)
+ *  - 35% Shared Interests & Project Themes
+ *  - 20% Past Swipe Behavior (or redistributed for cold-start users)
+ */
+app.get(
+  '/api/discovery/students',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const requestedHackathonId =
+        typeof req.query.hackathonId === 'string'
+          ? req.query.hackathonId.trim()
+          : typeof req.query.hackathonSlug === 'string'
+            ? req.query.hackathonSlug.trim()
+            : '';
+      const searchQuery =
+        typeof req.query.q === 'string' ? req.query.q.trim() : '';
+
+      const data = await loadBootstrapData(authUser.uid);
+      const hackathon =
+        data.hackathons.find((h) => h.id === requestedHackathonId) ??
+        data.hackathons.find((h) => h.matchable) ??
+        data.hackathons[0] ??
+        null;
+
+      if (!hackathon) {
+        res.json({
+          ok: true,
+          hackathonId: null,
+          candidates: [],
+          students: [],
+          totalEligibleCount: 0,
+          teamCapabilities: null,
+          activeTeam: null,
+        });
+        return;
+      }
+
+      const currentUser =
+        data.users.find((u) => u.uid === authUser.uid) ?? authUser;
+      const currentProfile = data.profiles[authUser.uid];
+
+      if (!currentProfile) {
+        res.json({
+          ok: true,
+          hackathonId: hackathon.id,
+          candidates: [],
+          students: [],
+          totalEligibleCount: 0,
+          teamCapabilities: null,
+          activeTeam: null,
+        });
+        return;
+      }
+
+      const candidates = rankStudentsForHackathon({
+        viewerUid: authUser.uid,
+        currentProfile,
+        hackathon,
+        users: data.users,
+        profiles: data.profiles,
+        participations: data.participations,
+        teams: data.teams,
+        memberships: data.memberships,
+        interests: data.interests,
+        blocks: data.blocks ?? [],
+        searchQuery,
+      });
+
+      const totalEligibleCount = countEligiblePeopleForHackathon({
+        viewerUid: authUser.uid,
+        hackathon,
+        users: data.users,
+        profiles: data.profiles,
+        participations: data.participations,
+        teams: data.teams,
+        memberships: data.memberships,
+        interests: data.interests,
+        blocks: data.blocks ?? [],
+        searchQuery,
+      });
+
+      const teamCapabilities = computeTeamCombinedCapabilities({
+        viewerUid: authUser.uid,
+        hackathon,
+        profiles: data.profiles,
+        participations: data.participations,
+        teams: data.teams,
+        memberships: data.memberships,
+      });
+
+      res.json({
+        ok: true,
+        hackathonId: hackathon.id,
+        candidates,
+        students: candidates,
+        totalEligibleCount,
+        teamCapabilities: {
+          teamId: teamCapabilities.activeTeam?.id ?? null,
+          memberCount: teamCapabilities.teamMemberUids.length,
+          maxCapacity: Math.min(
+            4,
+            hackathon.maxTeamSize && hackathon.maxTeamSize > 0
+              ? hackathon.maxTeamSize
+              : 4
+          ),
+          combinedSkills: teamCapabilities.combinedSkills,
+          combinedRoles: teamCapabilities.combinedRoles,
+          combinedInterests: teamCapabilities.combinedDomains,
+          missingRoles: teamCapabilities.missingRoles,
+          desiredSkills: [],
+        },
+        activeTeam: teamCapabilities.activeTeam ?? null,
+      });
+    } catch (error) {
+      console.error('Error in GET /api/discovery/students:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to load student discovery recommendations.',
+      });
+    }
+  }
+);
+
+/**
+ * Records a Pass or Interested swipe on a Student (or legacy Team).
+ * - Creates a mutual `direct_match` conversation AND an automatic 2-person team when two un-teamed students mutually swipe right.
+ * - Creates a `team_proposal` with unanimous member voting when a teamed student and a candidate mutually swipe right.
  */
 app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
@@ -4836,15 +6718,16 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
       customNote?: string;
     };
 
+    const targetType = body.targetType ?? 'user';
+
     if (
       !body.hackathonId ||
-      !body.targetType ||
       !body.targetId ||
       !body.decision
     ) {
       res.status(400).json({
         ok: false,
-        error: 'hackathonId, targetType, targetId, and decision are required.',
+        error: 'hackathonId, targetId, and decision are required.',
       });
       return;
     }
@@ -4852,16 +6735,13 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
     const result = await recordSwipeAndProcessMatchRecord({
       hackathonSlug: body.hackathonId,
       fromUid: authUser.uid,
-      targetType: body.targetType,
+      targetType,
       targetId: body.targetId,
       decision: body.decision,
       proposedRole: body.proposedRole,
       note: body.note ?? body.customNote,
     });
 
-    // Response contract used by the student UI: `matchedConversation` for a
-    // mutual person match and `createdJoinRequest` for a team application.
-    // The repository-level names are kept as aliases for compatibility.
     const payload: Record<string, unknown> = {
       ok: true,
       interest: result.interest,
@@ -4869,6 +6749,18 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
     if (result.mutualMatchConversation) {
       payload.matchedConversation = result.mutualMatchConversation;
       payload.mutualMatchConversation = result.mutualMatchConversation;
+    }
+    if (result.autoCreatedTeam) {
+      payload.autoCreatedTeam = result.autoCreatedTeam;
+    }
+    if (result.autoCreatedMemberships) {
+      payload.autoCreatedMemberships = result.autoCreatedMemberships;
+    }
+    if (result.teamRosterConversation) {
+      payload.teamRosterConversation = result.teamRosterConversation;
+    }
+    if (result.teamProposal) {
+      payload.teamProposal = result.teamProposal;
     }
     if (result.joinRequest) {
       payload.createdJoinRequest = result.joinRequest;
@@ -4880,28 +6772,621 @@ app.post('/api/swipes', requireAuth, async (req: AuthenticatedRequest, res) => {
 
     res.json(payload);
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith('TEAM_FULL:')) {
-      res.status(409).json({
-        ok: false,
-        error: error.message.replace('TEAM_FULL: ', ''),
-        userMessage: error.message.replace('TEAM_FULL: ', ''),
-      });
+    if (handleRepositoryError(error, res, 'Failed to record swipe.')) {
       return;
     }
-    if (error instanceof Error && error.message.startsWith('EVENT_')) {
-      const cleanMsg = error.message.replace(/^[A-Z_]+:\s*/, '');
-      res.status(400).json({
-        ok: false,
-        error: cleanMsg,
-        userMessage: cleanMsg,
+  }
+});
+
+/**
+ * Returns the authenticated student's 3-section Shortlist (`interested`, `interestedInYou`, `mutualMatches`).
+ */
+app.get(
+  '/api/swipes/shortlist',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      let hackathonSlug =
+        typeof req.query.hackathonId === 'string' && req.query.hackathonId.trim()
+          ? req.query.hackathonId.trim()
+          : '';
+      if (!hackathonSlug) {
+        const data = await loadBootstrapData(authUser.uid);
+        hackathonSlug =
+          data.hackathons.find((h) => h.matchable)?.id ??
+          data.hackathons[0]?.id ??
+          '';
+      }
+      const shortlist = await getShortlistForUserRecord({
+        uid: authUser.uid,
+        hackathonSlug,
       });
-      return;
+      const enriched = {
+        ...shortlist,
+        incomingInterested: shortlist.interestedInYou,
+      };
+      res.json({
+        ok: true,
+        ...enriched,
+        shortlist: enriched,
+      });
+    } catch (error) {
+      console.error('Error in GET /api/swipes/shortlist:', error);
+      res.status(500).json({
+        ok: false,
+        error: 'Failed to load shortlist.',
+      });
     }
-    console.error('Error in POST /api/swipes:', error);
+  }
+);
+
+/**
+ * Returns the authenticated student's mutual matches, shortlist, and conversations (`GET /api/matches`).
+ */
+app.get('/api/matches', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const data = await loadBootstrapData(authUser.uid);
+    const hackathonSlug =
+      typeof req.query.hackathonId === 'string' && req.query.hackathonId.trim()
+        ? req.query.hackathonId.trim()
+        : data.hackathons.find((h) => h.matchable)?.id ??
+          data.hackathons[0]?.id ??
+          '';
+    const shortlist = await getShortlistForUserRecord({
+      uid: authUser.uid,
+      hackathonSlug,
+    });
+    const conversations =
+      typeof req.query.hackathonId === 'string' && req.query.hackathonId.trim()
+        ? data.conversations.filter((c) => c.hackathonId === hackathonSlug)
+        : data.conversations;
+    const convIds = new Set(conversations.map((c) => c.id));
+    const messages = data.messages.filter((m) => convIds.has(m.conversationId));
+
+    res.json({
+      ok: true,
+      mutualMatches: shortlist.mutualMatches,
+      interested: shortlist.interested,
+      interestedInYou: shortlist.interestedInYou,
+      incomingInterested: shortlist.interestedInYou,
+      conversations,
+      messages,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/matches:', error);
     res.status(500).json({
       ok: false,
-      error: 'Failed to record swipe.',
+      error: 'Failed to load matches.',
     });
+  }
+});
+
+/**
+ * Helper to assemble rich team details for `GET /api/teams/me` and `GET /api/teams/:id`.
+ */
+function buildRichTeamSummary(params: {
+  team: Awaited<ReturnType<typeof loadBootstrapData>>['teams'][number];
+  viewerUid: string;
+  data: Awaited<ReturnType<typeof loadBootstrapData>>;
+}) {
+  const { team, viewerUid, data } = params;
+  const hackathon =
+    data.hackathons.find((h) => h.id === team.hackathonId) ?? null;
+  const activeMemberships = data.memberships.filter(
+    (m) => m.teamId === team.id && m.status === 'active'
+  );
+  const members = activeMemberships.map((m) => {
+    const u = data.users.find((usr) => usr.uid === m.uid);
+    const p = data.profiles[m.uid];
+    return {
+      membership: m,
+      user: u ?? null,
+      profile: p ?? null,
+    };
+  });
+
+  const capabilities = hackathon
+    ? computeTeamCombinedCapabilities({
+        viewerUid,
+        hackathon,
+        profiles: data.profiles,
+        participations: data.participations,
+        teams: data.teams,
+        memberships: data.memberships,
+      })
+    : null;
+
+  const proposals = (data.teamProposals ?? []).filter(
+    (tp) => tp.teamId === team.id
+  );
+
+  const existingRegistration = data.teamRegistrations?.[team.id] ?? null;
+  const readiness = computeTeamRegistrationReadiness({
+    memberCount: activeMemberships.length || team.memberCount,
+    minTeamSize: hackathon?.minTeamSize,
+    maxTeamSize: hackathon?.maxTeamSize ?? team.targetSize,
+    hackathonStatus: hackathon?.status,
+    registrationDeadline: hackathon?.registrationDeadline,
+    matchable: hackathon?.matchable,
+  });
+
+  const teamConversation =
+    data.conversations.find(
+      (c) => c.type === 'team_roster' && c.teamId === team.id
+    ) ?? null;
+
+  const registrationObj: TeamRegistration = existingRegistration ?? {
+    teamId: team.id,
+    hackathonId: team.hackathonId,
+    registrationStatus: readiness.computedStatus,
+    officialRegistrationUrl:
+      hackathon?.registrationUrl ?? hackathon?.verifiedCanonicalUrl ?? null,
+    externalRegistrationReference: null,
+    confirmationNotes: null,
+    registeredByUid: null,
+    registeredAt: null,
+    minRequiredMembers: readiness.minRequiredMembers,
+    maxAllowedMembers: readiness.maxAllowedMembers,
+    currentMemberCount: activeMemberships.length || team.memberCount,
+    isEligibleToRegister: readiness.isEligibleToRegister,
+    readinessReason: readiness.readinessReason,
+    updatedAt: team.createdAt,
+  };
+
+  return {
+    team,
+    hackathon,
+    members,
+    proposals,
+    teamRegistration: registrationObj,
+    registration: registrationObj,
+    capabilities: capabilities
+      ? {
+          combinedSkills: capabilities.combinedSkills,
+          combinedRoles: capabilities.combinedRoles,
+          combinedInterests: capabilities.combinedDomains,
+          missingRoles: capabilities.missingRoles,
+          desiredSkills: [],
+          maxCapacity: Math.min(
+            4,
+            hackathon?.maxTeamSize && hackathon.maxTeamSize > 0
+              ? hackathon.maxTeamSize
+              : 4
+          ),
+        }
+      : null,
+    teamConversationId: teamConversation?.id ?? null,
+  };
+}
+
+/**
+ * Returns the authenticated student's active team(s), pending candidate proposals,
+ * incoming team invitations, and registration readiness (`GET /api/teams/me`).
+ */
+app.get('/api/teams/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const hackathonSlug =
+      typeof req.query.hackathonId === 'string' && req.query.hackathonId.trim()
+        ? req.query.hackathonId.trim()
+        : undefined;
+
+    const data = await loadBootstrapData(authUser.uid);
+    const myActiveMemberships = data.memberships.filter(
+      (m) =>
+        m.uid === authUser.uid &&
+        m.status === 'active' &&
+        (!hackathonSlug || m.hackathonId === hackathonSlug)
+    );
+    const myTeamIds = new Set(myActiveMemberships.map((m) => m.teamId));
+    const myTeams = data.teams
+      .filter((t) => myTeamIds.has(t.id) && t.status !== 'locked')
+      .map((team) =>
+        buildRichTeamSummary({ team, viewerUid: authUser.uid, data })
+      );
+
+    // Also include incoming invitations where the current user is the proposed candidate
+    const incomingProposals = (data.teamProposals ?? []).filter(
+      (tp) =>
+        tp.candidateUid === authUser.uid &&
+        (!hackathonSlug || tp.hackathonId === hackathonSlug)
+    );
+
+    res.json({
+      ok: true,
+      activeTeam: myTeams[0] ?? null,
+      teams: myTeams,
+      incomingProposals,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/teams/me:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to load your team details.',
+    });
+  }
+});
+
+/**
+ * Returns a specific team's details, roster, proposals, and registration state (`GET /api/teams/:id`).
+ */
+app.get('/api/teams/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const teamId = String(req.params.id);
+    const data = await loadBootstrapData(authUser.uid);
+    const team = data.teams.find((t) => t.id === teamId);
+    if (!team) {
+      res.status(404).json({
+        ok: false,
+        error: 'Team not found.',
+      });
+      return;
+    }
+    const summary = buildRichTeamSummary({
+      team,
+      viewerUid: authUser.uid,
+      data,
+    });
+    res.json({
+      ok: true,
+      ...summary,
+    });
+  } catch (error) {
+    console.error('Error in GET /api/teams/:id:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to load team details.',
+    });
+  }
+});
+
+/**
+ * Updates a team's name, pitch, project idea, rolesNeeded, or targetSize (`PATCH /api/teams/:id`).
+ */
+app.patch(
+  '/api/teams/:id',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+      const body = (req.body ?? {}) as {
+        name?: string;
+        pitch?: string;
+        projectIdea?: string | null;
+        rolesNeeded?: string[];
+        customSpecializations?: string[];
+        targetSize?: number;
+      };
+
+      const updated = await updateTeamDetailsRecord({
+        teamSlug,
+        actorUid: authUser.uid,
+        name: body.name,
+        pitch: body.pitch,
+        projectIdea: body.projectIdea,
+        rolesNeeded: body.rolesNeeded,
+        customSpecializations: body.customSpecializations,
+        targetSize: body.targetSize,
+      });
+
+      res.json({
+        ok: true,
+        team: updated,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to update team details.');
+    }
+  }
+);
+
+/**
+ * Proposes a mutually matched student to join the proposer's existing team (`POST /api/teams/proposals`).
+ */
+app.post(
+  '/api/teams/proposals',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const body = (req.body ?? {}) as {
+        hackathonId?: string;
+        teamId?: string;
+        candidateUid?: string;
+        proposedRole?: string;
+        note?: string;
+        message?: string;
+      };
+
+      if (!body.teamId || !body.candidateUid) {
+        res.status(400).json({
+          ok: false,
+          error: 'teamId and candidateUid are required.',
+        });
+        return;
+      }
+
+      const proposal = await createTeamProposalRecord({
+        hackathonSlug: body.hackathonId ?? '',
+        teamSlug: body.teamId,
+        proposerUid: authUser.uid,
+        candidateUid: body.candidateUid,
+        proposedRole: body.proposedRole,
+        message: body.note ?? body.message,
+      });
+
+      res.status(201).json({
+        ok: true,
+        proposal,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to create team proposal.');
+    }
+  }
+);
+
+/**
+ * Records a current team member's vote ('approve' | 'reject') on a pending candidate proposal (`POST /api/teams/proposals/:id/vote`).
+ * - Unanimous approval transitions the proposal to `'invited'`.
+ * - Any single rejection immediately marks the proposal `'rejected'`.
+ */
+app.post(
+  '/api/teams/proposals/:id/vote',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const proposalUid = String(req.params.id);
+      const body = (req.body ?? {}) as {
+        decision?: 'approve' | 'reject';
+        vote?: 'approve' | 'reject';
+        comment?: string;
+      };
+      const decision = body.decision ?? body.vote;
+
+      if (decision !== 'approve' && decision !== 'reject') {
+        res.status(400).json({
+          ok: false,
+          error: 'vote/decision must be "approve" or "reject".',
+        });
+        return;
+      }
+
+      const result = await voteOnTeamProposalRecord({
+        proposalUid,
+        voterUid: authUser.uid,
+        decision,
+        comment: body.comment,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to record vote on team proposal.');
+    }
+  }
+);
+
+/**
+ * Allows an invited candidate to accept or decline a unanimously approved team invitation (`POST /api/teams/proposals/:id/accept`).
+ */
+app.post(
+  '/api/teams/proposals/:id/accept',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const proposalUid = String(req.params.id);
+      const rawDecision = (req.body ?? {}).decision;
+      const decision: 'accept' | 'decline' =
+        rawDecision === 'decline' || rawDecision === 'reject'
+          ? 'decline'
+          : 'accept';
+
+      const result = await respondToTeamProposalRecord({
+        proposalUid,
+        candidateUid: authUser.uid,
+        decision,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      handleRepositoryError(
+        error,
+        res,
+        'Failed to respond to team invitation.'
+      );
+    }
+  }
+);
+
+/**
+ * Allows a team member to leave a team (`POST /api/teams/:id/leave`).
+ * Reopens recruitment if the team was full, reassigns leader if needed, and blocks silent changes if already registered.
+ */
+app.post(
+  '/api/teams/:id/leave',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+
+      const result = await leaveTeamRecord({
+        teamSlug,
+        uid: authUser.uid,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+        remainingMembers: result.remainingMemberUids.length,
+        dissolved: result.remainingMemberUids.length === 0,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to leave team.');
+    }
+  }
+);
+
+/**
+ * Retrieves persistent group chat messages for a team (`GET /api/teams/:id/messages`).
+ * Restricted to active members of the team.
+ */
+app.get(
+  '/api/teams/:id/messages',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+
+      const result = await getTeamMessagesRecord({
+        teamSlug,
+        viewerUid: authUser.uid,
+      });
+
+      res.json({
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to load team messages.');
+    }
+  }
+);
+
+/**
+ * Sends a persistent message in a team's group chat (`POST /api/teams/:id/messages`).
+ * Restricted to active members of the team.
+ */
+app.post(
+  '/api/teams/:id/messages',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+      const { body } = (req.body ?? {}) as { body?: string };
+
+      if (!body || !body.trim()) {
+        res.status(400).json({
+          ok: false,
+          error: 'Message body cannot be empty.',
+        });
+        return;
+      }
+
+      const message = await createTeamMessageRecord({
+        teamSlug,
+        senderUid: authUser.uid,
+        body: body.trim(),
+      });
+
+      res.status(201).json({
+        ok: true,
+        message,
+        conversationId: message.conversationId,
+      });
+    } catch (error) {
+      handleRepositoryError(error, res, 'Failed to send team message.');
+    }
+  }
+);
+
+/**
+ * Updates a team's hackathon registration tracking status (`POST /api/teams/:id/registration`).
+ * Enforces verified team-size bounds (`minTeamSize` .. `maxTeamSize` / 4) before allowing `'ready_to_register'`, `'registration_in_progress'`, or `'registered'`.
+ */
+app.post(
+  '/api/teams/:id/registration',
+  requireAuth,
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const authUser = req.user!;
+      const teamSlug = String(req.params.id);
+      const body = (req.body ?? {}) as {
+        registrationStatus?: TeamRegistrationStatus;
+        status?: TeamRegistrationStatus;
+        externalRegistrationReference?: string | null;
+        confirmationNotes?: string | null;
+      };
+      const status = body.registrationStatus ?? body.status;
+
+      const validStatuses: TeamRegistrationStatus[] = [
+        'forming',
+        'ready_to_register',
+        'registration_in_progress',
+        'registered',
+        'registration_closed',
+      ];
+      if (!status || !validStatuses.includes(status)) {
+        res.status(400).json({
+          ok: false,
+          error:
+            'registrationStatus must be one of forming, ready_to_register, registration_in_progress, registered, registration_closed.',
+        });
+        return;
+      }
+
+      const teamRegistration = await updateTeamRegistrationRecord({
+        teamSlug,
+        actorUid: authUser.uid,
+        status,
+        externalRegistrationReference: body.externalRegistrationReference,
+        confirmationNotes: body.confirmationNotes,
+      });
+
+      res.json({
+        ok: true,
+        teamRegistration,
+        registration: teamRegistration,
+      });
+    } catch (error) {
+      handleRepositoryError(
+        error,
+        res,
+        'Failed to update team registration status.'
+      );
+    }
+  }
+);
+
+/**
+ * Blocks a user so neither user appears in the other's discovery or shortlist (`POST /api/blocks`).
+ */
+app.post('/api/blocks', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const authUser = req.user!;
+    const { blockedUid, targetUid, reason } = (req.body ?? {}) as {
+      blockedUid?: string;
+      targetUid?: string;
+      reason?: string;
+    };
+    const finalBlockedUid = (blockedUid ?? targetUid ?? '').trim();
+    if (!finalBlockedUid) {
+      res.status(400).json({
+        ok: false,
+        error: 'blockedUid is required.',
+      });
+      return;
+    }
+    await blockUserRecord({
+      blockerUid: authUser.uid,
+      blockedUid: finalBlockedUid,
+      reason,
+    });
+    res.status(201).json({ ok: true, blockedUid: finalBlockedUid });
+  } catch (error) {
+    handleRepositoryError(error, res, 'Failed to block user.');
   }
 });
 
@@ -4971,41 +7456,9 @@ app.post(
             resolvedTeam.memberCount >= resolvedTeam.targetSize),
       });
     } catch (error) {
-      if (error instanceof Error) {
-        if (error.message.startsWith('FORBIDDEN:')) {
-          res.status(403).json({
-            ok: false,
-            error: error.message.replace('FORBIDDEN: ', ''),
-            userMessage: error.message.replace('FORBIDDEN: ', ''),
-          });
-          return;
-        }
-        if (
-          error.message.startsWith('TEAM_FULL:') ||
-          error.message.startsWith('ALREADY_IN_TEAM:') ||
-          error.message.startsWith('ALREADY_RESOLVED:')
-        ) {
-          const clean = error.message.replace(/^[A-Z_]+:\s*/, '');
-          res.status(409).json({
-            ok: false,
-            error: clean,
-            userMessage: clean,
-          });
-          return;
-        }
-        if (error.message.startsWith('NOT_FOUND:')) {
-          res.status(404).json({
-            ok: false,
-            error: error.message.replace('NOT_FOUND: ', ''),
-          });
-          return;
-        }
+      if (handleRepositoryError(error, res, 'Failed to resolve join request.')) {
+        return;
       }
-      console.error('Error in POST /api/join-requests/:requestUid/resolve:', error);
-      res.status(500).json({
-        ok: false,
-        error: 'Failed to resolve join request.',
-      });
     }
   }
 );
@@ -5042,28 +7495,9 @@ app.post(
         message,
       });
     } catch (error) {
-      if (error instanceof Error) {
-        if (error.message.startsWith('FORBIDDEN:')) {
-          res.status(403).json({
-            ok: false,
-            error: error.message.replace('FORBIDDEN: ', ''),
-            userMessage: error.message.replace('FORBIDDEN: ', ''),
-          });
-          return;
-        }
-        if (error.message.startsWith('NOT_FOUND:')) {
-          res.status(404).json({
-            ok: false,
-            error: error.message.replace('NOT_FOUND: ', ''),
-          });
-          return;
-        }
+      if (handleRepositoryError(error, res, 'Failed to send message.')) {
+        return;
       }
-      console.error('Error in POST /api/conversations/:conversationUid/messages:', error);
-      res.status(500).json({
-        ok: false,
-        error: 'Failed to send message.',
-      });
     }
   }
 );

@@ -312,15 +312,217 @@ export function computeInterestCircles(
   });
 }
 
-/**
- * Fast O(N) Pass-1 count of eligible People without running TF-IDF when on the Teams tab.
- */
-export function countEligiblePeopleForHackathon(params: {
+const CORE_HACKATHON_ROLES = [
+  'Frontend / UI',
+  'Backend / APIs',
+  'AI / ML',
+  'Systems / Cloud',
+  'Product & UI/UX',
+  'Mobile',
+  'Hardware / IoT',
+  'Cybersecurity / CTF',
+];
+
+function normalizeControlledTag(tag: string): string {
+  return String(tag || '').toLowerCase().trim();
+}
+
+function normalizeRoleBucket(role: string): string {
+  const lower = role.trim().toLowerCase();
+  if (/front|react|ui\s*dev|web|next|tailwind/i.test(lower)) return 'Frontend / UI';
+  if (/back|api|node|express|postgres|database|server|golang|rust/i.test(lower)) return 'Backend / APIs';
+  if (/ai|ml|machine\s*learning|data|pytorch|llm|nlp|vision/i.test(lower)) return 'AI / ML';
+  if (/design|ux|figma|product|pitch/i.test(lower)) return 'Product & UI/UX';
+  if (/hardware|iot|embedded|robotics|arduino|ros|fpga/i.test(lower)) return 'Hardware / IoT';
+  if (/cyber|ctf|security|crypto|pentest/i.test(lower)) return 'Cybersecurity / CTF';
+  if (/mobile|android|ios|flutter|kotlin|react\s*native/i.test(lower)) return 'Mobile';
+  if (/system|cloud|devops|docker|kubernetes|infra/i.test(lower)) return 'Systems / Cloud';
+  return role.trim();
+}
+
+export function computeTeamCombinedCapabilities(params: {
+  viewerUid: string;
+  viewerProfile?: Profile;
+  hackathon: Hackathon;
+  profiles?: Record<string, Profile>;
+  allProfiles?: Profile[] | Record<string, Profile>;
+  participations?: Participation[];
+  teams?: Team[];
+  allTeams?: Team[];
+  memberships?: Membership[];
+  allMemberships?: Membership[];
+}): {
+  activeTeam: Team | undefined;
+  teamMemberUids: string[];
+  memberCount: number;
+  maxCapacity: number;
+  combinedSkills: string[];
+  combinedNormalizedSkills: Set<string>;
+  combinedRoles: string[];
+  combinedNormalizedRoles: Set<string>;
+  combinedDomains: string[];
+  missingRoles: string[];
+  desiredCapabilities: string[];
+} {
+  const {
+    viewerUid,
+    viewerProfile,
+    hackathon,
+    participations = [],
+  } = params;
+  const teams = params.teams ?? params.allTeams ?? [];
+  const memberships = params.memberships ?? params.allMemberships ?? [];
+  const profiles: Record<string, Profile> = params.profiles
+    ? { ...params.profiles }
+    : Array.isArray(params.allProfiles)
+      ? Object.fromEntries(params.allProfiles.map((p) => [p.uid, p]))
+      : { ...(params.allProfiles ?? {}) };
+  if (viewerProfile && viewerUid && !profiles[viewerUid]) {
+    profiles[viewerUid] = viewerProfile;
+  }
+
+  const hackathonTeamIds = new Set(
+    teams.filter((t) => t.hackathonId === hackathon.id).map((t) => t.id)
+  );
+  const viewerMembership = memberships.find(
+    (m) =>
+      m.uid === viewerUid &&
+      m.status === 'active' &&
+      (m.hackathonId === hackathon.id || (!m.hackathonId && hackathonTeamIds.has(m.teamId)))
+  );
+  const activeTeam = viewerMembership
+    ? teams.find((t) => t.id === viewerMembership.teamId && t.hackathonId === hackathon.id)
+    : teams.find(
+        (t) => t.hackathonId === hackathon.id && t.leaderId === viewerUid && t.status !== 'locked'
+      );
+
+  const teamMemberUids = activeTeam
+    ? Array.from(
+        new Set([
+          activeTeam.leaderId,
+          ...memberships
+            .filter((m) => m.teamId === activeTeam.id && m.status === 'active')
+            .map((m) => m.uid),
+        ])
+      )
+    : [viewerUid];
+
+  const combinedSkillsList: string[] = [];
+  const combinedNormalizedSkills = new Set<string>();
+  const combinedRolesList: string[] = [];
+  const combinedNormalizedRoles = new Set<string>();
+  const combinedDomainsList: string[] = [];
+  const combinedNormalizedDomains = new Set<string>();
+
+  for (const memberUid of teamMemberUids) {
+    const prof = profiles[memberUid];
+    const part = participations.find(
+      (p) => p.hackathonId === hackathon.id && p.uid === memberUid
+    );
+    const memberSkills = [
+      ...(prof?.skillTags ?? []),
+      ...(part?.skillsOffered ?? []),
+    ];
+    for (const sk of memberSkills) {
+      const norm = normalizeControlledTag(sk);
+      if (norm && !combinedNormalizedSkills.has(norm)) {
+        combinedNormalizedSkills.add(norm);
+        combinedSkillsList.push(sk.trim());
+      }
+    }
+
+    const memberRoles = [
+      ...(prof?.preferredRoles ?? []),
+      ...(part?.desiredRoles ?? []),
+    ];
+    for (const r of memberRoles) {
+      const bucket = normalizeRoleBucket(r);
+      if (bucket && !combinedNormalizedRoles.has(bucket.toLowerCase())) {
+        combinedNormalizedRoles.add(bucket.toLowerCase());
+        combinedRolesList.push(bucket);
+      }
+    }
+
+    const memberDomains = [
+      ...(prof?.interestTags ?? []),
+      ...(prof?.projectDomains ?? []),
+    ];
+    for (const d of memberDomains) {
+      const normD = normalizeControlledTag(d);
+      if (normD && !combinedNormalizedDomains.has(normD)) {
+        combinedNormalizedDomains.add(normD);
+        combinedDomainsList.push(d.trim());
+      }
+    }
+  }
+
+  // Determine missing roles & desired capabilities for the hackathon + team
+  const targetRoles = new Set<string>([
+    'Frontend / UI',
+    'Backend / APIs',
+    'AI / ML',
+    'Product & UI/UX',
+  ]);
+  for (const theme of hackathon.themes ?? []) {
+    if (/ai|ml|data|llm/i.test(theme)) targetRoles.add('AI / ML');
+    if (/iot|hardware|robot/i.test(theme)) targetRoles.add('Hardware / IoT');
+    if (/cyber|ctf|security/i.test(theme)) targetRoles.add('Cybersecurity / CTF');
+    if (/system|cloud|infra/i.test(theme)) targetRoles.add('Systems / Cloud');
+    if (/mobile|app/i.test(theme)) targetRoles.add('Mobile');
+  }
+  if (activeTeam) {
+    for (const needed of activeTeam.rolesNeeded ?? []) {
+      targetRoles.add(normalizeRoleBucket(needed));
+    }
+  }
+
+  const missingRoles = Array.from(targetRoles).filter(
+    (r) => !combinedNormalizedRoles.has(r.toLowerCase())
+  );
+
+  const desiredCapabilities = Array.from(
+    new Set([
+      ...missingRoles,
+      ...(activeTeam?.customSpecializations ?? []),
+      ...(activeTeam?.rolesNeeded ?? []).filter(
+        (r) => !combinedNormalizedRoles.has(normalizeRoleBucket(r).toLowerCase())
+      ),
+    ])
+  );
+
+  const eventMax =
+    hackathon.maxTeamSize && hackathon.maxTeamSize > 0
+      ? Math.min(4, hackathon.maxTeamSize)
+      : 4;
+  const maxCapacity = activeTeam
+    ? Math.min(eventMax, activeTeam.targetSize || eventMax)
+    : eventMax;
+
+  return {
+    activeTeam,
+    teamMemberUids,
+    memberCount: activeTeam ? Math.max(activeTeam.memberCount, teamMemberUids.length) : 1,
+    maxCapacity,
+    combinedSkills: combinedSkillsList,
+    combinedNormalizedSkills,
+    combinedRoles: combinedRolesList,
+    combinedNormalizedRoles,
+    combinedDomains: combinedDomainsList,
+    missingRoles:
+      missingRoles.length > 0
+        ? missingRoles
+        : CORE_HACKATHON_ROLES.filter((r) => !combinedNormalizedRoles.has(r.toLowerCase())).slice(0, 3),
+    desiredCapabilities,
+  };
+}
+
+function getEligibleCandidateUsers(params: {
   viewerUid: string;
   hackathon: Hackathon;
   users: User[];
   profiles: Record<string, Profile>;
   participations: Participation[];
+  teams?: Team[];
   memberships: Membership[];
   interests: Interest[];
   blocks: BlockRecord[];
@@ -328,13 +530,19 @@ export function countEligiblePeopleForHackathon(params: {
   roleFilter?: string;
   onlyFirstTimeHackers?: boolean;
   searchQuery?: string;
-}): number {
+}): {
+  user: User;
+  profile: Profile;
+  participation?: Participation;
+  candidateTeam?: Team;
+}[] {
   const {
     viewerUid,
     hackathon,
     users,
     profiles,
     participations,
+    teams = [],
     memberships,
     interests,
     blocks,
@@ -344,12 +552,53 @@ export function countEligiblePeopleForHackathon(params: {
     searchQuery,
   } = params;
 
-  if (!hackathon.matchable) return 0;
+  if (!hackathon.matchable) return [];
 
-  const userMap = new Map<string, User>();
-  for (let i = 0; i < users.length; i++) {
-    userMap.set(users[i].uid, users[i]);
+  const maxAllowedSize = Math.min(
+    4,
+    hackathon.maxTeamSize && hackathon.maxTeamSize > 0 ? hackathon.maxTeamSize : 4
+  );
+
+  const teamById = new Map<string, Team>();
+  for (const t of teams) {
+    if (t.hackathonId === hackathon.id) {
+      teamById.set(t.id, t);
+    }
   }
+
+  // Check if viewer is already in an active team for this hackathon
+  const viewerMembership = memberships.find(
+    (m) =>
+      m.uid === viewerUid &&
+      m.status === 'active' &&
+      (m.hackathonId === hackathon.id || (!m.hackathonId && teamById.has(m.teamId)))
+  );
+  const viewerTeam = viewerMembership
+    ? teamById.get(viewerMembership.teamId)
+    : teams.find(
+        (t) => t.hackathonId === hackathon.id && t.leaderId === viewerUid && t.status !== 'locked'
+      );
+
+  // If viewer's team is already full or locked, no further recruitment candidates are needed
+  if (
+    viewerTeam &&
+    (viewerTeam.status === 'full' ||
+      viewerTeam.status === 'locked' ||
+      viewerTeam.memberCount >= Math.min(maxAllowedSize, viewerTeam.targetSize || maxAllowedSize))
+  ) {
+    return [];
+  }
+
+  const viewerTeammateUids = new Set<string>(
+    viewerTeam
+      ? [
+          viewerTeam.leaderId,
+          ...memberships
+            .filter((m) => m.teamId === viewerTeam.id && m.status === 'active')
+            .map((m) => m.uid),
+        ]
+      : [viewerUid]
+  );
 
   const blockedUids = new Set(
     blocks
@@ -365,53 +614,130 @@ export function countEligiblePeopleForHackathon(params: {
       .map((i) => i.targetId)
   );
 
-  const activeMemberUidsInEvent = new Set(
-    memberships
-      .filter((m) => m.hackathonId === hackathon.id && m.status === 'active')
-      .map((m) => m.uid)
-  );
+  const participationByUid = new Map<string, Participation>();
+  for (const p of participations) {
+    if (p.hackathonId === hackathon.id) {
+      participationByUid.set(p.uid, p);
+    }
+  }
+
+  const activeMembershipByUid = new Map<string, Membership>();
+  for (const m of memberships) {
+    if (
+      m.status === 'active' &&
+      (m.hackathonId === hackathon.id || (!m.hackathonId && teamById.has(m.teamId)))
+    ) {
+      activeMembershipByUid.set(m.uid, m);
+    }
+  }
 
   const normQuery = searchQuery?.trim().toLowerCase() ?? '';
+  const results: {
+    user: User;
+    profile: Profile;
+    participation?: Participation;
+    candidateTeam?: Team;
+  }[] = [];
 
-  let count = 0;
-  for (let i = 0; i < participations.length; i++) {
-    const part = participations[i];
-    if (part.hackathonId !== hackathon.id) continue;
-    if (part.uid === viewerUid) continue;
-    if (!part.discoverable) continue;
-    if (blockedUids.has(part.uid)) continue;
-    if (swipedUserIds.has(part.uid)) continue;
-    if (activeMemberUidsInEvent.has(part.uid)) continue;
-
-    const candidateUser = userMap.get(part.uid);
-    const candidateProfile = profiles[part.uid];
-    if (!candidateUser || candidateUser.accountStatus !== 'active') continue;
+  for (const candidateUser of users) {
+    const uid = candidateUser.uid;
+    if (uid === viewerUid) continue;
+    if (viewerTeammateUids.has(uid)) continue;
+    if (candidateUser.accountStatus !== 'active') continue;
     if (candidateUser.verificationStatus === 'unverified') continue;
-    if (!candidateProfile || candidateProfile.visibility !== 'public_verified_students') continue;
+    if (candidateUser.privacyPreferences?.profileVisible === false) continue;
+    if (blockedUids.has(uid)) continue;
+    if (swipedUserIds.has(uid)) continue;
+
+    const candidateProfile = profiles[uid];
+    if (!candidateProfile || candidateProfile.visibility !== 'public_verified_students') {
+      continue;
+    }
+
+    const part = participationByUid.get(uid);
+    if (part && part.discoverable === false) continue;
+
+    // Check candidate's active team membership in this hackathon
+    const candidateMembership = activeMembershipByUid.get(uid);
+    const candidateTeam = candidateMembership
+      ? teamById.get(candidateMembership.teamId)
+      : undefined;
+
+    if (viewerTeam) {
+      // Viewer is already on a team -> can only recruit unassigned students (a student cannot belong to 2 teams)
+      if (candidateMembership) continue;
+    } else if (candidateMembership) {
+      // Viewer has no team, candidate is on a team -> only show if candidate's team is open and has capacity < maxAllowedSize
+      if (!candidateTeam) continue;
+      const cap = Math.min(maxAllowedSize, candidateTeam.targetSize || maxAllowedSize);
+      if (candidateTeam.status !== 'open' || candidateTeam.memberCount >= cap) {
+        continue;
+      }
+    }
+
     if (onlyFirstTimeHackers && !candidateProfile.isFirstTimeHacker) continue;
 
     if (roleFilter && roleFilter !== 'ALL') {
       const hasRole =
-        part.desiredRoles.includes(roleFilter) ||
+        (part?.desiredRoles ?? []).includes(roleFilter) ||
         candidateProfile.preferredRoles.includes(roleFilter) ||
-        candidateProfile.rolesWantToLearn.includes(roleFilter);
+        candidateProfile.rolesWantToLearn.includes(roleFilter) ||
+        candidateProfile.preferredRoles.some(
+          (r) => normalizeRoleBucket(r).toLowerCase() === normalizeRoleBucket(roleFilter).toLowerCase()
+        );
       if (!hasRole) continue;
     }
 
     if (activeCircleTags && activeCircleTags.length > 0) {
-      const inCircle = candidateProfile.interestTags.some((t) => activeCircleTags.includes(t));
+      const inCircle =
+        candidateProfile.interestTags.some((t) => activeCircleTags.includes(t)) ||
+        candidateProfile.projectDomains.some((t) => activeCircleTags.includes(t));
       if (!inCircle) continue;
     }
 
     if (normQuery) {
-      const hay = `${candidateUser.displayName} ${candidateProfile.headline} ${candidateProfile.skillTags.join(' ')} ${candidateProfile.interestTags.join(' ')}`.toLowerCase();
+      const hay = [
+        candidateUser.displayName,
+        candidateProfile.headline,
+        candidateProfile.about,
+        candidateProfile.skillTags.join(' '),
+        candidateProfile.interestTags.join(' '),
+        candidateProfile.projectDomains.join(' '),
+        candidateProfile.topicsToExplore.join(' '),
+        candidateProfile.preferredRoles.join(' '),
+      ]
+        .join(' ')
+        .toLowerCase();
       if (!hay.includes(normQuery)) continue;
     }
 
-    count += 1;
+    results.push({
+      user: candidateUser,
+      profile: candidateProfile,
+      participation: part,
+      candidateTeam,
+    });
   }
 
-  return count;
+  return results;
+}
+
+export function countEligiblePeopleForHackathon(params: {
+  viewerUid: string;
+  hackathon: Hackathon;
+  users: User[];
+  profiles: Record<string, Profile>;
+  participations: Participation[];
+  teams?: Team[];
+  memberships: Membership[];
+  interests: Interest[];
+  blocks: BlockRecord[];
+  activeCircleTags?: string[];
+  roleFilter?: string;
+  onlyFirstTimeHackers?: boolean;
+  searchQuery?: string;
+}): number {
+  return getEligibleCandidateUsers(params).length;
 }
 
 /**
@@ -490,7 +816,97 @@ export function countEligibleTeamsForHackathon(params: {
 }
 
 /**
- * Ranks People cards for a viewer within a selected hackathon.
+ * Computes regularized past swipe affinity (0..1) from the viewer's prior student swipes.
+ */
+function computePastSwipeAffinity(params: {
+  viewerUid: string;
+  candidateProfile: Profile;
+  candidateSkills: string[];
+  candidateRoles: string[];
+  profiles: Record<string, Profile>;
+  interests: Interest[];
+}): {
+  hasSwipeHistory: boolean;
+  score: number;
+  matchedLikedTag: string | null;
+} {
+  const { viewerUid, candidateProfile, candidateSkills, candidateRoles, profiles, interests } =
+    params;
+
+  const viewerUserSwipes = interests.filter(
+    (i) => i.fromUid === viewerUid && i.targetType === 'user'
+  );
+
+  if (viewerUserSwipes.length === 0) {
+    return { hasSwipeHistory: false, score: 0.5, matchedLikedTag: null };
+  }
+
+  const tagScoreMap = new Map<string, { pos: number; neg: number; label: string }>();
+  const recordSignal = (rawTag: string, isPositive: boolean) => {
+    const norm = normalizeControlledTag(rawTag);
+    if (!norm) return;
+    const prev = tagScoreMap.get(norm) ?? { pos: 0, neg: 0, label: rawTag.trim() };
+    if (isPositive) prev.pos += 1;
+    else prev.neg += 1;
+    tagScoreMap.set(norm, prev);
+  };
+
+  for (const sw of viewerUserSwipes) {
+    const targetProf = profiles[sw.targetId];
+    if (!targetProf) continue;
+    const isPos = sw.decision === 'interested';
+    for (const sk of targetProf.skillTags) recordSignal(sk, isPos);
+    for (const dom of [...targetProf.interestTags, ...targetProf.projectDomains]) {
+      recordSignal(dom, isPos);
+    }
+    for (const role of targetProf.preferredRoles) recordSignal(role, isPos);
+  }
+
+  const candidateSignals = [
+    ...candidateSkills,
+    ...candidateProfile.interestTags,
+    ...candidateProfile.projectDomains,
+    ...candidateRoles,
+  ];
+
+  let netSignal = 0;
+  let signalMatches = 0;
+  let bestLikedLabel: string | null = null;
+  let bestLikedWeight = 0;
+
+  for (const sig of candidateSignals) {
+    const norm = normalizeControlledTag(sig);
+    const entry = tagScoreMap.get(norm);
+    if (!entry) continue;
+    signalMatches += 1;
+    // Bayesian smoothed affinity per tag: (pos - 0.6 * neg) / (pos + neg + 2)
+    const tagAffinity = (entry.pos - 0.6 * entry.neg) / (entry.pos + entry.neg + 2);
+    netSignal += tagAffinity;
+    if (entry.pos > entry.neg && tagAffinity > bestLikedWeight) {
+      bestLikedWeight = tagAffinity;
+      bestLikedLabel = entry.label;
+    }
+  }
+
+  if (signalMatches === 0) {
+    return { hasSwipeHistory: true, score: 0.5, matchedLikedTag: null };
+  }
+
+  const avgSignal = netSignal / Math.sqrt(signalMatches);
+  // Clamp smoothly into [0.15, 0.95] around neutral 0.5
+  const clamped = Math.max(0.15, Math.min(0.95, 0.5 + avgSignal * 0.45));
+  return {
+    hasSwipeHistory: true,
+    score: clamped,
+    matchedLikedTag: bestLikedLabel,
+  };
+}
+
+/**
+ * Explainable Student-Only Recommendation Engine (Part C):
+ * - 45% Skill Complementarity (evaluated against the combined skills & roles of the viewer's active team in the hackathon, or the viewer solo)
+ * - 35% Shared Interests & Project Themes (Jaccard + TF-IDF across interests, project domains, topics to explore, past projects, and hackathon themes)
+ * - 20% Past Swipe Behavior (regularized affinity from past right/left swipes, with proportional cold-start redistribution when viewer has 0 swipes)
  */
 export function rankPeopleForHackathon(params: {
   viewerUid: string;
@@ -523,81 +939,42 @@ export function rankPeopleForHackathon(params: {
     searchQuery,
   } = params;
 
-  if (!hackathon.matchable) {
-    return { cards: [], internalScores: new Map() };
-  }
+  const eligibleCandidates = getEligibleCandidateUsers({
+    viewerUid,
+    hackathon,
+    users,
+    profiles,
+    participations,
+    teams,
+    memberships,
+    interests,
+    blocks,
+    activeCircleTags,
+    roleFilter,
+    onlyFirstTimeHackers,
+    searchQuery,
+  });
 
-  const userMap = new Map<string, User>();
-  for (let i = 0; i < users.length; i++) {
-    userMap.set(users[i].uid, users[i]);
+  if (eligibleCandidates.length === 0) {
+    return { cards: [], internalScores: new Map() };
   }
 
   const viewerProfile = profiles[viewerUid];
   const viewerParticipation = participations.find(
     (p) => p.hackathonId === hackathon.id && p.uid === viewerUid
   );
-  const viewerTeam = teams.find(
-    (t) => t.hackathonId === hackathon.id && t.leaderId === viewerUid && t.status === 'open'
-  );
 
-  const blockedUids = new Set(
-    blocks
-      .filter((b) => b.blockerUid === viewerUid || b.blockedUid === viewerUid)
-      .map((b) => (b.blockerUid === viewerUid ? b.blockedUid : b.blockerUid))
-  );
-
-  const swipedUserIds = new Set(
-    interests
-      .filter(
-        (i) => i.hackathonId === hackathon.id && i.fromUid === viewerUid && i.targetType === 'user'
-      )
-      .map((i) => i.targetId)
-  );
-
-  const activeMemberUidsInEvent = new Set(
-    memberships
-      .filter((m) => m.hackathonId === hackathon.id && m.status === 'active')
-      .map((m) => m.uid)
-  );
-
-  const normQuery = searchQuery?.trim().toLowerCase() ?? '';
-
-  const eligibleParticipations = participations.filter((part) => {
-    if (part.hackathonId !== hackathon.id) return false;
-    if (part.uid === viewerUid) return false;
-    if (!part.discoverable) return false;
-    if (blockedUids.has(part.uid)) return false;
-    if (swipedUserIds.has(part.uid)) return false;
-    if (activeMemberUidsInEvent.has(part.uid)) return false;
-
-    const candidateUser = userMap.get(part.uid);
-    const candidateProfile = profiles[part.uid];
-    if (!candidateUser || candidateUser.accountStatus !== 'active') return false;
-    if (candidateUser.verificationStatus === 'unverified') return false;
-    if (!candidateProfile || candidateProfile.visibility !== 'public_verified_students') return false;
-
-    if (onlyFirstTimeHackers && !candidateProfile.isFirstTimeHacker) return false;
-
-    if (roleFilter && roleFilter !== 'ALL') {
-      const hasRole =
-        part.desiredRoles.includes(roleFilter) ||
-        candidateProfile.preferredRoles.includes(roleFilter) ||
-        candidateProfile.rolesWantToLearn.includes(roleFilter);
-      if (!hasRole) return false;
-    }
-
-    if (activeCircleTags && activeCircleTags.length > 0) {
-      const inCircle = candidateProfile.interestTags.some((t) => activeCircleTags.includes(t));
-      if (!inCircle) return false;
-    }
-
-    if (normQuery) {
-      const hay = `${candidateUser.displayName} ${candidateProfile.headline} ${candidateProfile.skillTags.join(' ')} ${candidateProfile.interestTags.join(' ')}`.toLowerCase();
-      if (!hay.includes(normQuery)) return false;
-    }
-
-    return true;
+  // Compute combined team capabilities (across ALL active members if viewer is in a team!)
+  const teamCaps = computeTeamCombinedCapabilities({
+    viewerUid,
+    hackathon,
+    profiles,
+    participations,
+    teams,
+    memberships,
   });
+  const viewerTeam = teamCaps.activeTeam;
+  const isTeamContext = teamCaps.teamMemberUids.length > 1 || Boolean(viewerTeam);
 
   const buildProfileAbstract = (prof: Profile, part?: Participation): string => {
     const projText = prof.featuredProjects
@@ -606,25 +983,39 @@ export function rankPeopleForHackathon(params: {
     return [
       prof.headline,
       prof.about,
-      prof.skillTags.join(' '),
-      prof.interestTags.join(' '),
-      prof.projectDomains.join(' '),
-      prof.topicsToExplore.join(' '),
+      (prof.skillTags ?? []).join(' '),
+      (prof.interestTags ?? []).join(' '),
+      (prof.projectDomains ?? []).join(' '),
+      (prof.topicsToExplore ?? []).join(' '),
       projText,
-      part ? part.skillsOffered.join(' ') : '',
+      part ? (part.skillsOffered ?? []).join(' ') : '',
     ].join(' ');
   };
 
-  const candidateAbstracts = eligibleParticipations.map((p) =>
-    buildProfileAbstract(profiles[p.uid], p)
+  const candidateAbstracts = eligibleCandidates.map((c) =>
+    buildProfileAbstract(c.profile, c.participation)
   );
   const precomputedCorpus = precomputeTfIdfCorpus(candidateAbstracts);
 
-  const viewerAbstract = viewerTeam
-    ? `${viewerTeam.name} ${viewerTeam.pitch} ${viewerTeam.projectIdea ?? ''} ${viewerTeam.desiredDomains.join(' ')} ${viewerTeam.rolesNeeded.join(' ')} ${(viewerTeam.customSpecializations ?? []).join(' ')}`
-    : viewerProfile
-    ? buildProfileAbstract(viewerProfile, viewerParticipation)
-    : hackathon.themes.join(' ');
+  // Build combined viewer/team abstract for TF-IDF theme similarity
+  const combinedMemberAbstracts = teamCaps.teamMemberUids
+    .map((uid) => {
+      const p = profiles[uid];
+      const part = participations.find((x) => x.hackathonId === hackathon.id && x.uid === uid);
+      return p ? buildProfileAbstract(p, part) : '';
+    })
+    .filter(Boolean)
+    .join(' ');
+
+  const viewerAbstract = [
+    combinedMemberAbstracts,
+    viewerTeam
+      ? `${viewerTeam.name} ${viewerTeam.pitch ?? ''} ${viewerTeam.projectIdea ?? ''} ${(viewerTeam.desiredDomains ?? []).join(' ')} ${(viewerTeam.rolesNeeded ?? []).join(' ')} ${(viewerTeam.customSpecializations ?? []).join(' ')}`
+      : '',
+    (hackathon.themes ?? []).join(' '),
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   const viewerTokens = tokenizeControlled(viewerAbstract);
   const viewerCounts = new Map<string, number>();
@@ -634,14 +1025,109 @@ export function rankPeopleForHackathon(params: {
     viewerSet.add(t);
   }
 
+  // Combined interests & domains of the viewer / viewer's team + hackathon themes
+  const viewerCombinedInterests = Array.from(
+    new Set([
+      ...teamCaps.teamMemberUids.flatMap((uid) => [
+        ...(profiles[uid]?.interestTags ?? []),
+        ...(profiles[uid]?.projectDomains ?? []),
+        ...(profiles[uid]?.topicsToExplore ?? []),
+      ]),
+      ...(viewerTeam?.desiredDomains ?? []),
+      ...(hackathon.themes ?? []),
+    ])
+  );
+
   const internalScores = new Map<string, number>();
   const scoredCards: { card: CandidateCard; score: number }[] = [];
 
-  for (let idx = 0; idx < eligibleParticipations.length; idx++) {
-    const part = eligibleParticipations[idx];
-    const user = userMap.get(part.uid)!;
-    const prof = profiles[part.uid]!;
+  for (let idx = 0; idx < eligibleCandidates.length; idx++) {
+    const { user, profile: prof, participation: part, candidateTeam } = eligibleCandidates[idx];
     const candidateAbstract = candidateAbstracts[idx];
+
+    const candidateSkills = Array.from(
+      new Set([...(part?.skillsOffered ?? []), ...prof.skillTags])
+    );
+    const candidateOfferedRoles = Array.from(
+      new Set([...(part?.desiredRoles ?? []), ...prof.preferredRoles])
+    );
+
+    // =========================================================================
+    // FACTOR A: SKILL COMPLEMENTARITY (45%)
+    // Evaluated against the combined skills and roles of the viewer's team (or viewer solo)
+    // =========================================================================
+    const complementarySkills = candidateSkills.filter(
+      (sk) => !teamCaps.combinedNormalizedSkills.has(normalizeControlledTag(sk))
+    );
+    const complementaryRoles = candidateOfferedRoles.filter((r) => {
+      const bucket = normalizeRoleBucket(r).toLowerCase();
+      return (
+        !teamCaps.combinedNormalizedRoles.has(bucket) ||
+        teamCaps.missingRoles.some((mr) => mr.toLowerCase() === bucket)
+      );
+    });
+
+    const customSpecMatch = matchCustomSpecializations(
+      viewerTeam?.customSpecializations,
+      prof,
+      part
+    );
+
+    // How many of the candidate's complementary skills align with the hackathon themes or missing roles?
+    const hackathonThemeSet = new Set(
+      hackathon.themes.map((t) => normalizeControlledTag(t))
+    );
+    const themeAlignedNewSkills = complementarySkills.filter((sk) =>
+      hackathonThemeSet.has(normalizeControlledTag(sk))
+    );
+
+    const newSkillRatio =
+      candidateSkills.length > 0
+        ? Math.min(1, complementarySkills.length / Math.min(3, Math.max(1, candidateSkills.length)))
+        : 0.35;
+
+    const missingRoleFillRatio =
+      teamCaps.missingRoles.length > 0
+        ? Math.min(
+            1,
+            complementaryRoles.length / Math.min(2, teamCaps.missingRoles.length)
+          )
+        : complementaryRoles.length > 0
+        ? 0.75
+        : 0.4;
+
+    const themeSkillBonus = themeAlignedNewSkills.length > 0 ? 0.15 : 0;
+
+    let skillComplementarityScore = Math.min(
+      1,
+      0.5 * newSkillRatio + 0.4 * missingRoleFillRatio + 0.1 * customSpecMatch.score + themeSkillBonus
+    );
+    if (
+      viewerTeam?.customSpecializations &&
+      viewerTeam.customSpecializations.length > 0 &&
+      customSpecMatch.score > 0
+    ) {
+      skillComplementarityScore = Math.min(
+        1,
+        0.7 * skillComplementarityScore + 0.3 * customSpecMatch.score
+      );
+    }
+
+    // =========================================================================
+    // FACTOR B: SHARED INTERESTS & PROJECT THEMES (35%)
+    // =========================================================================
+    const candidateInterestsAndDomains = Array.from(
+      new Set([
+        ...prof.interestTags,
+        ...prof.projectDomains,
+        ...prof.topicsToExplore,
+      ])
+    );
+
+    const { score: interestSim, shared: sharedInterests } = jaccardOverlap(
+      viewerCombinedInterests,
+      candidateInterestsAndDomains
+    );
 
     const tfidfSim = computeFastTfIdfCosine(
       viewerTokens,
@@ -651,156 +1137,80 @@ export function rankPeopleForHackathon(params: {
       precomputedCorpus
     );
 
-    const viewerInterests = viewerTeam
-      ? viewerTeam.desiredDomains
-      : viewerProfile?.interestTags ?? hackathon.themes;
-    const { score: interestSim, shared: sharedInterests } = jaccardOverlap(
-      viewerInterests,
-      prof.interestTags
+    const sharedInterestsScore = Math.min(
+      1,
+      0.6 * interestSim + 0.4 * Math.min(1, tfidfSim * 2.2)
     );
 
-    const viewerAvail = viewerParticipation?.availabilityWindows ?? [];
-    const { score: availSim, shared: sharedAvail } = jaccardOverlap(
-      viewerAvail,
-      part.availabilityWindows
-    );
+    // =========================================================================
+    // FACTOR C: PAST SWIPE BEHAVIOR (20%)
+    // =========================================================================
+    const swipeAffinity = computePastSwipeAffinity({
+      viewerUid,
+      candidateProfile: prof,
+      candidateSkills,
+      candidateRoles: candidateOfferedRoles,
+      profiles,
+      interests,
+    });
 
-    const viewerWorkStyle = viewerTeam
-      ? viewerTeam.workStyleTags
-      : viewerParticipation?.workPreferences ?? viewerProfile?.workingStyleTags ?? [];
-    const { score: collabSim, shared: sharedWorkStyle } = jaccardOverlap(
-      viewerWorkStyle,
-      part.workPreferences.length > 0 ? part.workPreferences : prof.workingStyleTags
-    );
+    const coldStartRedistributed = !swipeAffinity.hasSwipeHistory;
+    // When viewer has no prior swipes, redistribute the 20% weight proportionally:
+    // 0.45 / 0.80 = 0.5625 and 0.35 / 0.80 = 0.4375
+    const totalScore = coldStartRedistributed
+      ? 0.5625 * skillComplementarityScore + 0.4375 * sharedInterestsScore
+      : 0.45 * skillComplementarityScore +
+        0.35 * sharedInterestsScore +
+        0.20 * swipeAffinity.score;
 
-    const viewerSkills = Array.from(
-      new Set([
-        ...(viewerParticipation?.skillsOffered ?? []),
-        ...(viewerProfile?.skillTags ?? []),
-      ])
-    );
-    const candidateSkills = Array.from(
-      new Set([...part.skillsOffered, ...prof.skillTags])
-    );
-    const { score: skillSim, shared: sharedSkills } = jaccardOverlap(
-      viewerSkills,
-      candidateSkills
-    );
-
-    const hasViewerStyle = Boolean(viewerWorkStyle.length > 0);
-    const hasCandidateStyle = Boolean(
-      part.workPreferences.length > 0 || prof.workingStyleTags.length > 0
-    );
-    const effectiveCollabSim =
-      hasViewerStyle && hasCandidateStyle ? collabSim : skillSim > 0 ? skillSim : 0.5;
-
-    const hasViewerAvail = Boolean(viewerAvail.length > 0);
-    const hasCandidateAvail = Boolean(part.availabilityWindows.length > 0);
-    const effectiveAvailSim =
-      hasViewerAvail && hasCandidateAvail ? availSim : 0.6;
-
-    const rolesNeededByViewer = viewerTeam
-      ? viewerTeam.rolesNeeded
-      : viewerProfile
-      ? ['Frontend', 'Backend', 'ML/Data', 'Product/UI Design', 'Hardware/Embedded'].filter(
-          (r) => !viewerProfile.preferredRoles.includes(r)
-        )
-      : [];
-
-    const candidateOfferedRoles = Array.from(
-      new Set([...part.desiredRoles, ...prof.preferredRoles])
-    );
-    const complementaryRoles = candidateOfferedRoles.filter((r) =>
-      rolesNeededByViewer.includes(r)
-    );
-
-    // Match custom specializations when recruiting for a team
-    const customSpecMatch = matchCustomSpecializations(
-      viewerTeam?.customSpecializations,
-      prof,
-      part
-    );
-
-    const baseRoleScore =
-      rolesNeededByViewer.length > 0
-        ? Math.min(1, complementaryRoles.length / Math.min(2, rolesNeededByViewer.length))
-        : 0.5;
-
-    const combinedRoleAndSpecScore =
-      viewerTeam?.customSpecializations && viewerTeam.customSpecializations.length > 0
-        ? 0.65 * baseRoleScore + 0.35 * customSpecMatch.score
-        : baseRoleScore;
-
-    const isColdStart = Boolean(prof.isFirstTimeHacker && !prof.githubUsername);
-    const isSparseProfile =
-      (!prof.githubUsername && prof.featuredProjects.length === 0) || !prof.about;
-    const explorationBonus = prof.isFirstTimeHacker ? 0.85 : 0.5;
-
-    let totalScore = 0;
-    const isRecruitingMode = Boolean(
-      viewerTeam || viewerParticipation?.intent === 'recruiting'
-    );
-
-    if (isRecruitingMode) {
-      const skillComplement =
-        isColdStart || isSparseProfile
-          ? Math.max(interestSim, skillSim, customSpecMatch.score)
-          : Math.max(tfidfSim, customSpecMatch.score);
-      totalScore =
-        0.35 * combinedRoleAndSpecScore +
-        0.25 * interestSim +
-        0.20 * effectiveAvailSim +
-        0.15 * skillComplement +
-        0.05 * explorationBonus;
-    } else {
-      const effectiveThemeSim =
-        isColdStart || isSparseProfile
-          ? Math.max(tfidfSim, interestSim, skillSim)
-          : tfidfSim;
-      totalScore =
-        0.35 * interestSim +
-        0.25 * effectiveThemeSim +
-        0.20 * effectiveAvailSim +
-        0.15 * effectiveCollabSim +
-        0.05 * explorationBonus;
-    }
-
+    // =========================================================================
+    // EXPLAINABLE RECOMMENDATION REASONS (Grounded, human-readable)
+    // =========================================================================
     const reasons: string[] = [];
+
     if (customSpecMatch.matchedOriginalLabels.length > 0) {
       reasons.push(
-        `Matches team specialization: ${customSpecMatch.matchedOriginalLabels.join(' & ')}`
+        `Complements your team specialization: ${customSpecMatch.matchedOriginalLabels.slice(0, 2).join(', ')}`
       );
     }
 
-    if (complementaryRoles.length > 0) {
+    if (complementarySkills.length > 0) {
+      const topNewSkills = complementarySkills.slice(0, 3).join(', ');
       reasons.push(
-        viewerTeam
-          ? `Fills open ${complementaryRoles.join(' / ')} role on ${viewerTeam.name.split(' (')[0]}`
-          : `Complements your stack with ${complementaryRoles.join(' & ')}`
+        isTeamContext
+          ? `Complements your team: ${topNewSkills}`
+          : `Complements your skills: ${topNewSkills}`
       );
-    } else if (prof.rolesWantToLearn.length > 0 && prof.isFirstTimeHacker) {
+    } else if (complementaryRoles.length > 0) {
       reasons.push(
-        `First-time hacker eager to contribute in ${candidateOfferedRoles.join('/')} and explore ${prof.rolesWantToLearn.join('/')}`
+        isTeamContext
+          ? `Fills needed ${complementaryRoles.slice(0, 2).join(' & ')} role on your team`
+          : `Brings ${complementaryRoles.slice(0, 2).join(' & ')} role coverage`
       );
     }
 
     if (sharedInterests.length > 0) {
       reasons.push(`Shared interest in ${sharedInterests.slice(0, 2).join(' & ')}`);
-    }
-
-    if (sharedSkills.length > 0 && reasons.length < 3) {
-      reasons.push(`Matching skills in ${sharedSkills.slice(0, 2).join(' & ')}`);
-    }
-
-    if (sharedAvail.length > 0 && reasons.length < 3) {
-      reasons.push(`Available during ${sharedAvail.slice(0, 2).join(' and ')}`);
-    } else if (sharedWorkStyle.length > 0 && reasons.length < 3) {
-      reasons.push(`Matches your ${sharedWorkStyle[0].toLowerCase()} collaboration style`);
+    } else if (prof.projectDomains.length > 0) {
+      reasons.push(`Worked on ${prof.projectDomains.slice(0, 2).join(' & ')} projects`);
     }
 
     if (prof.featuredProjects.length > 0 && reasons.length < 3) {
-      reasons.push(`Has built "${prof.featuredProjects[0].title}"`);
+      reasons.push(`Built "${prof.featuredProjects[0].title}"`);
+    } else if (swipeAffinity.matchedLikedTag && reasons.length < 3) {
+      reasons.push(`Matches your interest in ${swipeAffinity.matchedLikedTag} builders`);
     }
+
+    if (candidateTeam && reasons.length < 3) {
+      const cap = Math.min(4, candidateTeam.targetSize || 4);
+      reasons.push(
+        `Building with ${candidateTeam.name} (${candidateTeam.memberCount}/${cap} members)`
+      );
+    }
+
+    const viewerAvail = viewerParticipation?.availabilityWindows ?? [];
+    const candidateAvail = part?.availabilityWindows ?? [];
+    const { score: availSim } = jaccardOverlap(viewerAvail, candidateAvail);
 
     const icebreakerDrafts = viewerProfile
       ? generateTechnicalIcebreakerDrafts({
@@ -810,7 +1220,7 @@ export function rankPeopleForHackathon(params: {
           sharedInterests,
           complementaryRoles: [
             ...complementaryRoles,
-            ...customSpecMatch.matchedOriginalLabels,
+            ...complementarySkills.slice(0, 2),
           ],
           customPrompt: prof.icebreakerPrompt,
         })
@@ -828,7 +1238,7 @@ export function rankPeopleForHackathon(params: {
         subtitle: `${prof.headline} · ${user.campus}`,
         campus: user.campus,
         isFirstTimeHacker: prof.isFirstTimeHacker,
-        skills: Array.from(new Set([...part.skillsOffered, ...prof.skillTags])).slice(0, 7),
+        skills: candidateSkills.slice(0, 8),
         rolesOfferedOrNeeded: candidateOfferedRoles,
         matchedSpecializations: customSpecMatch.matchedOriginalLabels,
         rolesWantToLearn: prof.rolesWantToLearn,
@@ -839,20 +1249,40 @@ export function rankPeopleForHackathon(params: {
           isCoursework: fp.isCourseworkOrIdea,
         })),
         compatibilityReasons: reasons.slice(0, 3),
-        availabilitySummary: part.availabilityWindows.join(' · '),
-        commitmentLevel: part.commitmentLevel,
-        workingStyle: part.workPreferences.length > 0 ? part.workPreferences : prof.workingStyleTags,
+        availabilitySummary:
+          candidateAvail.length > 0
+            ? candidateAvail.join(' · ')
+            : prof.workingStyleTags.slice(0, 2).join(' · ') || 'Flexible schedule',
+        commitmentLevel: part?.commitmentLevel,
+        workingStyle:
+          part && part.workPreferences.length > 0
+            ? part.workPreferences
+            : prof.workingStyleTags,
         sharedInterests,
-        complementaryRoles,
+        complementaryRoles:
+          complementaryRoles.length > 0 ? complementaryRoles : complementarySkills.slice(0, 2),
         icebreakerDrafts,
         featureBreakdown: {
-          mode: isRecruitingMode ? 'team_candidate' : 'peer',
-          primaryFitLabel: isRecruitingMode ? 'Missing-Role & Spec Fit' : 'Interest & Project Affinity',
-          interestOrRoleSim: Math.round((isRecruitingMode ? combinedRoleAndSpecScore : interestSim) * 100),
-          tfidfThemeSim: Math.round(tfidfSim * 100),
-          availabilitySim: Math.round((viewerAvail.length > 0 ? availSim : 0.6) * 100),
-          collabOrSkillSim: Math.round(collabSim * 100),
-          coldStartRedistributed: isColdStart,
+          mode: isTeamContext ? 'team_candidate' : 'peer',
+          primaryFitLabel:
+            skillComplementarityScore >= sharedInterestsScore
+              ? isTeamContext
+                ? 'Team Skill Complementarity'
+                : 'Skill & Role Complementarity'
+              : 'Shared Themes & Project Fit',
+          interestOrRoleSim: Math.round(skillComplementarityScore * 100),
+          tfidfThemeSim: Math.round(sharedInterestsScore * 100),
+          availabilitySim: Math.round((viewerAvail.length > 0 ? availSim : 0.75) * 100),
+          collabOrSkillSim: Math.round(swipeAffinity.score * 100),
+          coldStartRedistributed,
+          skillComplementarity: Math.round(skillComplementarityScore * 100),
+          skillComplementarityScore: Math.round(skillComplementarityScore * 100),
+          sharedInterestsScore: Math.round(sharedInterestsScore * 100),
+          pastSwipeAffinityScore: Math.round(swipeAffinity.score * 100),
+          totalScore: Math.round(totalScore * 100),
+          evaluatedAgainstTeamId: viewerTeam?.id,
+          evaluatedAgainstMemberCount: teamCaps.teamMemberUids.length,
+          complementarySkills: complementarySkills.slice(0, 5),
         },
       },
     });
@@ -864,6 +1294,72 @@ export function rankPeopleForHackathon(params: {
     internalScores,
   };
 }
+
+export function rankStudentsForHackathon(params: {
+  viewerUid?: string;
+  currentUser?: User;
+  currentProfile?: Profile;
+  hackathon: Hackathon;
+  users?: User[];
+  allUsers?: User[];
+  profiles?: Record<string, Profile>;
+  allProfiles?: Record<string, Profile>;
+  participations: Participation[];
+  teams: Team[];
+  memberships: Membership[];
+  interests?: Interest[];
+  existingInterests?: Interest[];
+  blocks: BlockRecord[];
+  activeCircleTags?: string[];
+  roleFilter?: string;
+  onlyFirstTimeHackers?: boolean;
+  searchQuery?: string;
+}): Array<
+  CandidateCard & {
+    overallScore: number;
+    reasons: string[];
+  }
+> & {
+  cards: CandidateCard[];
+  internalScores: Map<string, number>;
+} {
+  const viewerUid = params.viewerUid ?? params.currentUser?.uid ?? '';
+  const users = params.users ?? params.allUsers ?? [];
+  const baseProfiles = params.profiles ?? params.allProfiles ?? {};
+  const profiles: Record<string, Profile> =
+    params.currentProfile && viewerUid && !baseProfiles[viewerUid]
+      ? { ...baseProfiles, [viewerUid]: params.currentProfile }
+      : baseProfiles;
+  const interests = params.interests ?? params.existingInterests ?? [];
+
+  const { cards, internalScores } = rankPeopleForHackathon({
+    viewerUid,
+    hackathon: params.hackathon,
+    users,
+    profiles,
+    participations: params.participations,
+    teams: params.teams,
+    memberships: params.memberships,
+    interests,
+    blocks: params.blocks,
+    activeCircleTags: params.activeCircleTags,
+    roleFilter: params.roleFilter,
+    onlyFirstTimeHackers: params.onlyFirstTimeHackers,
+    searchQuery: params.searchQuery,
+  });
+
+  const enriched = cards.map((card) => ({
+    ...card,
+    overallScore: internalScores.get(card.id) ?? card.featureBreakdown.totalScore ?? 0,
+    reasons: card.compatibilityReasons.slice(0, 2),
+  }));
+
+  return Object.assign(enriched, {
+    cards,
+    internalScores,
+  });
+}
+
 
 /**
  * Ranks open Teams for a viewer within a selected hackathon, including customSpecializations matching.

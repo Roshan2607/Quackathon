@@ -1262,6 +1262,16 @@ export interface PesuOAuthSignInStartResult {
   ok: boolean;
   authUrl?: string;
   state?: string;
+  redirectUri?: string;
+  canonicalAppOrigin?: string;
+  initiatingOrigin?: string;
+  configuredCallbackOrigin?: string;
+  initiationCookieStatus?: 'existing' | 'new';
+  publicClientId?: string | null;
+  portalManageUrl?: string | null;
+  providerRedirectUriRegistered?: boolean | null;
+  userMessage?: string;
+  diagnostics?: DeveloperDiagnosticTelemetry;
   errorMessage?: string;
 }
 
@@ -1269,19 +1279,36 @@ export interface PesuOAuthSignInStartResult {
  * Starts the PESU OAuth2 + PKCE authorization-code flow.
  *
  * The Express API performs OIDC discovery, PKCE generation and state binding,
- * and answers with an authorization URL. The caller opens that URL in a popup;
- * the server performs the code exchange and posts the result back to the
- * opener window (`PESU_OAUTH_RESULT`).
+ * and answers with an authorization URL. Supports both popup and full-page
+ * redirect authentication modes.
  */
 export async function startPesuOAuthSignIn(
-  scopes: string[] = ['openid', 'profile']
+  scopes: string[] = ['openid', 'profile'],
+  mode: 'popup' | 'redirect' = 'popup'
 ): Promise<PesuOAuthSignInStartResult> {
   const requestedScopes = scopes.filter(Boolean).length
     ? scopes.filter(Boolean)
     : ['openid', 'profile'];
 
+  const params = new URLSearchParams({
+    scope: requestedScopes.join(' '),
+    mode,
+  });
+
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    params.set('client_origin', window.location.origin);
+    try {
+      params.set(
+        'frame_context',
+        window.self !== window.top ? 'embedded' : 'top-level'
+      );
+    } catch {
+      params.set('frame_context', 'embedded');
+    }
+  }
+
   const res = await apiFetch<PesuOAuthUrlResponse>(
-    `/api/pesu-oauth/url?scope=${encodeURIComponent(requestedScopes.join(' '))}`,
+    `/api/pesu-oauth/url?${params.toString()}`,
     { timeoutMs: 20000 }
   );
 
@@ -1289,6 +1316,15 @@ export async function startPesuOAuthSignIn(
   if (!res.ok || !data || !data.ok) {
     return {
       ok: false,
+      redirectUri: data?.redirectUri,
+      canonicalAppOrigin: data?.canonicalAppOrigin,
+      initiatingOrigin: data?.initiatingOrigin,
+      configuredCallbackOrigin: data?.configuredCallbackOrigin,
+      initiationCookieStatus: data?.initiationCookieStatus,
+      publicClientId: data?.publicClientId,
+      portalManageUrl: data?.portalManageUrl,
+      providerRedirectUriRegistered: data?.providerRedirectUriRegistered,
+      diagnostics: data?.diagnostics,
       errorMessage:
         data?.userMessage ??
         res.errorMessage ??
@@ -1300,11 +1336,35 @@ export async function startPesuOAuthSignIn(
   if (!authUrl) {
     return {
       ok: false,
+      redirectUri: data.redirectUri,
+      canonicalAppOrigin: data.canonicalAppOrigin,
+      initiatingOrigin: data.initiatingOrigin,
+      configuredCallbackOrigin: data.configuredCallbackOrigin,
+      initiationCookieStatus: data.initiationCookieStatus,
+      publicClientId: data.publicClientId,
+      portalManageUrl: data.portalManageUrl,
+      providerRedirectUriRegistered: data.providerRedirectUriRegistered,
+      diagnostics: data.diagnostics,
       errorMessage:
         data.userMessage ??
         'PESU OAuth2 did not return an authorization URL. Check the server configuration.',
     };
   }
 
-  return { ok: true, authUrl, state: data.state };
+  return {
+    ok: true,
+    authUrl,
+    state: data.state,
+    redirectUri: data.redirectUri,
+    canonicalAppOrigin: data.canonicalAppOrigin,
+    initiatingOrigin: data.initiatingOrigin,
+    configuredCallbackOrigin: data.configuredCallbackOrigin,
+    initiationCookieStatus: data.initiationCookieStatus,
+    publicClientId: data.publicClientId,
+    portalManageUrl: data.portalManageUrl,
+    providerRedirectUriRegistered: data.providerRedirectUriRegistered,
+    userMessage: data.userMessage,
+    diagnostics: data.diagnostics,
+  };
 }
+

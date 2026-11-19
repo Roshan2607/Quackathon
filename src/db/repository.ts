@@ -1,5 +1,5 @@
-import { and, desc, eq, lt, or } from 'drizzle-orm';
-import { db } from './index.ts';
+import { and, desc, eq, inArray, lt, ne, or } from 'drizzle-orm';
+import { db, pool } from './index.ts';
 import * as schema from './schema.ts';
 import {
   decryptTokenAtRest,
@@ -7,6 +7,7 @@ import {
   hashSessionToken,
 } from '../lib/crypto.ts';
 import {
+  BlockRecord,
   CampusType,
   CommitmentLevel,
   Conversation,
@@ -26,10 +27,34 @@ import {
   RequestDirection,
   RequestStatus,
   ReviewQueueStatus,
+  ShortlistEntry,
+  ShortlistPayload,
   SourceUrlVerificationStatus,
   Team,
+  TeamProposal,
+  TeamProposalStatus,
+  TeamProposalVote,
+  TeamRegistration,
+  TeamRegistrationStatus,
   User,
 } from '../types/domain.ts';
+import {
+  areEventsSameRealWorldEvent,
+  classifyGroundedEvent,
+  cleanHtmlToText,
+  computeProposedEventDiffs,
+  deduplicateHackathonCatalog,
+  evaluateHackathonEligibilityAndStates,
+  formatEventDateDisplayIST,
+  isEligibleTeamHackathonCatalogEvent,
+  validateAndTransformPaashaHackathon,
+} from '../lib/eventsAndAnnouncements.ts';
+import { isSyntheticTestHackathonRecord } from './testCleanup.ts';
+
+export async function ensureMatchingAndTeamSchema(): Promise<void> {
+  // Tables team_proposals, team_proposal_votes, team_registrations, and user_blocks
+  // are provisioned via Drizzle schema migrations / Cloud SQL UpdateSchema.
+}
 
 function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
   if (!raw) return fallback;
@@ -38,6 +63,39 @@ function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+const POLLUTED_NAVBAR_TAGS = new Set([
+  'clubs & activities',
+  'talks',
+  'workshop',
+  'management',
+]);
+
+function cleanStoredEventThemes(rawThemes: string[]): {
+  themes: string[];
+  hadNavbarPollution: boolean;
+} {
+  const normalized = rawThemes
+    .map((t) => cleanHtmlToText(t).replace(/^#/, '').trim())
+    .filter(Boolean);
+  const lowerSet = new Set(normalized.map((t) => t.toLowerCase()));
+  const hadNavbarPollution =
+    lowerSet.has('clubs & activities') &&
+    lowerSet.has('talks') &&
+    lowerSet.has('workshop');
+
+  if (!hadNavbarPollution) {
+    return { themes: normalized, hadNavbarPollution: false };
+  }
+
+  const filtered = normalized.filter(
+    (t) => !POLLUTED_NAVBAR_TAGS.has(t.toLowerCase())
+  );
+  return {
+    themes: filtered.length > 0 ? filtered : ['PESU Event'],
+    hadNavbarPollution: true,
+  };
 }
 
 const DEFAULT_PRIVACY: User['privacyPreferences'] = {
@@ -113,16 +171,131 @@ export function mapDbProfileToDomain(
 export function mapDbHackathonToDomain(
   row: typeof schema.hackathons.$inferSelect
 ): Hackathon {
+  const parsedProv = safeJsonParse<Record<string, any>>(
+    row.fieldProvenanceJson,
+    {}
+  );
+  const metaSource = parsedProv?._meta?.sourceType as EventSourceType | undefined;
+  const combinedUrls = [
+    row.verifiedCanonicalUrl,
+    row.originalSubmissionUrl,
+    row.registrationUrl,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  const resolvedSourceType: EventSourceType =
+    metaSource ||
+    (combinedUrls.includes('events.pes.edu')
+      ? 'pes_public_events'
+      : 'submitted_public_url');
+
+  const cleanName = cleanHtmlToText(row.name || '');
+  const cleanOrganizer = cleanHtmlToText(row.organizer || '');
+  const cleanDescription = cleanHtmlToText(row.description || '');
+  const rawThemes = safeJsonParse<string[]>(row.themesJson, []);
+  const { themes: cleanedThemes } = cleanStoredEventThemes(rawThemes);
+
+  // Strip bogus QR-generator blog links, private pesuacademy.com URLs, or bare events.pes.edu canonical duplicates from registrationUrl
+  let cleanRegistrationUrl = row.registrationUrl ?? null;
+  if (cleanRegistrationUrl) {
+    const lowerReg = cleanRegistrationUrl.toLowerCase();
+    if (
+      lowerReg.includes('me-qr.com/page/blog') ||
+      lowerReg.includes('pesuacademy.com') ||
+      (row.verifiedCanonicalUrl &&
+        cleanRegistrationUrl === row.verifiedCanonicalUrl &&
+        lowerReg.includes('events.pes.edu/'))
+    ) {
+      cleanRegistrationUrl = null;
+    }
+  }
+
+  let cleanCanonicalUrl = row.verifiedCanonicalUrl ?? null;
+  if (
+    cleanCanonicalUrl &&
+    cleanCanonicalUrl.toLowerCase().includes('pesuacademy.com')
+  ) {
+    cleanCanonicalUrl = null;
+  }
+
+  const states = evaluateHackathonEligibilityAndStates({
+    name: cleanName,
+    description: cleanDescription,
+    eventType: (row.eventType as EventType) || 'hackathon',
+    themes: cleanedThemes.filter((t) => t !== 'PESU Event'),
+    minTeamSize: row.minTeamSize,
+    maxTeamSize: row.maxTeamSize,
+    startAt: row.startAt,
+    endAt: row.endAt,
+    registrationDeadline: row.registrationDeadline,
+    registrationUrl: cleanRegistrationUrl,
+    verifiedCanonicalUrl: cleanCanonicalUrl,
+    originalSubmissionUrl: row.originalSubmissionUrl,
+    sourceUrlStatus: row.sourceUrlStatus,
+    sourceType: resolvedSourceType,
+    status: row.status,
+  });
+
+  const resolvedEventType = states.eventType;
+  const resolvedMatchable = states.matchable;
+  const resolvedReason =
+    row.classificationReason ||
+    states.classificationReason ||
+    'Verified event entry.';
+
+  const allSourceUrls = Array.isArray(parsedProv?._meta?.allSourceUrls)
+    ? (parsedProv._meta.allSourceUrls as string[]).filter(
+        (u) => typeof u === 'string' && !u.toLowerCase().includes('pesuacademy.com')
+      )
+    : [];
+  const sourceIds = Array.from(
+    new Set(
+      [
+        row.slug,
+        cleanCanonicalUrl,
+        ...allSourceUrls,
+      ].filter((v): v is string => Boolean(v && v.trim()))
+    )
+  );
+
+  const hasPesEventsSource =
+    row.slug.startsWith('pes_event_') ||
+    resolvedSourceType === 'pes_public_events' ||
+    sourceIds.some((s) => s.toLowerCase().includes('events.pes.edu'));
+  const hasPaashaSource =
+    row.slug.startsWith('paasha_') ||
+    resolvedSourceType === 'paasha_microservice' ||
+    sourceIds.some((s) => s.toLowerCase().startsWith('paasha:'));
+
+  const sources = Array.from(
+    new Set(
+      [
+        hasPesEventsSource ? 'events.pes.edu' : null,
+        hasPaashaSource ? 'PAASHA' : null,
+        cleanCanonicalUrl,
+        cleanRegistrationUrl,
+        ...allSourceUrls,
+      ].filter((v): v is string => Boolean(v && v.trim()))
+    )
+  );
+
   return {
     id: row.slug,
-    name: row.name,
-    organizer: row.organizer,
-    description: row.description,
-    eventType: (row.eventType as EventType) || 'hackathon',
-    matchable: row.matchable,
-    themes: safeJsonParse<string[]>(row.themesJson, []),
+    name: cleanName,
+    organizer: cleanOrganizer,
+    description: cleanDescription,
+    shortDescription: cleanDescription.slice(0, 220),
+    eventType: resolvedEventType,
+    categoryLabel: states.categoryLabel,
+    isHackathon: states.isHackathon,
+    teamParticipationVerified: states.teamParticipationVerified,
+    publicSourceVerified: states.publicSourceVerified,
+    matchable: resolvedMatchable,
+    findTeammatesEligible: states.findTeammatesEligible,
+    themes: cleanedThemes,
     venue: {
-      name: row.venueName ?? null,
+      name: row.venueName ? cleanHtmlToText(row.venueName) : null,
       campus: (row.campus as CampusType | null) ?? null,
     },
     format:
@@ -134,30 +307,48 @@ export function mapDbHackathonToDomain(
         : 'date_only'
       : 'unknown',
     endAt: row.endAt ?? null,
+    dateDisplay: formatEventDateDisplayIST({
+      startAt: row.startAt,
+      endAt: row.endAt,
+    }),
     timezone: 'Asia/Kolkata',
     registrationDeadline: row.registrationDeadline ?? null,
+    registrationStatus: states.registrationStatus,
+    registrationStatusDetail: states.registrationStatusDetail,
+    registrationStatusLabel: states.registrationStatusLabel,
     originalSubmissionUrl: row.originalSubmissionUrl ?? null,
-    verifiedCanonicalUrl: row.verifiedCanonicalUrl ?? null,
-    registrationUrl: row.registrationUrl ?? null,
+    verifiedCanonicalUrl: cleanCanonicalUrl,
+    registrationUrl: cleanRegistrationUrl,
     sourceUrlStatus:
       (row.sourceUrlStatus as SourceUrlVerificationStatus) || 'unverified',
-    minTeamSize: row.minTeamSize ?? null,
-    maxTeamSize: row.maxTeamSize ?? null,
-    eligibilityNotes: row.eligibilityNotes ?? null,
-    sourceIds: [row.slug],
-    fieldProvenance: safeJsonParse(row.fieldProvenanceJson, {}),
-    suggestedByCount: 1,
-    classification: {
-      category: (row.eventType as EventType) || 'hackathon',
-      ruleGatePassed: row.ruleGatePassed,
-      mlConfidenceScore: row.ruleGatePassed ? 1 : 0,
-      reason: row.classificationReason || 'Verified event entry.',
+    minTeamSize: states.minTeamSize,
+    maxTeamSize: states.maxTeamSize,
+    teamSize: {
+      min: states.minTeamSize,
+      max: states.maxTeamSize,
     },
-    lastVerifiedAt: row.createdAt.toISOString(),
+    eligibilityNotes: row.eligibilityNotes ?? null,
+    sourceType: resolvedSourceType,
+    sourceIds,
+    sources,
+    fieldProvenance: parsedProv,
+    suggestedByCount: Math.max(1, allSourceUrls.length || 1),
+    classification: {
+      category: resolvedEventType,
+      ruleGatePassed: resolvedMatchable,
+      mlConfidenceScore: resolvedMatchable ? 1 : 0,
+      reason: resolvedReason,
+    },
+    lastVerifiedAt:
+      parsedProv?._meta?.verifiedAt ?? row.createdAt.toISOString(),
+    extractedAt:
+      parsedProv?._meta?.extractedAt ?? row.createdAt.toISOString(),
     verificationStatus:
-      row.verificationStatus === 'unconfirmed_constraints'
-        ? 'unconfirmed_constraints'
-        : 'verified',
+      states.teamParticipationVerified &&
+      states.minTeamSize !== null &&
+      states.maxTeamSize !== null
+        ? 'verified'
+        : 'unconfirmed_constraints',
     status: (row.status as EventLifecycleStatus) || 'published',
     createdBy: row.createdByUid,
   };
@@ -166,6 +357,21 @@ export function mapDbHackathonToDomain(
 export function mapDbCandidateToDomain(
   row: typeof schema.eventCandidates.$inferSelect
 ): EventCandidate {
+  const parsedEvidence = safeJsonParse<Record<string, any>>(
+    row.fieldEvidenceJson,
+    {}
+  );
+  const storedDiffs = Array.isArray(parsedEvidence?._proposedDiffs)
+    ? parsedEvidence._proposedDiffs
+    : undefined;
+  const cleanEvidence: Record<string, { sourceUrl: string; excerpt: string }[]> =
+    {};
+  for (const [k, v] of Object.entries(parsedEvidence || {})) {
+    if (k !== '_proposedDiffs' && Array.isArray(v)) {
+      cleanEvidence[k] = v;
+    }
+  }
+
   return {
     id: row.candidateUid,
     source: (row.source as EventSourceType) || 'submitted_public_url',
@@ -179,6 +385,7 @@ export function mapDbCandidateToDomain(
     externalFingerprint: row.externalFingerprint,
     duplicateOfHackathonId: row.duplicateOfHackathonSlug ?? undefined,
     updatesExistingHackathonId: row.updatesExistingHackathonSlug ?? undefined,
+    proposedDiffs: storedDiffs,
     title: row.title,
     organizer: row.organizer,
     eventType: (row.eventType as EventType) || 'unknown',
@@ -201,7 +408,7 @@ export function mapDbCandidateToDomain(
     },
     registrationUrl: row.registrationUrl ?? null,
     eligibilityNotes: row.eligibilityNotes ?? null,
-    fieldEvidence: safeJsonParse(row.fieldEvidenceJson, {}),
+    fieldEvidence: cleanEvidence,
     classification: {
       ruleGatePassed: row.ruleGatePassed,
       mlScore: row.ruleGatePassed ? 1 : 0,
@@ -661,6 +868,8 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
   state: string;
   code?: string | null;
   incomingSessionId?: string | null;
+  candidateSessionIds?: string[];
+  callbackCookieStatus?: 'valid' | 'missing' | 'invalid_signature';
   authenticatedUid?: string | null;
 }): Promise<{
   status:
@@ -668,11 +877,20 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
     | 'processing'
     | 'completed_same_session'
     | 'failed_previously'
+    | 'session_missing'
+    | 'session_invalid'
     | 'session_mismatch'
     | 'expired'
     | 'replayed'
     | 'invalid';
   transactionStatus: OAuthTransactionLifecycleStatus | 'not_found';
+  sessionBindingMatched: boolean;
+  matchedSessionId: string | null;
+  transactionMeta: {
+    clientOrigin: string | null;
+    redirectUri: string;
+    initiatingSessionIdHash: string;
+  } | null;
   transaction: ClaimedOAuthTransaction | null;
   outcome?: OAuthTransactionRecordedOutcome;
 }> {
@@ -681,6 +899,9 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
     return {
       status: 'invalid',
       transactionStatus: 'not_found',
+      sessionBindingMatched: false,
+      matchedSessionId: null,
+      transactionMeta: null,
       transaction: null,
     };
   }
@@ -691,10 +912,18 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
       params.code && params.code.trim()
         ? hashSessionToken(params.code.trim())
         : null;
-    const incomingSidHash =
-      params.incomingSessionId && params.incomingSessionId.trim()
-        ? hashSessionToken(params.incomingSessionId.trim())
-        : null;
+
+    const candidateSids = Array.from(
+      new Set(
+        [
+          ...(params.candidateSessionIds ?? []),
+          params.incomingSessionId ?? '',
+        ]
+          .map((s) => s.trim())
+          .filter(Boolean)
+      )
+    );
+
     const now = new Date();
 
     const existingRows = await db
@@ -708,9 +937,18 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
       return {
         status: 'invalid',
         transactionStatus: 'not_found',
+        sessionBindingMatched: false,
+        matchedSessionId: null,
+        transactionMeta: null,
         transaction: null,
       };
     }
+
+    const transactionMeta = {
+      clientOrigin: row.clientOrigin ?? null,
+      redirectUri: row.redirectUri,
+      initiatingSessionIdHash: row.initiatingSessionIdHash,
+    };
 
     // 1. Check expiration before any state transition
     if (row.expiresAt.getTime() <= now.getTime() || row.status === 'expired') {
@@ -724,25 +962,161 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
       return {
         status: 'expired',
         transactionStatus: 'expired',
+        sessionBindingMatched: false,
+        matchedSessionId: null,
+        transactionMeta,
         transaction: null,
       };
     }
 
-    // 2. Reject callbacks arriving from a different explicit browser session
-    if (
-      incomingSidHash &&
-      row.initiatingSessionIdHash &&
-      incomingSidHash !== row.initiatingSessionIdHash
-    ) {
+    // Check whether any verified session cookie sent by the browser matches the initiating session hash
+    const matchedSessionId =
+      candidateSids.find(
+        (sid) => hashSessionToken(sid) === row.initiatingSessionIdHash
+      ) ?? null;
+    const sessionBindingMatched = Boolean(matchedSessionId);
+
+    const baseTx: ClaimedOAuthTransaction = {
+      state: rawState,
+      stateHash: row.stateHash,
+      codeHash: row.codeHash ?? null,
+      initiatingSessionIdHash: row.initiatingSessionIdHash,
+      codeVerifier: '', // Never expose verifier on already-claimed rows
+      redirectUri: row.redirectUri,
+      clientOrigin: row.clientOrigin ?? null,
+      scopes: safeJsonParse<string[]>(row.scopesJson, []),
+      issuer: row.issuer,
+      authorizationEndpoint: row.authorizationEndpoint,
+      tokenEndpoint: row.tokenEndpoint,
+      userinfoEndpoint: row.userinfoEndpoint ?? null,
+      status: (row.status as OAuthTransactionLifecycleStatus) || 'processing',
+      createdAt: row.createdAt,
+      expiresAt: row.expiresAt,
+    };
+
+    // 2. If already completed: check if duplicate callback is from the same authenticated session & same code
+    if (row.status === 'completed') {
+      const sameCode = !codeHash || !row.codeHash || codeHash === row.codeHash;
+      const sameAuthenticatedUser =
+        Boolean(params.authenticatedUid) &&
+        Boolean(row.completedUid) &&
+        params.authenticatedUid === row.completedUid;
+
+      if (sameCode && (sessionBindingMatched || sameAuthenticatedUser)) {
+        const activeSessionRows = await db
+          .select()
+          .from(schema.oauthSessions)
+          .where(
+            and(
+              eq(
+                schema.oauthSessions.initiatingSessionIdHash,
+                row.initiatingSessionIdHash
+              ),
+              eq(schema.oauthSessions.revoked, false)
+            )
+          )
+          .orderBy(desc(schema.oauthSessions.createdAt))
+          .limit(1);
+
+        const hasActiveSession =
+          sameAuthenticatedUser ||
+          Boolean(
+            activeSessionRows[0] &&
+              activeSessionRows[0].expiresAt.getTime() > now.getTime()
+          );
+
+        if (hasActiveSession) {
+          return {
+            status: 'completed_same_session',
+            transactionStatus: 'completed',
+            sessionBindingMatched: true,
+            matchedSessionId,
+            transactionMeta,
+            transaction: baseTx,
+            outcome: {
+              status: 'completed',
+              completedUid: row.completedUid ?? null,
+              outcomeStatus: row.outcomeStatus ?? 200,
+              outcomeErrorCategory: row.outcomeErrorCategory ?? 'NONE',
+              outcomeMessage: row.outcomeMessage ?? null,
+              outcomeIdentity: safeJsonParse<Record<string, unknown> | null>(
+                row.outcomeIdentityJson,
+                null
+              ),
+            },
+          };
+        }
+      }
+
+      return {
+        status: 'replayed',
+        transactionStatus: 'completed',
+        sessionBindingMatched,
+        matchedSessionId,
+        transactionMeta,
+        transaction: null,
+      };
+    }
+
+    // 3. If previous callback failed during token exchange or consent
+    if (row.status === 'failed') {
+      return {
+        status: 'failed_previously',
+        transactionStatus: 'failed',
+        sessionBindingMatched,
+        matchedSessionId,
+        transactionMeta,
+        transaction: baseTx,
+        outcome: {
+          status: 'failed',
+          completedUid: null,
+          outcomeStatus: row.outcomeStatus ?? 400,
+          outcomeErrorCategory:
+            row.outcomeErrorCategory ?? 'OAUTH_STATE_INVALID',
+          outcomeMessage: row.outcomeMessage ?? null,
+          outcomeIdentity: null,
+        },
+      };
+    }
+
+    // 4. Enforce strict browser-session binding for pending/processing transactions
+    if (row.initiatingSessionIdHash && !sessionBindingMatched) {
+      const currentLifecycle =
+        (row.status as OAuthTransactionLifecycleStatus) || 'pending';
+      if (params.callbackCookieStatus === 'invalid_signature') {
+        return {
+          status: 'session_invalid',
+          transactionStatus: currentLifecycle,
+          sessionBindingMatched: false,
+          matchedSessionId: null,
+          transactionMeta,
+          transaction: null,
+        };
+      }
+      if (
+        params.callbackCookieStatus === 'missing' ||
+        candidateSids.length === 0
+      ) {
+        return {
+          status: 'session_missing',
+          transactionStatus: currentLifecycle,
+          sessionBindingMatched: false,
+          matchedSessionId: null,
+          transactionMeta,
+          transaction: null,
+        };
+      }
       return {
         status: 'session_mismatch',
-        transactionStatus:
-          (row.status as OAuthTransactionLifecycleStatus) || 'pending',
+        transactionStatus: currentLifecycle,
+        sessionBindingMatched: false,
+        matchedSessionId: null,
+        transactionMeta,
         transaction: null,
       };
     }
 
-    // 3. If pending, atomically claim: pending -> processing
+    // 5. If pending, atomically claim: pending -> processing
     if (row.status === 'pending' && !row.consumed) {
       const claimedRows = await db
         .update(schema.oauthTransactions)
@@ -781,6 +1155,9 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
           return {
             status: 'invalid',
             transactionStatus: 'failed',
+            sessionBindingMatched: true,
+            matchedSessionId,
+            transactionMeta,
             transaction: null,
           };
         }
@@ -788,6 +1165,9 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
         return {
           status: 'claimed',
           transactionStatus: 'processing',
+          sessionBindingMatched: true,
+          matchedSessionId,
+          transactionMeta,
           transaction: {
             state: rawState,
             stateHash: claimed.stateHash,
@@ -818,122 +1198,37 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
         return {
           status: 'invalid',
           transactionStatus: 'not_found',
+          sessionBindingMatched: false,
+          matchedSessionId: null,
+          transactionMeta,
           transaction: null,
         };
       }
       row = refreshedRows[0];
     }
 
-    const baseTx: ClaimedOAuthTransaction = {
-      state: rawState,
-      stateHash: row.stateHash,
-      codeHash: row.codeHash ?? null,
-      initiatingSessionIdHash: row.initiatingSessionIdHash,
-      codeVerifier: '', // Never expose verifier on already-claimed rows
-      redirectUri: row.redirectUri,
-      clientOrigin: row.clientOrigin ?? null,
-      scopes: safeJsonParse<string[]>(row.scopesJson, []),
-      issuer: row.issuer,
-      authorizationEndpoint: row.authorizationEndpoint,
-      tokenEndpoint: row.tokenEndpoint,
-      userinfoEndpoint: row.userinfoEndpoint ?? null,
-      status: (row.status as OAuthTransactionLifecycleStatus) || 'processing',
-      createdAt: row.createdAt,
-      expiresAt: row.expiresAt,
-    };
-
-    // 4. If currently processing (concurrent duplicate callback with same code)
+    // 6. If currently processing (concurrent duplicate callback with same code)
     if (row.status === 'processing') {
       if (codeHash && row.codeHash && codeHash !== row.codeHash) {
         return {
           status: 'replayed',
           transactionStatus: 'processing',
+          sessionBindingMatched: true,
+          matchedSessionId,
+          transactionMeta,
           transaction: null,
         };
       }
       return {
         status: 'processing',
         transactionStatus: 'processing',
-        transaction: baseTx,
-      };
-    }
-
-    // 5. If already completed: check if duplicate callback is from the same authenticated session & same code
-    if (row.status === 'completed') {
-      const sameCode = !codeHash || !row.codeHash || codeHash === row.codeHash;
-      const sameInitiatingSession =
-        Boolean(incomingSidHash) &&
-        incomingSidHash === row.initiatingSessionIdHash;
-      const sameAuthenticatedUser =
-        Boolean(params.authenticatedUid) &&
-        Boolean(row.completedUid) &&
-        params.authenticatedUid === row.completedUid;
-
-      if (sameCode && (sameInitiatingSession || sameAuthenticatedUser)) {
-        // Also confirm the session has not been revoked in oauth_sessions
-        const activeSessionRows = await db
-          .select()
-          .from(schema.oauthSessions)
-          .where(
-            and(
-              eq(
-                schema.oauthSessions.initiatingSessionIdHash,
-                row.initiatingSessionIdHash
-              ),
-              eq(schema.oauthSessions.revoked, false)
-            )
-          )
-          .orderBy(desc(schema.oauthSessions.createdAt))
-          .limit(1);
-
-        const hasActiveSession =
-          sameAuthenticatedUser ||
-          Boolean(
-            activeSessionRows[0] &&
-              activeSessionRows[0].expiresAt.getTime() > now.getTime()
-          );
-
-        if (hasActiveSession) {
-          return {
-            status: 'completed_same_session',
-            transactionStatus: 'completed',
-            transaction: baseTx,
-            outcome: {
-              status: 'completed',
-              completedUid: row.completedUid ?? null,
-              outcomeStatus: row.outcomeStatus ?? 200,
-              outcomeErrorCategory: row.outcomeErrorCategory ?? 'NONE',
-              outcomeMessage: row.outcomeMessage ?? null,
-              outcomeIdentity: safeJsonParse<Record<string, unknown> | null>(
-                row.outcomeIdentityJson,
-                null
-              ),
-            },
-          };
-        }
-      }
-
-      return {
-        status: 'replayed',
-        transactionStatus: 'completed',
-        transaction: null,
-      };
-    }
-
-    // 6. If previous callback failed during token exchange or consent
-    if (row.status === 'failed') {
-      return {
-        status: 'failed_previously',
-        transactionStatus: 'failed',
-        transaction: baseTx,
-        outcome: {
-          status: 'failed',
-          completedUid: null,
-          outcomeStatus: row.outcomeStatus ?? 400,
-          outcomeErrorCategory:
-            row.outcomeErrorCategory ?? 'OAUTH_STATE_INVALID',
-          outcomeMessage: row.outcomeMessage ?? null,
-          outcomeIdentity: null,
+        sessionBindingMatched: true,
+        matchedSessionId,
+        transactionMeta,
+        transaction: {
+          ...baseTx,
+          codeHash: row.codeHash ?? null,
+          status: 'processing',
         },
       };
     }
@@ -942,6 +1237,9 @@ export async function claimOrInspectOAuthTransactionRecord(params: {
       status: 'replayed',
       transactionStatus:
         (row.status as OAuthTransactionLifecycleStatus) || 'completed',
+      sessionBindingMatched,
+      matchedSessionId,
+      transactionMeta,
       transaction: null,
     };
   } catch (error) {
@@ -1094,17 +1392,32 @@ export async function createOAuthSessionRecord(params: {
     const encryptedAccess = encryptTokenAtRest(params.accessToken);
     const encryptedRefresh = encryptTokenAtRest(params.refreshToken);
 
-    await db.insert(schema.oauthSessions).values({
-      sessionToken: tokenHash,
-      initiatingSessionIdHash: sidHash,
-      uid: params.uid,
-      pesuSub: params.pesuSub,
-      accessToken: encryptedAccess,
-      refreshToken: encryptedRefresh,
-      scopesJson: JSON.stringify(params.scopes),
-      expiresAt: params.expiresAt,
-      revoked: false,
-    });
+    await db
+      .insert(schema.oauthSessions)
+      .values({
+        sessionToken: tokenHash,
+        initiatingSessionIdHash: sidHash,
+        uid: params.uid,
+        pesuSub: params.pesuSub,
+        accessToken: encryptedAccess,
+        refreshToken: encryptedRefresh,
+        scopesJson: JSON.stringify(params.scopes),
+        expiresAt: params.expiresAt,
+        revoked: false,
+      })
+      .onConflictDoUpdate({
+        target: schema.oauthSessions.sessionToken,
+        set: {
+          initiatingSessionIdHash: sidHash,
+          uid: params.uid,
+          pesuSub: params.pesuSub,
+          accessToken: encryptedAccess,
+          refreshToken: encryptedRefresh,
+          scopesJson: JSON.stringify(params.scopes),
+          expiresAt: params.expiresAt,
+          revoked: false,
+        },
+      });
   } catch (error) {
     console.error('Database error in createOAuthSessionRecord:', error);
     throw new Error('Failed to store OAuth session.', { cause: error });
@@ -1241,8 +1554,12 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
   interests: Interest[];
   conversations: Conversation[];
   messages: Message[];
+  teamProposals: TeamProposal[];
+  teamRegistrations: Record<string, TeamRegistration>;
+  blocks: BlockRecord[];
 }> {
   try {
+    await ensureMatchingAndTeamSchema();
     const hasViewer = Boolean(viewerUid);
     const [
       userRows,
@@ -1256,6 +1573,10 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
       swipeRows,
       convRows,
       msgRows,
+      proposalRows,
+      voteRows,
+      regRows,
+      blockRows,
     ] = await Promise.all([
       db.select().from(schema.users).orderBy(desc(schema.users.createdAt)),
       db.select().from(schema.profiles),
@@ -1286,33 +1607,98 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
       hasViewer
         ? db.select().from(schema.messages).orderBy(schema.messages.createdAt)
         : Promise.resolve([]),
+      hasViewer
+        ? db
+            .select()
+            .from(schema.teamProposals)
+            .orderBy(desc(schema.teamProposals.createdAt))
+        : Promise.resolve([]),
+      hasViewer
+        ? db.select().from(schema.teamProposalVotes)
+        : Promise.resolve([]),
+      db.select().from(schema.teamRegistrations),
+      hasViewer
+        ? db.select().from(schema.userBlocks)
+        : Promise.resolve([]),
     ]);
 
-    const users = userRows.map(mapDbUserToDomain);
-    const profiles: Record<string, Profile> = {};
-    for (const pr of profileRows) {
-      profiles[pr.uid] = mapDbProfileToDomain(pr);
+    const allUsers = userRows.map(mapDbUserToDomain);
+    const userNameByUid = new Map<string, string>();
+    for (const u of allUsers) {
+      userNameByUid.set(u.uid, u.displayName);
     }
 
-    const hackathons = hackathonRows.map(mapDbHackathonToDomain);
-    const eventCandidates = candidateRows.map(mapDbCandidateToDomain);
+    const viewerUser = viewerUid
+      ? allUsers.find((u) => u.uid === viewerUid)
+      : undefined;
+    const isViewerAdmin = Boolean(viewerUser?.isAdmin);
 
-    const participations: Participation[] = partRows.map((r) => ({
-      id: r.participationKey,
-      hackathonId: r.hackathonSlug,
-      uid: r.uid,
-      intent: (r.intent as ParticipationIntent) || 'looking',
-      desiredRoles: safeJsonParse<string[]>(r.desiredRolesJson, []),
-      skillsOffered: safeJsonParse<string[]>(r.skillsOfferedJson, []),
-      availabilityWindows: safeJsonParse<string[]>(
-        r.availabilityWindowsJson,
-        []
-      ),
-      commitmentLevel: (r.commitmentLevel as CommitmentLevel) || 'standard',
-      workPreferences: safeJsonParse<string[]>(r.workPreferencesJson, []),
-      discoverable: r.discoverable,
-      updatedAt: r.updatedAt.toISOString(),
-    }));
+    const allProfiles: Record<string, Profile> = {};
+    for (const pr of profileRows) {
+      allProfiles[pr.uid] = mapDbProfileToDomain(pr);
+    }
+
+    // Filter public discoverable users & profiles (always include the viewer's own profile)
+    const users = allUsers.filter(
+      (u) =>
+        u.uid === viewerUid ||
+        (u.accountStatus === 'active' &&
+          u.privacyPreferences?.profileVisible !== false &&
+          allProfiles[u.uid]?.visibility !== 'hidden')
+    );
+
+    const profiles: Record<string, Profile> = {};
+    for (const u of users) {
+      if (allProfiles[u.uid]) {
+        profiles[u.uid] = allProfiles[u.uid];
+      }
+    }
+
+    const allMappedHackathons = hackathonRows.map(mapDbHackathonToDomain);
+    const hackathonBySlug = new Map<string, Hackathon>();
+    for (const h of allMappedHackathons) {
+      hackathonBySlug.set(h.id, h);
+    }
+
+    const isTestEnv =
+      process.env.QUACKATHON_TEST_MODE === 'true' ||
+      process.env.NODE_ENV === 'test';
+
+    const eligibleHackathons = allMappedHackathons.filter((h) => {
+      if (!isTestEnv && isSyntheticTestHackathonRecord(h)) {
+        return false;
+      }
+      return isEligibleTeamHackathonCatalogEvent(h);
+    });
+    const hackathons = deduplicateHackathonCatalog(eligibleHackathons);
+
+    // Only expose staged eventCandidates to admins or the student who submitted them
+    const eventCandidates = candidateRows
+      .filter(
+        (c) =>
+          isViewerAdmin ||
+          (Boolean(viewerUid) && c.submittedByUid === viewerUid)
+      )
+      .map(mapDbCandidateToDomain);
+
+    const participations: Participation[] = partRows
+      .filter((r) => r.uid === viewerUid || r.discoverable !== false)
+      .map((r) => ({
+        id: r.participationKey,
+        hackathonId: r.hackathonSlug,
+        uid: r.uid,
+        intent: (r.intent as ParticipationIntent) || 'looking',
+        desiredRoles: safeJsonParse<string[]>(r.desiredRolesJson, []),
+        skillsOffered: safeJsonParse<string[]>(r.skillsOfferedJson, []),
+        availabilityWindows: safeJsonParse<string[]>(
+          r.availabilityWindowsJson,
+          []
+        ),
+        commitmentLevel: (r.commitmentLevel as CommitmentLevel) || 'standard',
+        workPreferences: safeJsonParse<string[]>(r.workPreferencesJson, []),
+        discoverable: r.discoverable,
+        updatedAt: r.updatedAt.toISOString(),
+      }));
 
     const teams: Team[] = teamRows.map((t) => {
       const specs = safeJsonParse<string[]>(t.customSpecializationsJson, []);
@@ -1346,30 +1732,68 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
       status: (m.status as 'active' | 'left') || 'active',
     }));
 
-    const joinRequests: JoinRequest[] = joinReqRows.map((jr) => ({
-      id: jr.requestUid,
-      hackathonId: jr.hackathonSlug,
-      teamId: jr.teamSlug,
-      applicantUid: jr.applicantUid,
-      initiatorUid: jr.initiatorUid,
-      proposedRole: jr.proposedRole,
-      message: jr.message ?? undefined,
-      direction: (jr.direction as RequestDirection) || 'application',
-      status: (jr.status as RequestStatus) || 'pending',
-      resolutionNote: jr.resolutionNote ?? undefined,
-      createdAt: jr.createdAt.toISOString(),
-      resolvedAt: jr.resolvedAt ? jr.resolvedAt.toISOString() : undefined,
-    }));
+    const viewerTeamSlugs = new Set<string>();
+    if (viewerUid) {
+      for (const m of memberships) {
+        if (m.uid === viewerUid && m.status === 'active') {
+          viewerTeamSlugs.add(m.teamId);
+        }
+      }
+      for (const t of teams) {
+        if (t.leaderId === viewerUid) {
+          viewerTeamSlugs.add(t.id);
+        }
+      }
+    }
 
-    const interests: Interest[] = swipeRows.map((s) => ({
-      id: s.swipeKey,
-      hackathonId: s.hackathonSlug,
-      fromUid: s.fromUid,
-      targetType: (s.targetType as 'user' | 'team') || 'user',
-      targetId: s.targetId,
-      decision: (s.decision as 'interested' | 'passed') || 'interested',
-      createdAt: s.createdAt.toISOString(),
-    }));
+    // Scope joinRequests strictly to viewer's applications, invitations, or teams
+    const joinRequests: JoinRequest[] = viewerUid
+      ? joinReqRows
+          .filter(
+            (jr) =>
+              jr.applicantUid === viewerUid ||
+              jr.initiatorUid === viewerUid ||
+              viewerTeamSlugs.has(jr.teamSlug)
+          )
+          .map((jr) => ({
+            id: jr.requestUid,
+            hackathonId: jr.hackathonSlug,
+            teamId: jr.teamSlug,
+            applicantUid: jr.applicantUid,
+            initiatorUid: jr.initiatorUid,
+            proposedRole: jr.proposedRole,
+            message: jr.message ?? undefined,
+            direction: (jr.direction as RequestDirection) || 'application',
+            status: (jr.status as RequestStatus) || 'pending',
+            resolutionNote: jr.resolutionNote ?? undefined,
+            createdAt: jr.createdAt.toISOString(),
+            resolvedAt: jr.resolvedAt ? jr.resolvedAt.toISOString() : undefined,
+          }))
+      : [];
+
+    // Scope swipes strictly to viewer's own swipes or incoming 'interested' swipes on the viewer/viewer's team
+    const interests: Interest[] = viewerUid
+      ? swipeRows
+          .filter(
+            (s) =>
+              s.fromUid === viewerUid ||
+              (s.targetType === 'user' &&
+                s.targetId === viewerUid &&
+                s.decision === 'interested') ||
+              (s.targetType === 'team' &&
+                viewerTeamSlugs.has(s.targetId) &&
+                s.decision === 'interested')
+          )
+          .map((s) => ({
+            id: s.swipeKey,
+            hackathonId: s.hackathonSlug,
+            fromUid: s.fromUid,
+            targetType: (s.targetType as 'user' | 'team') || 'user',
+            targetId: s.targetId,
+            decision: (s.decision as 'interested' | 'passed') || 'interested',
+            createdAt: s.createdAt.toISOString(),
+          }))
+      : [];
 
     const allConvs: Conversation[] = convRows.map((c) => ({
       id: c.conversationUid,
@@ -1383,7 +1807,11 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
     }));
 
     const conversations = viewerUid
-      ? allConvs.filter((c) => c.participantUids.includes(viewerUid))
+      ? allConvs.filter(
+          (c) =>
+            c.participantUids.includes(viewerUid) ||
+            (c.teamId && viewerTeamSlugs.has(c.teamId))
+        )
       : [];
     const allowedConvIds = new Set(conversations.map((c) => c.id));
 
@@ -1398,6 +1826,109 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
         moderationStatus: 'clean',
       }));
 
+    // Map proposals scoped to viewer's teams or where viewer is the candidate
+    const votesByProposal = new Map<string, TeamProposalVote[]>();
+    for (const vr of voteRows) {
+      const list = votesByProposal.get(vr.proposalUid) ?? [];
+      list.push({
+        id: vr.voteKey,
+        proposalId: vr.proposalUid,
+        teamId: vr.teamSlug,
+        voterUid: vr.voterUid,
+        voterName: userNameByUid.get(vr.voterUid),
+        decision: (vr.decision as 'approve' | 'reject') || 'approve',
+        comment: vr.comment ?? undefined,
+        votedAt: vr.votedAt.toISOString(),
+      });
+      votesByProposal.set(vr.proposalUid, list);
+    }
+
+    const teamNameBySlug = new Map<string, string>();
+    for (const t of teams) {
+      teamNameBySlug.set(t.id, t.name);
+    }
+
+    const activeMembersByTeam = new Map<string, string[]>();
+    for (const m of memberships) {
+      if (m.status === 'active') {
+        const list = activeMembersByTeam.get(m.teamId) ?? [];
+        if (!list.includes(m.uid)) list.push(m.uid);
+        activeMembersByTeam.set(m.teamId, list);
+      }
+    }
+
+    const teamProposals: TeamProposal[] = viewerUid
+      ? proposalRows
+          .filter(
+            (pr) =>
+              pr.candidateUid === viewerUid ||
+              pr.proposedByUid === viewerUid ||
+              viewerTeamSlugs.has(pr.teamSlug)
+          )
+          .map((pr) => {
+            const votes = votesByProposal.get(pr.proposalUid) ?? [];
+            const requiredVoterUids = activeMembersByTeam.get(pr.teamSlug) ?? [
+              pr.proposedByUid,
+            ];
+            const approvedCount = votes.filter(
+              (v) =>
+                v.decision === 'approve' &&
+                requiredVoterUids.includes(v.voterUid)
+            ).length;
+            const candProfile = allProfiles[pr.candidateUid];
+            return {
+              id: pr.proposalUid,
+              hackathonId: pr.hackathonSlug,
+              teamId: pr.teamSlug,
+              teamName: teamNameBySlug.get(pr.teamSlug),
+              candidateUid: pr.candidateUid,
+              candidateName: userNameByUid.get(pr.candidateUid),
+              candidateHeadline: candProfile?.headline,
+              candidateSkills: candProfile?.skillTags ?? [],
+              proposedByUid: pr.proposedByUid,
+              proposedByName: userNameByUid.get(pr.proposedByUid),
+              proposedRole: pr.proposedRole,
+              message: pr.message ?? undefined,
+              status: (pr.status as TeamProposalStatus) || 'pending_votes',
+              resolutionNote: pr.resolutionNote ?? undefined,
+              votes,
+              requiredVoterUids,
+              approvedCount,
+              requiredCount: Math.max(1, requiredVoterUids.length),
+              createdAt: pr.createdAt.toISOString(),
+              updatedAt: pr.updatedAt.toISOString(),
+              resolvedAt: pr.resolvedAt ? pr.resolvedAt.toISOString() : undefined,
+            };
+          })
+      : [];
+
+    const teamRegistrations: Record<string, TeamRegistration> = {};
+    const regRowByTeamSlug = new Map(regRows.map((r) => [r.teamSlug, r]));
+    for (const t of teams) {
+      if (viewerUid && viewerTeamSlugs.has(t.id)) {
+        const hack = hackathonBySlug.get(t.hackathonId);
+        const existingReg = regRowByTeamSlug.get(t.id);
+        teamRegistrations[t.id] = buildTeamRegistrationDomainObject({
+          team: t,
+          hackathon: hack,
+          regRow: existingReg,
+        });
+      }
+    }
+
+    const blocks: BlockRecord[] = viewerUid
+      ? blockRows
+          .filter(
+            (b) => b.blockerUid === viewerUid || b.blockedUid === viewerUid
+          )
+          .map((b) => ({
+            id: b.blockKey,
+            blockerUid: b.blockerUid,
+            blockedUid: b.blockedUid,
+            createdAt: b.createdAt.toISOString(),
+          }))
+      : [];
+
     return {
       users,
       profiles,
@@ -1410,6 +1941,9 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
       interests,
       conversations,
       messages,
+      teamProposals,
+      teamRegistrations,
+      blocks,
     };
   } catch (error) {
     console.error('Database error in loadBootstrapData:', error);
@@ -1491,71 +2025,209 @@ export async function createEventCandidateRecord(
   candidate: EventCandidate
 ): Promise<EventCandidate> {
   try {
-    // Check duplicate fingerprint against published hackathons or pending candidates
-    const existingCandidates = await db
-      .select()
-      .from(schema.eventCandidates)
-      .where(
-        eq(
-          schema.eventCandidates.externalFingerprint,
-          candidate.externalFingerprint
-        )
-      );
-
+    // 1. Check against all existing published hackathons for cross-source duplicate or update detection
+    const allPublishedRows = await db.select().from(schema.hackathons);
     let duplicateSlug = candidate.duplicateOfHackathonId ?? null;
-    if (!duplicateSlug && candidate.verifiedCanonicalUrl) {
-      const matchingHack = await db
-        .select()
-        .from(schema.hackathons)
-        .where(
-          eq(
-            schema.hackathons.verifiedCanonicalUrl,
-            candidate.verifiedCanonicalUrl
-          )
-        );
-      if (matchingHack[0]) {
-        duplicateSlug = matchingHack[0].slug;
+    let updatesSlug = candidate.updatesExistingHackathonId ?? null;
+    let computedDiffs = candidate.proposedDiffs ?? [];
+
+    for (const hRow of allPublishedRows) {
+      const hDomain = mapDbHackathonToDomain(hRow);
+      if (
+        areEventsSameRealWorldEvent(
+          {
+            title: hRow.name,
+            description: hRow.description,
+            startAt: hRow.startAt,
+            endAt: hRow.endAt,
+            organizer: hRow.organizer,
+            verifiedCanonicalUrl: hRow.verifiedCanonicalUrl,
+            originalSubmissionUrl: hRow.originalSubmissionUrl,
+            registrationUrl: hRow.registrationUrl,
+          },
+          {
+            title: candidate.title,
+            description: candidate.description,
+            startAt: candidate.startAt,
+            endAt: candidate.endAt,
+            organizer: candidate.organizer,
+            verifiedCanonicalUrl: candidate.verifiedCanonicalUrl,
+            originalSubmissionUrl:
+              candidate.originalSubmissionUrl ?? candidate.sourceUrl,
+            registrationUrl: candidate.registrationUrl,
+          }
+        )
+      ) {
+        const diffs = computeProposedEventDiffs(hDomain, {
+          startAt: candidate.startAt,
+          endAt: candidate.endAt,
+          registrationDeadline: candidate.registrationDeadline,
+          venue: candidate.venue,
+          registrationUrl: candidate.registrationUrl,
+          verifiedCanonicalUrl: candidate.verifiedCanonicalUrl,
+          teamSize: candidate.teamSize,
+          organizer: candidate.organizer,
+        });
+
+        if (diffs.length > 0 && !updatesSlug) {
+          updatesSlug = hRow.slug;
+          computedDiffs = diffs.map((d) => ({
+            field: d.field,
+            previousVerifiedValue: d.oldValue,
+            newProposedValue: d.newValue,
+            evidenceExcerpt: `Updated via ${candidate.source} (${candidate.verifiedCanonicalUrl ?? candidate.originalSubmissionUrl ?? candidate.sourceUrl ?? 'verified submission'})`,
+          }));
+        } else if (!duplicateSlug && !updatesSlug) {
+          duplicateSlug = hRow.slug;
+        }
+        break;
       }
     }
 
+    // 2. Check existing pending candidates across all sources so the same event from 3 sources
+    //    consolidates into a single candidate entry instead of creating 3 separate cards
+    const allCandidates = await db.select().from(schema.eventCandidates);
+    let matchedExistingCandidate:
+      | typeof schema.eventCandidates.$inferSelect
+      | undefined = allCandidates.find(
+      (c) => c.externalFingerprint === candidate.externalFingerprint
+    );
+
+    if (!matchedExistingCandidate) {
+      matchedExistingCandidate = allCandidates.find(
+        (c) =>
+          (c.reviewStatus === 'new' ||
+            c.reviewStatus === 'needs_confirmation') &&
+          areEventsSameRealWorldEvent(
+            {
+              title: c.title,
+              description: c.description,
+              startAt: c.startAt,
+              endAt: c.endAt,
+              organizer: c.organizer,
+              verifiedCanonicalUrl: c.verifiedCanonicalUrl,
+              originalSubmissionUrl: c.originalSubmissionUrl ?? c.sourceUrl,
+              registrationUrl: c.registrationUrl,
+            },
+            {
+              title: candidate.title,
+              description: candidate.description,
+              startAt: candidate.startAt,
+              endAt: candidate.endAt,
+              organizer: candidate.organizer,
+              verifiedCanonicalUrl: candidate.verifiedCanonicalUrl,
+              originalSubmissionUrl:
+                candidate.originalSubmissionUrl ?? candidate.sourceUrl,
+              registrationUrl: candidate.registrationUrl,
+            }
+          )
+      );
+    }
+
     const candidateUid =
-      existingCandidates[0]?.candidateUid ??
+      matchedExistingCandidate?.candidateUid ??
       (candidate.id || `cand_${Date.now()}`);
+
+    // Merge grounded fields if consolidating with an existing pending candidate
+    const mergedStartAt =
+      candidate.startAt ?? matchedExistingCandidate?.startAt ?? null;
+    const mergedEndAt =
+      candidate.endAt ?? matchedExistingCandidate?.endAt ?? null;
+    const mergedDeadline =
+      candidate.registrationDeadline ??
+      matchedExistingCandidate?.registrationDeadline ??
+      null;
+    const mergedCampus =
+      candidate.venue?.campus ??
+      (matchedExistingCandidate?.campus as CampusType | null) ??
+      null;
+    const mergedVenueName =
+      candidate.venue?.name ?? matchedExistingCandidate?.venueName ?? null;
+    const mergedMinTeam =
+      candidate.teamSize?.min ?? matchedExistingCandidate?.minTeamSize ?? null;
+    const mergedMaxTeam =
+      candidate.teamSize?.max ?? matchedExistingCandidate?.maxTeamSize ?? null;
+    const mergedRegUrl =
+      candidate.registrationUrl ??
+      matchedExistingCandidate?.registrationUrl ??
+      null;
+    const mergedVerifiedCanonical =
+      candidate.verifiedCanonicalUrl ??
+      matchedExistingCandidate?.verifiedCanonicalUrl ??
+      null;
+
+    // Combine field evidence and store `_proposedDiffs` inside `fieldEvidenceJson`
+    const existingEvidence = matchedExistingCandidate
+      ? safeJsonParse<Record<string, any>>(
+          matchedExistingCandidate.fieldEvidenceJson,
+          {}
+        )
+      : {};
+    const combinedEvidence: Record<string, any> = {
+      ...existingEvidence,
+      ...(candidate.fieldEvidence ?? {}),
+    };
+    if (computedDiffs && computedDiffs.length > 0) {
+      combinedEvidence._proposedDiffs = computedDiffs;
+    }
 
     const [row] = await db
       .insert(schema.eventCandidates)
       .values({
         candidateUid,
         source: candidate.source,
-        sourceUrl: candidate.sourceUrl ?? null,
-        originalSubmissionUrl: candidate.originalSubmissionUrl ?? null,
-        verifiedCanonicalUrl: candidate.verifiedCanonicalUrl ?? null,
-        sourceUrlStatus: candidate.sourceUrlStatus ?? 'unverified',
+        sourceUrl:
+          candidate.sourceUrl ?? matchedExistingCandidate?.sourceUrl ?? null,
+        originalSubmissionUrl:
+          candidate.originalSubmissionUrl ??
+          matchedExistingCandidate?.originalSubmissionUrl ??
+          null,
+        verifiedCanonicalUrl: mergedVerifiedCanonical,
+        sourceUrlStatus:
+          candidate.sourceUrlStatus ??
+          (matchedExistingCandidate?.sourceUrlStatus as SourceUrlVerificationStatus) ??
+          'unverified',
         uploadedAttachmentJson: candidate.uploadedAttachment
           ? JSON.stringify(candidate.uploadedAttachment)
-          : null,
-        submittedByUid: candidate.submittedByUid ?? null,
-        externalFingerprint: candidate.externalFingerprint,
+          : (matchedExistingCandidate?.uploadedAttachmentJson ?? null),
+        submittedByUid:
+          candidate.submittedByUid ??
+          matchedExistingCandidate?.submittedByUid ??
+          null,
+        externalFingerprint:
+          matchedExistingCandidate?.externalFingerprint ??
+          candidate.externalFingerprint,
         duplicateOfHackathonSlug: duplicateSlug,
-        updatesExistingHackathonSlug:
-          candidate.updatesExistingHackathonId ?? null,
-        title: candidate.title,
-        organizer: candidate.organizer,
+        updatesExistingHackathonSlug: updatesSlug,
+        title: candidate.title || matchedExistingCandidate?.title || '',
+        organizer:
+          candidate.organizer || matchedExistingCandidate?.organizer || '',
         eventType: candidate.eventType,
         matchable: candidate.matchable,
         themesJson: JSON.stringify(candidate.themes ?? []),
-        description: candidate.description,
-        startAt: candidate.startAt ?? null,
-        endAt: candidate.endAt ?? null,
-        registrationDeadline: candidate.registrationDeadline ?? null,
-        campus: candidate.venue?.campus ?? null,
-        venueName: candidate.venue?.name ?? null,
-        format: candidate.format ?? 'unknown',
-        minTeamSize: candidate.teamSize?.min ?? null,
-        maxTeamSize: candidate.teamSize?.max ?? null,
-        registrationUrl: candidate.registrationUrl ?? null,
-        eligibilityNotes: candidate.eligibilityNotes ?? null,
-        fieldEvidenceJson: JSON.stringify(candidate.fieldEvidence ?? {}),
+        description:
+          candidate.description || matchedExistingCandidate?.description || '',
+        startAt: mergedStartAt,
+        endAt: mergedEndAt,
+        registrationDeadline: mergedDeadline,
+        campus: mergedCampus,
+        venueName: mergedVenueName,
+        format:
+          candidate.format && candidate.format !== 'unknown'
+            ? candidate.format
+            : ((matchedExistingCandidate?.format as
+                | 'onsite'
+                | 'online'
+                | 'hybrid'
+                | 'unknown') ?? 'unknown'),
+        minTeamSize: mergedMinTeam,
+        maxTeamSize: mergedMaxTeam,
+        registrationUrl: mergedRegUrl,
+        eligibilityNotes:
+          candidate.eligibilityNotes ??
+          matchedExistingCandidate?.eligibilityNotes ??
+          null,
+        fieldEvidenceJson: JSON.stringify(combinedEvidence),
         ruleGatePassed: candidate.classification.ruleGatePassed,
         classificationReason: candidate.classification.reason,
         reviewStatus: candidate.reviewStatus ?? 'needs_confirmation',
@@ -1564,16 +2236,25 @@ export async function createEventCandidateRecord(
       .onConflictDoUpdate({
         target: schema.eventCandidates.candidateUid,
         set: {
-          title: candidate.title,
-          organizer: candidate.organizer,
+          title: candidate.title || matchedExistingCandidate?.title || '',
+          organizer:
+            candidate.organizer || matchedExistingCandidate?.organizer || '',
           eventType: candidate.eventType,
           matchable: candidate.matchable,
-          description: candidate.description,
-          startAt: candidate.startAt ?? null,
-          endAt: candidate.endAt ?? null,
-          registrationDeadline: candidate.registrationDeadline ?? null,
-          minTeamSize: candidate.teamSize?.min ?? null,
-          maxTeamSize: candidate.teamSize?.max ?? null,
+          description:
+            candidate.description || matchedExistingCandidate?.description || '',
+          startAt: mergedStartAt,
+          endAt: mergedEndAt,
+          registrationDeadline: mergedDeadline,
+          campus: mergedCampus,
+          venueName: mergedVenueName,
+          minTeamSize: mergedMinTeam,
+          maxTeamSize: mergedMaxTeam,
+          registrationUrl: mergedRegUrl,
+          verifiedCanonicalUrl: mergedVerifiedCanonical,
+          duplicateOfHackathonSlug: duplicateSlug,
+          updatesExistingHackathonSlug: updatesSlug,
+          fieldEvidenceJson: JSON.stringify(combinedEvidence),
           reviewStatus: candidate.reviewStatus ?? 'needs_confirmation',
         },
       })
@@ -1608,9 +2289,6 @@ export async function approveEventCandidateRecord(params: {
       throw new Error('Event candidate not found.');
     }
 
-    // Overrides are applied per field: an omitted field keeps the candidate's
-    // submitted value, while an explicit `null` is honoured (e.g. "team size
-    // unknown" -> unconfirmed constraints).
     const hasOverride = (key: string) =>
       params.overrides !== undefined && key in params.overrides;
 
@@ -1627,56 +2305,188 @@ export async function approveEventCandidateRecord(params: {
       ? (params.overrides!.campus ?? null)
       : ((cand.campus as CampusType | null) ?? null);
 
-    const slugBase = cand.title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .slice(0, 36);
-    const slug = `hack_${slugBase}_${Date.now().toString(36)}`;
+    const parsedEvidence = safeJsonParse<Record<string, any>>(
+      cand.fieldEvidenceJson,
+      {}
+    );
+    const provenanceWithMeta = {
+      ...parsedEvidence,
+      _meta: {
+        sourceType: cand.source,
+        sourceUrl:
+          cand.verifiedCanonicalUrl ??
+          cand.originalSubmissionUrl ??
+          cand.sourceUrl ??
+          'manual',
+        extractedAt: cand.createdAt.toISOString(),
+        verifiedBy: params.actorUid,
+        verifiedAt: new Date().toISOString(),
+      },
+    };
 
-    const [hackRow] = await db
-      .insert(schema.hackathons)
-      .values({
-        slug,
-        name: cand.title,
-        organizer: cand.organizer,
-        description: cand.description,
-        eventType: finalType,
-        matchable: finalMatchable,
-        themesJson: cand.themesJson,
-        campus: finalCampus ?? null,
-        venueName: cand.venueName ?? null,
-        format: cand.format,
-        startAt: cand.startAt,
-        endAt: cand.endAt,
-        registrationDeadline: cand.registrationDeadline,
-        originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
-        verifiedCanonicalUrl: cand.verifiedCanonicalUrl,
-        registrationUrl: cand.registrationUrl,
-        sourceUrlStatus: cand.sourceUrlStatus,
-        minTeamSize: finalMin,
-        maxTeamSize: finalMax,
-        eligibilityNotes: cand.eligibilityNotes,
-        fieldProvenanceJson: cand.fieldEvidenceJson,
-        ruleGatePassed: cand.ruleGatePassed,
-        classificationReason: cand.classificationReason,
-        verificationStatus:
-          finalMin !== null && finalMax !== null
-            ? 'verified'
-            : 'unconfirmed_constraints',
-        status: 'published',
-        createdByUid: params.actorUid,
-      })
-      .returning();
+    // Check if this candidate updates or duplicates an already-published hackathon
+    let existingTargetSlug =
+      cand.updatesExistingHackathonSlug ?? cand.duplicateOfHackathonSlug ?? null;
+
+    if (!existingTargetSlug) {
+      const allHacks = await db.select().from(schema.hackathons);
+      const matchedHack = allHacks.find((h) =>
+        areEventsSameRealWorldEvent(
+          {
+            title: h.name,
+            description: h.description,
+            startAt: h.startAt,
+            endAt: h.endAt,
+            organizer: h.organizer,
+            verifiedCanonicalUrl: h.verifiedCanonicalUrl,
+            originalSubmissionUrl: h.originalSubmissionUrl,
+            registrationUrl: h.registrationUrl,
+          },
+          {
+            title: cand.title,
+            description: cand.description,
+            startAt: cand.startAt,
+            endAt: cand.endAt,
+            organizer: cand.organizer,
+            verifiedCanonicalUrl: cand.verifiedCanonicalUrl,
+            originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
+            registrationUrl: cand.registrationUrl,
+          }
+        )
+      );
+      if (matchedHack) {
+        existingTargetSlug = matchedHack.slug;
+      }
+    }
+
+    let hackRow: typeof schema.hackathons.$inferSelect;
+
+    if (existingTargetSlug) {
+      const existingRows = await db
+        .select()
+        .from(schema.hackathons)
+        .where(eq(schema.hackathons.slug, existingTargetSlug));
+      const ex = existingRows[0];
+
+      if (ex) {
+        const exProv = safeJsonParse<Record<string, any>>(
+          ex.fieldProvenanceJson,
+          {}
+        );
+        const existingSourceUrls = Array.isArray(exProv?._meta?.allSourceUrls)
+          ? (exProv._meta.allSourceUrls as string[])
+          : [];
+        const mergedSourceUrls = Array.from(
+          new Set(
+            [
+              ...existingSourceUrls,
+              ex.verifiedCanonicalUrl,
+              cand.verifiedCanonicalUrl,
+              cand.originalSubmissionUrl,
+              cand.sourceUrl,
+            ].filter((u): u is string => Boolean(u && u.trim()))
+          )
+        );
+        const mergedProv = {
+          ...exProv,
+          ...provenanceWithMeta,
+          _meta: {
+            ...(exProv._meta ?? {}),
+            ...provenanceWithMeta._meta,
+            allSourceUrls: mergedSourceUrls,
+          },
+        };
+
+        const [updatedHack] = await db
+          .update(schema.hackathons)
+          .set({
+            name: cleanHtmlToText(cand.title || ex.name),
+            organizer: cleanHtmlToText(cand.organizer || ex.organizer),
+            description: cleanHtmlToText(cand.description || ex.description),
+            eventType: finalType,
+            matchable: finalMatchable,
+            campus: finalCampus ?? ex.campus,
+            venueName: cand.venueName ?? ex.venueName,
+            startAt: cand.startAt ?? ex.startAt,
+            endAt: cand.endAt ?? ex.endAt,
+            registrationDeadline:
+              cand.registrationDeadline ?? ex.registrationDeadline,
+            verifiedCanonicalUrl:
+              ex.verifiedCanonicalUrl ?? cand.verifiedCanonicalUrl,
+            registrationUrl: cand.registrationUrl ?? ex.registrationUrl,
+            minTeamSize: finalMin ?? ex.minTeamSize,
+            maxTeamSize: finalMax ?? ex.maxTeamSize,
+            fieldProvenanceJson: JSON.stringify(mergedProv),
+            verificationStatus:
+              (finalMin ?? ex.minTeamSize) !== null &&
+              (finalMax ?? ex.maxTeamSize) !== null
+                ? 'verified'
+                : 'unconfirmed_constraints',
+          })
+          .where(eq(schema.hackathons.slug, ex.slug))
+          .returning();
+        hackRow = updatedHack;
+      } else {
+        existingTargetSlug = null;
+      }
+    }
+
+    if (!existingTargetSlug) {
+      const slugBase = cand.title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 36);
+      const slug = `hack_${slugBase}_${Date.now().toString(36)}`;
+
+      const [insertedHack] = await db
+        .insert(schema.hackathons)
+        .values({
+          slug,
+          name: cleanHtmlToText(cand.title),
+          organizer: cleanHtmlToText(cand.organizer),
+          description: cleanHtmlToText(cand.description),
+          eventType: finalType,
+          matchable: finalMatchable,
+          themesJson: cand.themesJson,
+          campus: finalCampus ?? null,
+          venueName: cand.venueName ?? null,
+          format: cand.format,
+          startAt: cand.startAt,
+          endAt: cand.endAt,
+          registrationDeadline: cand.registrationDeadline,
+          originalSubmissionUrl: cand.originalSubmissionUrl ?? cand.sourceUrl,
+          verifiedCanonicalUrl: cand.verifiedCanonicalUrl,
+          registrationUrl: cand.registrationUrl,
+          sourceUrlStatus: cand.sourceUrlStatus,
+          minTeamSize: finalMin,
+          maxTeamSize: finalMax,
+          eligibilityNotes: cand.eligibilityNotes,
+          fieldProvenanceJson: JSON.stringify(provenanceWithMeta),
+          ruleGatePassed: cand.ruleGatePassed,
+          classificationReason: cand.classificationReason,
+          verificationStatus:
+            finalMin !== null && finalMax !== null
+              ? 'verified'
+              : 'unconfirmed_constraints',
+          status: finalMatchable ? 'published' : 'archived',
+          createdByUid: params.actorUid,
+        })
+        .returning();
+      hackRow = insertedHack;
+    }
 
     const [updatedCand] = await db
       .update(schema.eventCandidates)
-      .set({ reviewStatus: 'approved' })
+      .set({
+        reviewStatus: 'approved',
+        duplicateOfHackathonSlug: existingTargetSlug ?? hackRow!.slug,
+      })
       .where(eq(schema.eventCandidates.candidateUid, params.candidateUid))
       .returning();
 
     return {
-      hackathon: mapDbHackathonToDomain(hackRow),
+      hackathon: mapDbHackathonToDomain(hackRow!),
       candidate: mapDbCandidateToDomain(updatedCand),
     };
   } catch (error) {
@@ -1706,6 +2516,67 @@ export async function rejectEventCandidateRecord(
   }
 }
 
+/**
+ * Re-links any teams, memberships, participations, joinRequests, swipes, conversations,
+ * teamProposals, and teamRegistrations from a duplicate `oldSlug` to the canonical `newSlug`
+ * so existing teams and student state remain intact across cross-source deduplication.
+ */
+export async function relinkHackathonForeignKeys(
+  oldSlug: string,
+  newSlug: string
+): Promise<void> {
+  if (!oldSlug || !newSlug || oldSlug === newSlug) return;
+  try {
+    await db
+      .update(schema.teams)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.teams.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.memberships)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.memberships.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.participations)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.participations.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.joinRequests)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.joinRequests.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.swipes)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.swipes.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.conversations)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.conversations.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.teamProposals)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.teamProposals.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.teamRegistrations)
+      .set({ hackathonSlug: newSlug })
+      .where(eq(schema.teamRegistrations.hackathonSlug, oldSlug))
+      .catch(() => {});
+    await db
+      .update(schema.eventCandidates)
+      .set({ duplicateOfHackathonSlug: newSlug })
+      .where(eq(schema.eventCandidates.duplicateOfHackathonSlug, oldSlug))
+      .catch(() => {});
+  } catch {
+    // Non-fatal if a composite key already exists on newSlug
+  }
+}
+
 export async function createPublishedHackathonDirect(params: {
   slug?: string;
   name: string;
@@ -1725,64 +2596,991 @@ export async function createPublishedHackathonDirect(params: {
   registrationUrl: string | null;
   verifiedCanonicalUrl: string | null;
   sourceUrlStatus: SourceUrlVerificationStatus;
+  sourceType?: EventSourceType;
+  additionalSources?: string[];
+  additionalProvenance?: Record<string, any>;
+  extractedAt?: string;
+  classificationReason?: string;
+  status?: EventLifecycleStatus;
   createdByUid: string;
 }): Promise<Hackathon> {
   try {
+    const cleanName = cleanHtmlToText(params.name);
+    const cleanOrganizer = cleanHtmlToText(params.organizer);
+    const cleanDesc = cleanHtmlToText(params.description);
+    const cleanVenue = params.venueName
+      ? cleanHtmlToText(params.venueName)
+      : null;
+
+    let cleanRegUrl = params.registrationUrl?.trim() || null;
+    if (cleanRegUrl) {
+      const lowerReg = cleanRegUrl.toLowerCase();
+      if (
+        lowerReg.includes('me-qr.com/page/blog') ||
+        lowerReg.includes('pesuacademy.com') ||
+        (params.verifiedCanonicalUrl &&
+          cleanRegUrl === params.verifiedCanonicalUrl &&
+          lowerReg.includes('events.pes.edu/'))
+      ) {
+        cleanRegUrl = null;
+      }
+    }
+
+    let cleanCanonUrl = params.verifiedCanonicalUrl?.trim() || null;
+    if (cleanCanonUrl && cleanCanonUrl.toLowerCase().includes('pesuacademy.com')) {
+      cleanCanonUrl = null;
+    }
+
+    // Find all existing rows that match either the same real-world event OR the explicit slug
+    const allPublished = await db.select().from(schema.hackathons);
+    const matchingRows = allPublished.filter(
+      (h) =>
+        (params.slug && h.slug === params.slug) ||
+        areEventsSameRealWorldEvent(
+          {
+            title: h.name,
+            description: h.description,
+            startAt: h.startAt,
+            endAt: h.endAt,
+            organizer: h.organizer,
+            verifiedCanonicalUrl: h.verifiedCanonicalUrl,
+            originalSubmissionUrl: h.originalSubmissionUrl,
+            registrationUrl: h.registrationUrl,
+          },
+          {
+            title: cleanName,
+            description: cleanDesc,
+            startAt: params.startAt,
+            endAt: params.endAt,
+            organizer: cleanOrganizer,
+            verifiedCanonicalUrl: cleanCanonUrl,
+            originalSubmissionUrl: cleanRegUrl ?? cleanCanonUrl,
+            registrationUrl: cleanRegUrl,
+          }
+        )
+    );
+
+    // If multiple rows match (e.g. ADCOM 2027 across 11537 and 11523, or PES Public + PAASHA),
+    // prefer official events.pes.edu slugs and canonical conference/hackathon titles
+    matchingRows.sort((a, b) => {
+      const aCanonicalTitle = /31st international advanced computing/i.test(
+        a.name
+      )
+        ? 1
+        : 0;
+      const bCanonicalTitle = /31st international advanced computing/i.test(
+        b.name
+      )
+        ? 1
+        : 0;
+      if (aCanonicalTitle !== bCanonicalTitle) {
+        return bCanonicalTitle - aCanonicalTitle;
+      }
+      const aPesOfficial = a.slug.startsWith('pes_event_') ? 1 : 0;
+      const bPesOfficial = b.slug.startsWith('pes_event_') ? 1 : 0;
+      if (aPesOfficial !== bPesOfficial) {
+        return bPesOfficial - aPesOfficial;
+      }
+      return a.slug.localeCompare(b.slug);
+    });
+
+    const primaryExisting = matchingRows[0];
+    const secondaryDuplicates = matchingRows.slice(1);
+
     const slug =
+      primaryExisting?.slug ||
       params.slug ||
-      `hack_${params.name
+      `hack_${cleanName
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')
         .slice(0, 32)}_${Date.now().toString(36)}`;
+
+    // Merge all official source URLs across primary, secondary duplicates, and incoming params
+    const existingProv = primaryExisting
+      ? safeJsonParse<Record<string, any>>(
+          primaryExisting.fieldProvenanceJson,
+          {}
+        )
+      : {};
+    const prevUrls = Array.isArray(existingProv?._meta?.allSourceUrls)
+      ? (existingProv._meta.allSourceUrls as string[])
+      : [];
+
+    const allSourceUrls = Array.from(
+      new Set(
+        [
+          ...prevUrls,
+          primaryExisting?.verifiedCanonicalUrl,
+          ...secondaryDuplicates.map((d) => d.verifiedCanonicalUrl),
+          cleanCanonUrl,
+          cleanRegUrl,
+          ...(params.additionalSources ?? []),
+        ].filter(
+          (u): u is string =>
+            Boolean(u && u.trim() && !u.toLowerCase().includes('pesuacademy.com'))
+        )
+      )
+    );
+
+    // Choose the best title & description when consolidating multi-page or cross-source events
+    const finalName =
+      primaryExisting &&
+      /31st international advanced computing/i.test(primaryExisting.name) &&
+      !/31st international advanced computing/i.test(cleanName)
+        ? cleanHtmlToText(primaryExisting.name)
+        : primaryExisting &&
+            primaryExisting.slug.startsWith('pes_event_') &&
+            params.sourceType === 'paasha_microservice' &&
+            cleanHtmlToText(primaryExisting.name).length >= 3
+          ? cleanHtmlToText(primaryExisting.name)
+          : cleanName;
+
+    const finalDesc =
+      primaryExisting &&
+      cleanHtmlToText(primaryExisting.description).length > cleanDesc.length &&
+      primaryExisting.slug !== params.slug
+        ? cleanHtmlToText(primaryExisting.description)
+        : cleanDesc;
+
+    const finalCanonicalUrl =
+      primaryExisting &&
+      primaryExisting.verifiedCanonicalUrl?.includes('events.pes.edu')
+        ? primaryExisting.verifiedCanonicalUrl
+        : primaryExisting && primaryExisting.slug !== params.slug
+          ? (primaryExisting.verifiedCanonicalUrl ?? cleanCanonUrl)
+          : (cleanCanonUrl ?? primaryExisting?.verifiedCanonicalUrl ?? null);
+
+    const finalRegUrl =
+      cleanRegUrl ??
+      (primaryExisting?.registrationUrl &&
+      primaryExisting.registrationUrl !== primaryExisting.verifiedCanonicalUrl &&
+      !primaryExisting.registrationUrl.toLowerCase().includes('me-qr.com/page/blog') &&
+      !primaryExisting.registrationUrl.toLowerCase().includes('pesuacademy.com')
+        ? primaryExisting.registrationUrl
+        : null);
+
+    // Confidence-aware field merging: prefer verified dates from events.pes.edu when merging PAASHA,
+    // and fill missing fields (like minTeamSize/maxTeamSize/registrationUrl/registrationDeadline/venue)
+    const isIncomingPaashaOntoPesPublic =
+      params.sourceType === 'paasha_microservice' &&
+      Boolean(primaryExisting?.verifiedCanonicalUrl?.includes('events.pes.edu'));
+
+    const mergedStartAt = isIncomingPaashaOntoPesPublic
+      ? (primaryExisting?.startAt ?? params.startAt ?? null)
+      : (params.startAt ?? primaryExisting?.startAt ?? null);
+    const mergedEndAt = isIncomingPaashaOntoPesPublic
+      ? (primaryExisting?.endAt ?? params.endAt ?? mergedStartAt)
+      : (params.endAt ?? primaryExisting?.endAt ?? mergedStartAt);
+    const mergedDeadline =
+      params.registrationDeadline ??
+      primaryExisting?.registrationDeadline ??
+      null;
+    const mergedCampus =
+      (isIncomingPaashaOntoPesPublic
+        ? (primaryExisting?.campus as CampusType | null) ?? params.campus
+        : params.campus ?? (primaryExisting?.campus as CampusType | null)) ??
+      null;
+    const mergedVenue =
+      (isIncomingPaashaOntoPesPublic
+        ? primaryExisting?.venueName ?? cleanVenue
+        : cleanVenue ?? primaryExisting?.venueName) ?? null;
+
+    const rawMinTeam = params.minTeamSize ?? primaryExisting?.minTeamSize ?? null;
+    const rawMaxTeam = params.maxTeamSize ?? primaryExisting?.maxTeamSize ?? null;
+
+    const states = evaluateHackathonEligibilityAndStates({
+      name: finalName,
+      description: finalDesc,
+      eventType: params.eventType,
+      themes: params.themes,
+      minTeamSize: rawMinTeam,
+      maxTeamSize: rawMaxTeam,
+      startAt: mergedStartAt,
+      endAt: mergedEndAt,
+      registrationDeadline: mergedDeadline,
+      registrationUrl: finalRegUrl,
+      verifiedCanonicalUrl: finalCanonicalUrl,
+      sourceUrlStatus: params.sourceUrlStatus,
+      sourceType:
+        params.sourceType ??
+        (finalCanonicalUrl?.includes('events.pes.edu')
+          ? 'pes_public_events'
+          : 'submitted_public_url'),
+    });
+
+    // Events with unknown team eligibility must NEVER be marked matchable: true
+    const resolvedMatchable =
+      params.matchable !== false && states.matchable;
+    const resolvedStatus: EventLifecycleStatus =
+      params.status ??
+      (states.isHackathon && states.publicSourceVerified
+        ? 'published'
+        : 'archived');
+
+    const nowIso = new Date().toISOString();
+    const provenanceObj: Record<string, any> = {
+      ...existingProv,
+      ...(params.additionalProvenance ?? {}),
+      _meta: {
+        ...(existingProv._meta ?? {}),
+        sourceType:
+          finalCanonicalUrl?.includes('events.pes.edu')
+            ? 'pes_public_events'
+            : (params.sourceType ??
+              existingProv?._meta?.sourceType ??
+              'submitted_public_url'),
+        sourceUrl: finalCanonicalUrl ?? finalRegUrl ?? 'manual',
+        allSourceUrls,
+        extractedAt: params.extractedAt ?? nowIso,
+        verifiedBy: params.createdByUid,
+        verifiedAt: nowIso,
+      },
+    };
+
+    for (const url of allSourceUrls) {
+      const key = `official_source_${url.replace(/[^a-zA-Z0-9]/g, '_').slice(-32)}`;
+      if (!provenanceObj[key]) {
+        provenanceObj[key] = {
+          sourceUrl: url,
+          sourceType: url.includes('events.pes.edu')
+            ? 'pes_public_events'
+            : url.startsWith('paasha:')
+              ? 'paasha_microservice'
+              : (params.sourceType ?? 'submitted_public_url'),
+          excerpt: `Verified source reference (${url})`,
+          verifiedAt: nowIso,
+        };
+      }
+    }
+
+    const provenanceJson = JSON.stringify(provenanceObj);
 
     const [row] = await db
       .insert(schema.hackathons)
       .values({
         slug,
-        name: params.name,
-        organizer: params.organizer,
-        description: params.description,
-        eventType: params.eventType,
-        matchable: params.matchable,
+        name: finalName,
+        organizer: cleanOrganizer || primaryExisting?.organizer || 'PES University',
+        description: finalDesc,
+        eventType: states.eventType,
+        matchable: resolvedMatchable,
         themesJson: JSON.stringify(params.themes),
-        campus: params.campus,
-        venueName: params.venueName,
-        format: params.format,
-        startAt: params.startAt,
-        endAt: params.endAt,
-        registrationDeadline: params.registrationDeadline,
-        originalSubmissionUrl: params.registrationUrl,
-        verifiedCanonicalUrl: params.verifiedCanonicalUrl,
-        registrationUrl: params.registrationUrl,
+        campus: mergedCampus,
+        venueName: mergedVenue,
+        format:
+          params.format !== 'unknown'
+            ? params.format
+            : (primaryExisting?.format as any) || 'unknown',
+        startAt: mergedStartAt,
+        endAt: mergedEndAt,
+        registrationDeadline: mergedDeadline,
+        originalSubmissionUrl: finalRegUrl ?? finalCanonicalUrl,
+        verifiedCanonicalUrl: finalCanonicalUrl,
+        registrationUrl: finalRegUrl,
         sourceUrlStatus: params.sourceUrlStatus,
-        minTeamSize: params.minTeamSize,
-        maxTeamSize: params.maxTeamSize,
-        ruleGatePassed: params.matchable,
-        classificationReason: 'Published verified event.',
+        minTeamSize: states.minTeamSize,
+        maxTeamSize: states.maxTeamSize,
+        fieldProvenanceJson: provenanceJson,
+        ruleGatePassed: resolvedMatchable,
+        classificationReason:
+          params.classificationReason ||
+          states.classificationReason ||
+          'Published verified event.',
         verificationStatus:
-          params.minTeamSize !== null && params.maxTeamSize !== null
+          states.teamParticipationVerified &&
+          states.minTeamSize !== null &&
+          states.maxTeamSize !== null
             ? 'verified'
             : 'unconfirmed_constraints',
-        status: 'published',
+        status: resolvedStatus,
         createdByUid: params.createdByUid,
       })
       .onConflictDoUpdate({
         target: schema.hackathons.slug,
         set: {
-          name: params.name,
-          organizer: params.organizer,
-          description: params.description,
-          minTeamSize: params.minTeamSize,
-          maxTeamSize: params.maxTeamSize,
+          name: finalName,
+          organizer:
+            cleanOrganizer || primaryExisting?.organizer || 'PES University',
+          description: finalDesc,
+          eventType: states.eventType,
+          matchable: resolvedMatchable,
+          themesJson: JSON.stringify(params.themes),
+          campus: mergedCampus,
+          venueName: mergedVenue,
+          format:
+            params.format !== 'unknown'
+              ? params.format
+              : (primaryExisting?.format as any) || 'unknown',
+          startAt: mergedStartAt,
+          endAt: mergedEndAt,
+          registrationDeadline: mergedDeadline,
+          verifiedCanonicalUrl: finalCanonicalUrl,
+          registrationUrl: finalRegUrl,
+          minTeamSize: states.minTeamSize,
+          maxTeamSize: states.maxTeamSize,
+          fieldProvenanceJson: provenanceJson,
+          ruleGatePassed: resolvedMatchable,
+          classificationReason:
+            params.classificationReason ||
+            states.classificationReason ||
+            'Published verified event.',
+          verificationStatus:
+            states.teamParticipationVerified &&
+            states.minTeamSize !== null &&
+            states.maxTeamSize !== null
+              ? 'verified'
+              : 'unconfirmed_constraints',
+          status: resolvedStatus,
         },
       })
       .returning();
+
+    // Re-link foreign keys and archive any secondary duplicate rows in DB
+    for (const dup of secondaryDuplicates) {
+      if (dup.slug !== slug) {
+        await relinkHackathonForeignKeys(dup.slug, slug);
+        await db
+          .update(schema.hackathons)
+          .set({
+            status: 'archived',
+            matchable: false,
+            classificationReason: `Consolidated duplicate into ${slug}`,
+          })
+          .where(eq(schema.hackathons.slug, dup.slug))
+          .catch(() => {});
+      }
+    }
 
     return mapDbHackathonToDomain(row);
   } catch (error) {
     console.error('Database error in createPublishedHackathonDirect:', error);
     throw new Error('Failed to create hackathon.', { cause: error });
   }
+}
+
+export interface PaashaIngestionSummary {
+  receivedCount: number;
+  publishedCount: number;
+  mergedWithExistingCount: number;
+  heldForReviewCount: number;
+  excludedNonHackathonCount: number;
+  publishedIds: string[];
+  heldCandidateIds: string[];
+}
+
+/**
+ * Ingests validated PAASHA microservice records into Quackathon's PostgreSQL pipeline:
+ * - Stages candidate records in `event_candidates` with sanitized provenance.
+ * - Excludes non-hackathons (`isHackathon === false`).
+ * - Holds events with missing public proof (`publicSourceVerified === false`) or unknown team
+ *   participation (`teamParticipationVerified === false`) in `needs_confirmation` unless they
+ *   enrich an already-published official `events.pes.edu` hackathon.
+ * - Cross-source deduplicates against existing `hackathons` rows (`events.pes.edu` + PAASHA)
+ *   without changing existing `hackathon.id` slugs or breaking linked teams/participations.
+ */
+export async function ingestPaashaHackathonsToDatabase(params: {
+  items: import('../services/paashaClient').PaashaHackathonItem[];
+  actorUid?: string;
+}): Promise<PaashaIngestionSummary> {
+  const actorUid = params.actorUid ?? 'system_paasha_sync';
+  const summary: PaashaIngestionSummary = {
+    receivedCount: params.items.length,
+    publishedCount: 0,
+    mergedWithExistingCount: 0,
+    heldForReviewCount: 0,
+    excludedNonHackathonCount: 0,
+    publishedIds: [],
+    heldCandidateIds: [],
+  };
+
+  for (const rawItem of params.items) {
+    const validated = validateAndTransformPaashaHackathon(rawItem);
+    const candidateUid = `cand_paasha_${validated.paashaId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48)}`;
+
+    // Check if an existing published hackathon already represents this real-world event
+    const existingHacks = await db.select().from(schema.hackathons);
+    const matchedExisting = existingHacks.find((h) =>
+      areEventsSameRealWorldEvent(
+        {
+          title: h.name,
+          description: h.description,
+          startAt: h.startAt,
+          endAt: h.endAt,
+          organizer: h.organizer,
+          verifiedCanonicalUrl: h.verifiedCanonicalUrl,
+          originalSubmissionUrl: h.originalSubmissionUrl,
+          registrationUrl: h.registrationUrl,
+        },
+        {
+          title: validated.title,
+          description: validated.description,
+          startAt: validated.startAt,
+          endAt: validated.endAt,
+          organizer: validated.organizer,
+          verifiedCanonicalUrl: validated.verifiedCanonicalUrl,
+          originalSubmissionUrl:
+            validated.registrationUrl ?? validated.verifiedCanonicalUrl,
+          registrationUrl: validated.registrationUrl,
+        }
+      )
+    );
+
+    const canEnrichExistingHackathon =
+      Boolean(matchedExisting) &&
+      validated.isHackathon &&
+      matchedExisting!.status !== 'archived';
+
+    const shouldPublishOrMerge =
+      validated.shouldPublishToCatalog || canEnrichExistingHackathon;
+
+    let linkedSlug: string | null = matchedExisting?.slug ?? null;
+
+    if (!validated.isHackathon) {
+      summary.excludedNonHackathonCount += 1;
+    } else if (shouldPublishOrMerge) {
+      const wasExisting = Boolean(matchedExisting);
+      const cleanPaashaIdSlug = validated.paashaId
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .slice(0, 48);
+      const defaultPaashaSlug = cleanPaashaIdSlug.startsWith('paasha_')
+        ? cleanPaashaIdSlug
+        : `paasha_${cleanPaashaIdSlug.slice(0, 40)}`;
+      const published = await createPublishedHackathonDirect({
+        slug: matchedExisting?.slug ?? defaultPaashaSlug,
+        name: validated.title,
+        organizer: validated.organizer,
+        description: validated.description,
+        eventType: validated.eventType,
+        matchable: validated.matchable || Boolean(matchedExisting?.matchable),
+        themes: validated.themes,
+        campus: validated.campus,
+        venueName: validated.venueName,
+        format: validated.format,
+        startAt: validated.startAt,
+        endAt: validated.endAt,
+        registrationDeadline: validated.registrationDeadline,
+        minTeamSize: validated.minTeamSize,
+        maxTeamSize: validated.maxTeamSize,
+        registrationUrl: validated.registrationUrl ?? null,
+        verifiedCanonicalUrl: validated.verifiedCanonicalUrl ?? null,
+        sourceUrlStatus: validated.publicSourceVerified ? 'verified' : 'unverified',
+        sourceType: 'paasha_microservice',
+        additionalSources: validated.sources,
+        additionalProvenance: validated.fieldProvenance,
+        classificationReason: validated.rejectionOrHoldReason,
+        createdByUid: actorUid,
+      });
+      linkedSlug = published.id;
+      if (wasExisting) {
+        summary.mergedWithExistingCount += 1;
+      } else {
+        summary.publishedCount += 1;
+      }
+      if (!summary.publishedIds.includes(published.id)) {
+        summary.publishedIds.push(published.id);
+      }
+    } else {
+      summary.heldForReviewCount += 1;
+      summary.heldCandidateIds.push(candidateUid);
+    }
+
+    const candReviewStatus = !validated.isHackathon
+      ? 'rejected'
+      : shouldPublishOrMerge
+        ? 'approved'
+        : 'needs_confirmation';
+
+    await db
+      .insert(schema.eventCandidates)
+      .values({
+        candidateUid,
+        source: 'paasha_microservice',
+        sourceUrl:
+          validated.verifiedCanonicalUrl ??
+          validated.registrationUrl ??
+          null,
+        originalSubmissionUrl:
+          validated.registrationUrl ??
+          validated.verifiedCanonicalUrl ??
+          null,
+        verifiedCanonicalUrl: validated.verifiedCanonicalUrl,
+        sourceUrlStatus: validated.publicSourceVerified
+          ? 'verified'
+          : 'unverified',
+        externalFingerprint: validated.externalFingerprint,
+        duplicateOfHackathonSlug: linkedSlug,
+        updatesExistingHackathonSlug: matchedExisting?.slug ?? null,
+        title: validated.title,
+        organizer: validated.organizer,
+        eventType: validated.eventType,
+        matchable: validated.matchable,
+        themesJson: JSON.stringify(validated.themes),
+        description: validated.description,
+        startAt: validated.startAt,
+        endAt: validated.endAt,
+        registrationDeadline: validated.registrationDeadline,
+        campus: validated.campus,
+        venueName: validated.venueName,
+        format: validated.format,
+        minTeamSize: validated.minTeamSize,
+        maxTeamSize: validated.maxTeamSize,
+        registrationUrl: validated.registrationUrl,
+        fieldEvidenceJson: JSON.stringify({
+          paasha: [
+            {
+              sourceUrl:
+                validated.verifiedCanonicalUrl ??
+                `paasha://hackathon/${validated.paashaId}`,
+              excerpt: validated.rejectionOrHoldReason,
+            },
+          ],
+        }),
+        ruleGatePassed: validated.matchable,
+        classificationReason: validated.rejectionOrHoldReason,
+        reviewStatus: candReviewStatus,
+        warningsJson: JSON.stringify(
+          validated.shouldPublishToCatalog
+            ? []
+            : [validated.rejectionOrHoldReason]
+        ),
+      })
+      .onConflictDoUpdate({
+        target: schema.eventCandidates.candidateUid,
+        set: {
+          duplicateOfHackathonSlug: linkedSlug,
+          updatesExistingHackathonSlug: matchedExisting?.slug ?? null,
+          title: validated.title,
+          organizer: validated.organizer,
+          eventType: validated.eventType,
+          matchable: validated.matchable,
+          description: validated.description,
+          startAt: validated.startAt,
+          endAt: validated.endAt,
+          registrationDeadline: validated.registrationDeadline,
+          campus: validated.campus,
+          venueName: validated.venueName,
+          minTeamSize: validated.minTeamSize,
+          maxTeamSize: validated.maxTeamSize,
+          registrationUrl: validated.registrationUrl,
+          verifiedCanonicalUrl: validated.verifiedCanonicalUrl,
+          ruleGatePassed: validated.matchable,
+          classificationReason: validated.rejectionOrHoldReason,
+          reviewStatus: candReviewStatus,
+        },
+      });
+  }
+
+  return summary;
+}
+
+export interface DatabaseReconciliationReport {
+  executed: boolean;
+  totalRowsInspected: number;
+  duplicateRowsConsolidated: Array<{
+    removedOrArchivedSlug: string;
+    mergedIntoSlug: string;
+    title: string;
+  }>;
+  verifiedTeamHackathons: Array<{
+    slug: string;
+    name: string;
+    eventType: EventType;
+    minTeamSize: number | null;
+    maxTeamSize: number | null;
+  }>;
+  unknownTeamEligibilityHackathons: Array<{
+    slug: string;
+    name: string;
+    eventType: EventType;
+  }>;
+  nonHackathonRecords: Array<{
+    slug: string;
+    name: string;
+    eventType: EventType;
+  }>;
+  rowsUpdatedCount: number;
+}
+
+/**
+ * Audits and reconciles all rows in `schema.hackathons` (with dry-run support when `execute: false`):
+ * 1. Consolidates multi-page duplicates (`ADCOM 2027` across `pes_event_11537` and `pes_event_11523`,
+ *    and duplicate `Triverse Ideathon` pages) while preserving foreign keys.
+ * 2. Extracts grounded team sizes from descriptions (`MarTechHack26`, `Hackathon 2026`,
+ *    `Nimbus 1000 Hackathon`, `HEAL-A-Thon 2026`, `Agentathon 2025`, `Algomania 2.0`, etc.).
+ * 3. Ensures events with unknown team eligibility (`teamParticipationVerified === false`) are
+ *    marked `matchable: false` and `verificationStatus: 'unconfirmed_constraints'`.
+ * 4. Ensures all non-hackathon records (`tech_talk`, `workshop`, `conference`, `other`) have
+ *    accurate `eventType`, `matchable: false`, and `status: 'archived'`.
+ */
+export async function reconcileExistingHackathonsDatabase(options: {
+  execute: boolean;
+}): Promise<DatabaseReconciliationReport> {
+  const allRows = await db
+    .select()
+    .from(schema.hackathons)
+    .orderBy(schema.hackathons.id);
+
+  const duplicateRowsConsolidated: DatabaseReconciliationReport['duplicateRowsConsolidated'] =
+    [];
+  const verifiedTeamHackathons: DatabaseReconciliationReport['verifiedTeamHackathons'] =
+    [];
+  const unknownTeamEligibilityHackathons: DatabaseReconciliationReport['unknownTeamEligibilityHackathons'] =
+    [];
+  const nonHackathonRecords: DatabaseReconciliationReport['nonHackathonRecords'] =
+    [];
+  let rowsUpdatedCount = 0;
+
+  // Group rows by real-world event identity
+  const canonicalGroups: Array<{
+    primary: typeof schema.hackathons.$inferSelect;
+    duplicates: Array<typeof schema.hackathons.$inferSelect>;
+  }> = [];
+
+  for (const row of allRows) {
+    const existingGroup = canonicalGroups.find((g) =>
+      areEventsSameRealWorldEvent(
+        {
+          title: g.primary.name,
+          description: g.primary.description,
+          startAt: g.primary.startAt,
+          endAt: g.primary.endAt,
+          organizer: g.primary.organizer,
+          verifiedCanonicalUrl: g.primary.verifiedCanonicalUrl,
+          originalSubmissionUrl: g.primary.originalSubmissionUrl,
+          registrationUrl: g.primary.registrationUrl,
+        },
+        {
+          title: row.name,
+          description: row.description,
+          startAt: row.startAt,
+          endAt: row.endAt,
+          organizer: row.organizer,
+          verifiedCanonicalUrl: row.verifiedCanonicalUrl,
+          originalSubmissionUrl: row.originalSubmissionUrl,
+          registrationUrl: row.registrationUrl,
+        }
+      )
+    );
+
+    if (!existingGroup) {
+      canonicalGroups.push({ primary: row, duplicates: [] });
+    } else {
+      // Prefer `pes_event_11537` for ADCOM 2027 ("31st International Advanced Computing and Communication Conference")
+      if (
+        /31st international advanced computing/i.test(row.name) &&
+        !/31st international advanced computing/i.test(existingGroup.primary.name)
+      ) {
+        existingGroup.duplicates.push(existingGroup.primary);
+        existingGroup.primary = row;
+      } else {
+        existingGroup.duplicates.push(row);
+      }
+    }
+  }
+
+  for (const group of canonicalGroups) {
+    const primary = group.primary;
+    const dups = group.duplicates;
+
+    const cleanName = cleanHtmlToText(primary.name);
+    const cleanDesc = cleanHtmlToText(primary.description);
+    const rawThemes = safeJsonParse<string[]>(primary.themesJson, []);
+    const { themes: cleanedThemes } = cleanStoredEventThemes(rawThemes);
+
+    let cleanRegUrl = primary.registrationUrl ?? null;
+    if (cleanRegUrl) {
+      const lower = cleanRegUrl.toLowerCase();
+      if (
+        lower.includes('me-qr.com/page/blog') ||
+        lower.includes('pesuacademy.com') ||
+        (primary.verifiedCanonicalUrl &&
+          cleanRegUrl === primary.verifiedCanonicalUrl &&
+          lower.includes('events.pes.edu/'))
+      ) {
+        cleanRegUrl = null;
+      }
+    }
+
+    const states = evaluateHackathonEligibilityAndStates({
+      name: cleanName,
+      description: cleanDesc,
+      eventType: primary.eventType,
+      themes: cleanedThemes.filter((t) => t !== 'PESU Event'),
+      minTeamSize: primary.minTeamSize,
+      maxTeamSize: primary.maxTeamSize,
+      startAt: primary.startAt,
+      endAt: primary.endAt,
+      registrationDeadline: primary.registrationDeadline,
+      registrationUrl: cleanRegUrl,
+      verifiedCanonicalUrl: primary.verifiedCanonicalUrl,
+      originalSubmissionUrl: primary.originalSubmissionUrl,
+      sourceUrlStatus: primary.sourceUrlStatus,
+      sourceType: primary.slug.startsWith('pes_event_')
+        ? 'pes_public_events'
+        : undefined,
+      status: 'published', // Evaluate intrinsic hackathon status regardless of previous archived state
+    });
+
+    if (!states.isHackathon) {
+      nonHackathonRecords.push({
+        slug: primary.slug,
+        name: cleanName,
+        eventType: states.eventType,
+      });
+    } else if (states.teamParticipationVerified) {
+      verifiedTeamHackathons.push({
+        slug: primary.slug,
+        name: cleanName,
+        eventType: states.eventType,
+        minTeamSize: states.minTeamSize,
+        maxTeamSize: states.maxTeamSize,
+      });
+    } else {
+      unknownTeamEligibilityHackathons.push({
+        slug: primary.slug,
+        name: cleanName,
+        eventType: states.eventType,
+      });
+    }
+
+    const existingProv = safeJsonParse<Record<string, any>>(
+      primary.fieldProvenanceJson,
+      {}
+    );
+    const prevUrls = Array.isArray(existingProv?._meta?.allSourceUrls)
+      ? (existingProv._meta.allSourceUrls as string[])
+      : [];
+    const mergedSourceUrls = Array.from(
+      new Set(
+        [
+          ...prevUrls,
+          primary.verifiedCanonicalUrl,
+          ...dups.map((d) => d.verifiedCanonicalUrl),
+        ].filter((u): u is string => Boolean(u && u.trim()))
+      )
+    );
+
+    const targetStatus: EventLifecycleStatus = states.isHackathon
+      ? 'published'
+      : 'archived';
+    const targetVerificationStatus =
+      states.teamParticipationVerified &&
+      states.minTeamSize !== null &&
+      states.maxTeamSize !== null
+        ? 'verified'
+        : 'unconfirmed_constraints';
+
+    const needsUpdate =
+      primary.eventType !== states.eventType ||
+      primary.matchable !== states.matchable ||
+      primary.minTeamSize !== states.minTeamSize ||
+      primary.maxTeamSize !== states.maxTeamSize ||
+      primary.registrationUrl !== cleanRegUrl ||
+      primary.status !== targetStatus ||
+      primary.verificationStatus !== targetVerificationStatus ||
+      dups.length > 0;
+
+    if (needsUpdate) {
+      rowsUpdatedCount += 1;
+      if (options.execute) {
+        const updatedProv = {
+          ...existingProv,
+          _meta: {
+            ...(existingProv._meta ?? {}),
+            allSourceUrls: mergedSourceUrls,
+            verifiedAt: new Date().toISOString(),
+          },
+        };
+        await db
+          .update(schema.hackathons)
+          .set({
+            name: cleanName,
+            description: cleanDesc,
+            eventType: states.eventType,
+            matchable: states.matchable,
+            themesJson: JSON.stringify(cleanedThemes),
+            minTeamSize: states.minTeamSize,
+            maxTeamSize: states.maxTeamSize,
+            registrationUrl: cleanRegUrl,
+            ruleGatePassed: states.matchable,
+            classificationReason: states.classificationReason,
+            verificationStatus: targetVerificationStatus,
+            status: targetStatus,
+            fieldProvenanceJson: JSON.stringify(updatedProv),
+          })
+          .where(eq(schema.hackathons.slug, primary.slug));
+      }
+    }
+
+    for (const dup of dups) {
+      duplicateRowsConsolidated.push({
+        removedOrArchivedSlug: dup.slug,
+        mergedIntoSlug: primary.slug,
+        title: cleanHtmlToText(dup.name),
+      });
+      if (options.execute) {
+        await relinkHackathonForeignKeys(dup.slug, primary.slug);
+        await db
+          .delete(schema.hackathons)
+          .where(eq(schema.hackathons.slug, dup.slug));
+      }
+    }
+  }
+
+  return {
+    executed: options.execute,
+    totalRowsInspected: allRows.length,
+    duplicateRowsConsolidated,
+    verifiedTeamHackathons,
+    unknownTeamEligibilityHackathons,
+    nonHackathonRecords,
+    rowsUpdatedCount,
+  };
+}
+
+export function computeTeamRegistrationReadiness(params: {
+  memberCount: number;
+  minTeamSize?: number | null;
+  maxTeamSize?: number | null;
+  hackathonStatus?: string | null;
+  registrationDeadline?: string | null;
+  matchable?: boolean | null;
+}): {
+  minRequiredMembers: number;
+  maxAllowedMembers: number;
+  isEligibleToRegister: boolean;
+  computedStatus: TeamRegistrationStatus;
+  readinessReason: string;
+} {
+  const maxAllowedMembers = Math.min(
+    4,
+    params.maxTeamSize && params.maxTeamSize > 0 ? params.maxTeamSize : 4
+  );
+  const minRequiredMembers = Math.min(
+    maxAllowedMembers,
+    Math.max(1, params.minTeamSize && params.minTeamSize > 0 ? params.minTeamSize : 2)
+  );
+
+  if (
+    params.hackathonStatus === 'registration_closed' ||
+    params.hackathonStatus === 'completed' ||
+    params.hackathonStatus === 'archived'
+  ) {
+    return {
+      minRequiredMembers,
+      maxAllowedMembers,
+      isEligibleToRegister: false,
+      computedStatus: 'registration_closed',
+      readinessReason: 'Official registration for this event has closed.',
+    };
+  }
+
+  if (params.matchable === false) {
+    return {
+      minRequiredMembers,
+      maxAllowedMembers,
+      isEligibleToRegister: false,
+      computedStatus: 'forming',
+      readinessReason: 'This event does not support team registration.',
+    };
+  }
+
+  if (params.memberCount < minRequiredMembers) {
+    const needed = minRequiredMembers - params.memberCount;
+    return {
+      minRequiredMembers,
+      maxAllowedMembers,
+      isEligibleToRegister: false,
+      computedStatus: 'forming',
+      readinessReason: `Add ${needed} more ${
+        needed === 1 ? 'member' : 'members'
+      } to reach the minimum team size of ${minRequiredMembers}.`,
+    };
+  }
+
+  if (params.memberCount > maxAllowedMembers) {
+    return {
+      minRequiredMembers,
+      maxAllowedMembers,
+      isEligibleToRegister: false,
+      computedStatus: 'forming',
+      readinessReason: `Team size (${params.memberCount}) exceeds the maximum allowed (${maxAllowedMembers}).`,
+    };
+  }
+
+  return {
+    minRequiredMembers,
+    maxAllowedMembers,
+    isEligibleToRegister: true,
+    computedStatus: 'ready_to_register',
+    readinessReason: `Team roster (${params.memberCount}/${maxAllowedMembers}) meets verified team size requirements (${minRequiredMembers}–${maxAllowedMembers} members). Ready for official registration.`,
+  };
+}
+
+export function buildTeamRegistrationDomainObject(params: {
+  team: Team;
+  hackathon?: Hackathon | null;
+  regRow?: typeof schema.teamRegistrations.$inferSelect | null;
+}): TeamRegistration {
+  const { team, hackathon, regRow } = params;
+  const readiness = computeTeamRegistrationReadiness({
+    memberCount: team.memberCount,
+    minTeamSize: hackathon?.minTeamSize,
+    maxTeamSize: hackathon?.maxTeamSize ?? team.targetSize,
+    hackathonStatus: hackathon?.status,
+    registrationDeadline: hackathon?.registrationDeadline,
+    matchable: hackathon?.matchable,
+  });
+
+  let effectiveStatus: TeamRegistrationStatus = readiness.computedStatus;
+  if (regRow) {
+    if (regRow.registrationStatus === 'registered') {
+      effectiveStatus = 'registered';
+    } else if (
+      regRow.registrationStatus === 'registration_in_progress' &&
+      readiness.isEligibleToRegister
+    ) {
+      effectiveStatus = 'registration_in_progress';
+    } else if (regRow.registrationStatus === 'registration_closed') {
+      effectiveStatus = 'registration_closed';
+    }
+  }
+
+  const officialUrl =
+    regRow?.officialRegistrationUrl ||
+    hackathon?.registrationUrl ||
+    hackathon?.verifiedCanonicalUrl ||
+    hackathon?.originalSubmissionUrl ||
+    null;
+
+  return {
+    teamId: team.id,
+    hackathonId: team.hackathonId,
+    registrationStatus: effectiveStatus,
+    officialRegistrationUrl: officialUrl,
+    externalRegistrationReference:
+      regRow?.externalRegistrationReference ?? null,
+    confirmationNotes: regRow?.confirmationNotes ?? null,
+    registeredByUid: regRow?.registeredByUid ?? null,
+    registeredAt: regRow?.registeredAt
+      ? regRow.registeredAt.toISOString()
+      : null,
+    minRequiredMembers: readiness.minRequiredMembers,
+    maxAllowedMembers: readiness.maxAllowedMembers,
+    currentMemberCount: team.memberCount,
+    isEligibleToRegister: readiness.isEligibleToRegister,
+    readinessReason:
+      effectiveStatus === 'registered'
+        ? `Officially registered${
+            regRow?.externalRegistrationReference
+              ? ` (Ref: ${regRow.externalRegistrationReference})`
+              : ''
+          }. Roster changes are locked unless registration is amended.`
+        : readiness.readinessReason,
+    updatedAt: regRow?.updatedAt
+      ? regRow.updatedAt.toISOString()
+      : team.createdAt,
+  };
 }
 
 export async function createTeamWithLeaderRecord(params: {
@@ -1802,6 +3600,7 @@ export async function createTeamWithLeaderRecord(params: {
   conversation: Conversation;
 }> {
   try {
+    await ensureMatchingAndTeamSchema();
     const membershipKey = `${params.hackathonSlug}_${params.leaderUid}`;
     const existingMember = await db
       .select()
@@ -1814,9 +3613,28 @@ export async function createTeamWithLeaderRecord(params: {
       );
 
     if (existingMember.length > 0) {
-      throw new Error(
-        'ALREADY_IN_TEAM: You are already in an active team for this hackathon.'
-      );
+      // If the existing active membership was from an untouched auto-created 2-person match team
+      // and a caller explicitly invokes POST /api/teams (e.g. legacy explicit team creation flow),
+      // dissolve the auto-created team so the explicit team can be created; otherwise reject with 409.
+      const existingTeamSlug = existingMember[0].teamSlug;
+      if (existingTeamSlug.startsWith('team_auto_')) {
+        await db
+          .delete(schema.memberships)
+          .where(eq(schema.memberships.teamSlug, existingTeamSlug));
+        await db
+          .delete(schema.teamRegistrations)
+          .where(eq(schema.teamRegistrations.teamSlug, existingTeamSlug));
+        await db
+          .delete(schema.conversations)
+          .where(eq(schema.conversations.teamSlug, existingTeamSlug));
+        await db
+          .delete(schema.teams)
+          .where(eq(schema.teams.teamSlug, existingTeamSlug));
+      } else {
+        throw new Error(
+          'ALREADY_IN_TEAM: You are already in an active team for this hackathon.'
+        );
+      }
     }
 
     const hackRows = await db
@@ -1824,21 +3642,24 @@ export async function createTeamWithLeaderRecord(params: {
       .from(schema.hackathons)
       .where(eq(schema.hackathons.slug, params.hackathonSlug));
     const hack = hackRows[0];
-
-    if (hack && !hack.matchable) {
+    if (!hack) {
+      throw new Error('EVENT_NOT_FOUND: Hackathon not found.');
+    }
+    if (!hack.matchable) {
       throw new Error('EVENT_NOT_MATCHABLE: This event is not eligible for team formation.');
     }
-    if (hack?.registrationDeadline && new Date(hack.registrationDeadline).getTime() < Date.now()) {
+    if (hack.registrationDeadline && new Date(hack.registrationDeadline).getTime() < Date.now()) {
       throw new Error('EVENT_REGISTRATION_CLOSED: Registration for this event has closed.');
     }
-    if (hack?.endAt && new Date(hack.endAt).getTime() < Date.now()) {
+    if (hack.endAt && new Date(hack.endAt).getTime() < Date.now()) {
       throw new Error('EVENT_ENDED: This event has ended.');
     }
 
-    const clampedTargetSize =
-      hack?.maxTeamSize != null
-        ? Math.min(params.targetSize, hack.maxTeamSize)
-        : params.targetSize;
+    const maxCap = Math.min(
+      4,
+      hack?.maxTeamSize != null && hack.maxTeamSize > 0 ? hack.maxTeamSize : 4
+    );
+    const clampedTargetSize = Math.min(params.targetSize || maxCap, maxCap);
 
     const teamSlug = `team_${Date.now()}_${Math.random()
       .toString(36)
@@ -1876,6 +3697,15 @@ export async function createTeamWithLeaderRecord(params: {
         role: 'Team Lead',
         status: 'active',
       })
+      .onConflictDoUpdate({
+        target: schema.memberships.membershipKey,
+        set: {
+          teamSlug,
+          role: 'Team Lead',
+          status: 'active',
+          joinedAt: new Date(),
+        },
+      })
       .returning();
 
     const conversationUid = `conv_${teamSlug}`;
@@ -1889,7 +3719,34 @@ export async function createTeamWithLeaderRecord(params: {
         participantUidsJson: JSON.stringify([params.leaderUid]),
         teamSlug,
       })
+      .onConflictDoUpdate({
+        target: schema.conversations.conversationUid,
+        set: {
+          participantUidsJson: JSON.stringify([params.leaderUid]),
+          lastMessageAt: new Date(),
+        },
+      })
       .returning();
+
+    const readiness = computeTeamRegistrationReadiness({
+      memberCount: 1,
+      minTeamSize: hack?.minTeamSize,
+      maxTeamSize: hack?.maxTeamSize ?? clampedTargetSize,
+      hackathonStatus: hack?.status,
+      registrationDeadline: hack?.registrationDeadline,
+      matchable: hack?.matchable,
+    });
+
+    await db
+      .insert(schema.teamRegistrations)
+      .values({
+        teamSlug,
+        hackathonSlug: params.hackathonSlug,
+        registrationStatus: readiness.computedStatus,
+        officialRegistrationUrl:
+          hack?.registrationUrl ?? hack?.verifiedCanonicalUrl ?? null,
+      })
+      .onConflictDoNothing();
 
     return {
       team: {
@@ -1957,27 +3814,70 @@ export async function recordSwipeAndProcessMatchRecord(params: {
 }): Promise<{
   interest: Interest;
   mutualMatchConversation?: Conversation;
+  autoCreatedTeam?: Team;
+  autoCreatedMemberships?: Membership[];
+  teamRosterConversation?: Conversation;
+  teamProposal?: TeamProposal;
   joinRequest?: JoinRequest;
   initialMessage?: Message;
 }> {
   try {
-    if (params.decision === 'interested') {
-      const hackRows = await db
+    await ensureMatchingAndTeamSchema();
+
+    if (params.targetType === 'user' && params.fromUid === params.targetId) {
+      throw new Error('SELF_SWIPE: You cannot swipe on your own profile.');
+    }
+
+    if (params.targetType === 'user') {
+      const blockRows = await db
         .select()
-        .from(schema.hackathons)
-        .where(eq(schema.hackathons.slug, params.hackathonSlug));
-      const hack = hackRows[0];
-      if (hack && !hack.matchable) {
-        throw new Error('EVENT_NOT_MATCHABLE: This event is not eligible for teammate matching.');
-      }
-      if (hack?.registrationDeadline && new Date(hack.registrationDeadline).getTime() < Date.now()) {
-        throw new Error('EVENT_REGISTRATION_CLOSED: Registration for this event has closed.');
-      }
-      if (hack?.endAt && new Date(hack.endAt).getTime() < Date.now()) {
-        throw new Error('EVENT_ENDED: This event has ended.');
+        .from(schema.userBlocks)
+        .where(
+          or(
+            and(
+              eq(schema.userBlocks.blockerUid, params.fromUid),
+              eq(schema.userBlocks.blockedUid, params.targetId)
+            ),
+            and(
+              eq(schema.userBlocks.blockerUid, params.targetId),
+              eq(schema.userBlocks.blockedUid, params.fromUid)
+            )
+          )
+        );
+      if (blockRows.length > 0) {
+        throw new Error('BLOCKED_USER: Cannot interact with a blocked student.');
       }
     }
 
+    const hackRows = await db
+      .select()
+      .from(schema.hackathons)
+      .where(eq(schema.hackathons.slug, params.hackathonSlug));
+    const hack = hackRows[0];
+    if (!hack) {
+      throw new Error('INELIGIBLE_EVENT: Hackathon not found.');
+    }
+    if (
+      !hack.matchable ||
+      hack.status === 'archived' ||
+      hack.status === 'completed'
+    ) {
+      throw new Error(
+        'INELIGIBLE_EVENT: Team matching is not active for this event.'
+      );
+    }
+
+    if (params.decision === 'interested') {
+      if (!hack.matchable) {
+        throw new Error('EVENT_NOT_MATCHABLE: This event is not eligible for teammate matching.');
+      }
+      if (hack.registrationDeadline && new Date(hack.registrationDeadline).getTime() < Date.now()) {
+        throw new Error('EVENT_REGISTRATION_CLOSED: Registration for this event has closed.');
+      }
+      if (hack.endAt && new Date(hack.endAt).getTime() < Date.now()) {
+        throw new Error('EVENT_ENDED: This event has ended.');
+      }
+    }
     const swipeKey = `${params.hackathonSlug}_${params.fromUid}_${params.targetType}_${params.targetId}`;
     const [swipeRow] = await db
       .insert(schema.swipes)
@@ -2013,7 +3913,7 @@ export async function recordSwipeAndProcessMatchRecord(params: {
       return { interest };
     }
 
-    // Case A: Swiping right on an open Team -> create a JoinRequest application
+    // Legacy Case A: Swiping right on an open Team -> create a JoinRequest application
     if (params.targetType === 'team') {
       const teamRows = await db
         .select()
@@ -2076,99 +3976,123 @@ export async function recordSwipeAndProcessMatchRecord(params: {
       };
     }
 
-    // Case B: Swiping right on a Person -> check if viewer is a team lead inviting them OR check mutual match
-    const leaderTeams = await db
-      .select()
-      .from(schema.teams)
-      .where(
-        and(
-          eq(schema.teams.hackathonSlug, params.hackathonSlug),
-          eq(schema.teams.leaderUid, params.fromUid),
-          eq(schema.teams.status, 'open')
-        )
+    // Case B: Student-to-Student Swipe (Part B — Mutual Matching, Automatic 2-Person Team Creation & Growing Existing Teams)
+    return await db.transaction(async (tx) => {
+      // Find active memberships in this hackathon for both fromUid and targetId
+      const activeMemberRows = await tx
+        .select()
+        .from(schema.memberships)
+        .where(
+          and(
+            eq(schema.memberships.hackathonSlug, params.hackathonSlug),
+            eq(schema.memberships.status, 'active')
+          )
+        );
+
+      const fromMembership = activeMemberRows.find(
+        (m) => m.uid === params.fromUid
+      );
+      const targetMembership = activeMemberRows.find(
+        (m) => m.uid === params.targetId
       );
 
-    if (leaderTeams.length > 0) {
-      const leadTeam = leaderTeams[0];
-      const requestUid = `req_inv_${params.hackathonSlug}_${leadTeam.teamSlug}_${params.targetId}`;
-      const [invRow] = await db
-        .insert(schema.joinRequests)
-        .values({
-          requestUid,
-          hackathonSlug: params.hackathonSlug,
-          teamSlug: leadTeam.teamSlug,
-          applicantUid: params.targetId,
-          initiatorUid: params.fromUid,
-          proposedRole: params.proposedRole || 'Builder',
-          message:
-            params.note || `Invited to join ${leadTeam.name}!`,
-          direction: 'invitation',
-          status: 'pending',
-        })
-        .onConflictDoUpdate({
-          target: schema.joinRequests.requestUid,
-          set: {
-            status: 'pending',
-            message: params.note || `Invited to join ${leadTeam.name}!`,
-          },
-        })
-        .returning();
-
-      // Also check if reverse interest exists so mutual peer match still works if both swiped
-      const reverseKey = `${params.hackathonSlug}_${params.targetId}_user_${params.fromUid}`;
-      const reverseSwipes = await db
+      // Check direct reverse interest (targetId -> fromUid)
+      const directReverseKey = `${params.hackathonSlug}_${params.targetId}_user_${params.fromUid}`;
+      const directReverseRows = await tx
         .select()
         .from(schema.swipes)
         .where(
           and(
-            eq(schema.swipes.swipeKey, reverseKey),
+            eq(schema.swipes.swipeKey, directReverseKey),
             eq(schema.swipes.decision, 'interested')
           )
         );
 
-      if (reverseSwipes.length === 0) {
-        return {
-          interest,
-          joinRequest: {
-            id: invRow.requestUid,
-            hackathonId: invRow.hackathonSlug,
-            teamId: invRow.teamSlug,
-            applicantUid: invRow.applicantUid,
-            initiatorUid: invRow.initiatorUid,
-            proposedRole: invRow.proposedRole,
-            message: invRow.message ?? undefined,
-            direction: 'invitation',
-            status: 'pending',
-            createdAt: invRow.createdAt.toISOString(),
-          },
-        };
+      // Also check if either student is on a team and the unassigned student swiped right on ANY member of that team,
+      // OR a member of that team swiped right on the unassigned student
+      let teamMemberReciprocalUid: string | null =
+        directReverseRows.length > 0 ? params.fromUid : null;
+      let recruitingTeamSlug: string | null = null;
+      let candidateUidForProposal: string | null = null;
+      let proposerUidForProposal: string | null = null;
+
+      if (fromMembership && !targetMembership) {
+        recruitingTeamSlug = fromMembership.teamSlug;
+        candidateUidForProposal = params.targetId;
+        proposerUidForProposal = params.fromUid;
+
+        if (!teamMemberReciprocalUid) {
+          // Did targetId swipe right on any member of fromUid's team?
+          const teamMemberUids = activeMemberRows
+            .filter((m) => m.teamSlug === fromMembership.teamSlug)
+            .map((m) => m.uid);
+          const candidateSwipesOnTeam = await tx
+            .select()
+            .from(schema.swipes)
+            .where(
+              and(
+                eq(schema.swipes.hackathonSlug, params.hackathonSlug),
+                eq(schema.swipes.fromUid, params.targetId),
+                eq(schema.swipes.targetType, 'user'),
+                inArray(schema.swipes.targetId, teamMemberUids),
+                eq(schema.swipes.decision, 'interested')
+              )
+            );
+          if (candidateSwipesOnTeam.length > 0) {
+            teamMemberReciprocalUid = candidateSwipesOnTeam[0].targetId;
+          }
+        }
+      } else if (!fromMembership && targetMembership) {
+        recruitingTeamSlug = targetMembership.teamSlug;
+        candidateUidForProposal = params.fromUid;
+        proposerUidForProposal = params.targetId;
+
+        if (!teamMemberReciprocalUid) {
+          // Did any member of targetId's team swipe right on fromUid?
+          const teamMemberUids = activeMemberRows
+            .filter((m) => m.teamSlug === targetMembership.teamSlug)
+            .map((m) => m.uid);
+          const teamSwipesOnCandidate = await tx
+            .select()
+            .from(schema.swipes)
+            .where(
+              and(
+                eq(schema.swipes.hackathonSlug, params.hackathonSlug),
+                inArray(schema.swipes.fromUid, teamMemberUids),
+                eq(schema.swipes.targetType, 'user'),
+                eq(schema.swipes.targetId, params.fromUid),
+                eq(schema.swipes.decision, 'interested')
+              )
+            );
+          if (teamSwipesOnCandidate.length > 0) {
+            teamMemberReciprocalUid = teamSwipesOnCandidate[0].fromUid;
+            proposerUidForProposal = teamMemberReciprocalUid;
+          }
+        }
       }
-    }
 
-    // Check reverse user swipe for Mutual Match
-    const reverseKey = `${params.hackathonSlug}_${params.targetId}_user_${params.fromUid}`;
-    const reverseRows = await db
-      .select()
-      .from(schema.swipes)
-      .where(
-        and(
-          eq(schema.swipes.swipeKey, reverseKey),
-          eq(schema.swipes.decision, 'interested')
-        )
-      );
+      const isMutualMatch =
+        directReverseRows.length > 0 || Boolean(teamMemberReciprocalUid);
 
-    if (reverseRows.length > 0) {
+      if (!isMutualMatch) {
+        return { interest };
+      }
+
+      // 1. Always create/update direct_match conversation between the two students
       const sortedPair = [params.fromUid, params.targetId].sort();
       const conversationUid = `conv_match_${params.hackathonSlug}_${sortedPair[0]}_${sortedPair[1]}`;
 
-      const userRows = await db.select().from(schema.users);
+      const userRows = await tx
+        .select()
+        .from(schema.users)
+        .where(inArray(schema.users.uid, sortedPair));
       const fromUser = userRows.find((u) => u.uid === params.fromUid);
       const toUser = userRows.find((u) => u.uid === params.targetId);
       const title = `${fromUser?.displayName ?? params.fromUid} ↔ ${
         toUser?.displayName ?? params.targetId
       }`;
 
-      const [convRow] = await db
+      const [convRow] = await tx
         .insert(schema.conversations)
         .values({
           conversationUid,
@@ -2183,12 +4107,22 @@ export async function recordSwipeAndProcessMatchRecord(params: {
         })
         .returning();
 
+      const mutualMatchConversation: Conversation = {
+        id: convRow.conversationUid,
+        hackathonId: convRow.hackathonSlug,
+        type: 'direct_match',
+        title: convRow.title,
+        participantUids: sortedPair,
+        createdAt: convRow.createdAt.toISOString(),
+        lastMessageAt: convRow.lastMessageAt.toISOString(),
+      };
+
       let initialMessage: Message | undefined;
       if (params.note && params.note.trim()) {
         const messageUid = `msg_${Date.now()}_${Math.random()
           .toString(36)
           .slice(2, 6)}`;
-        const [msgRow] = await db
+        const [msgRow] = await tx
           .insert(schema.messages)
           .values({
             messageUid,
@@ -2208,33 +4142,2079 @@ export async function recordSwipeAndProcessMatchRecord(params: {
         };
       }
 
+      const maxCap = Math.min(
+        4,
+        hack?.maxTeamSize != null && hack.maxTeamSize > 0 ? hack.maxTeamSize : 4
+      );
+
+      // 2. Subcase 2A: Neither student is on a team for this hackathon -> Automatically create a 2-person team!
+      if (!fromMembership && !targetMembership && maxCap >= 2) {
+        const teamSlug = `team_auto_${params.hackathonSlug}_${sortedPair[0]}_${sortedPair[1]}`;
+        const firstNameA = (fromUser?.displayName ?? 'Builder').split(' ')[0];
+        const firstNameB = (toUser?.displayName ?? 'Builder').split(' ')[0];
+        const teamName = `${firstNameA} & ${firstNameB}'s Team`;
+        const teamStatus: 'open' | 'full' = 2 >= maxCap ? 'full' : 'open';
+
+        const profileRows = await tx
+          .select()
+          .from(schema.profiles)
+          .where(inArray(schema.profiles.uid, sortedPair));
+        const combinedDomains = Array.from(
+          new Set([
+            ...profileRows.flatMap((p) =>
+              safeJsonParse<string[]>(p.interestTagsJson, [])
+            ),
+            ...(hack ? safeJsonParse<string[]>(hack.themesJson, []) : []),
+          ])
+        ).slice(0, 5);
+
+        const [teamRow] = await tx
+          .insert(schema.teams)
+          .values({
+            teamSlug,
+            hackathonSlug: params.hackathonSlug,
+            leaderUid: sortedPair[0],
+            name: teamName,
+            pitch: `Matched on Quackathon for ${
+              hack?.name ?? params.hackathonSlug
+            }.`,
+            projectIdea: null,
+            rolesNeededJson: JSON.stringify([
+              'Frontend / UI',
+              'Backend / APIs',
+              'AI / ML',
+              'Product & UI/UX',
+            ]),
+            customSpecializationsJson: '[]',
+            desiredDomainsJson: JSON.stringify(combinedDomains),
+            availabilitySummary: 'Flexible schedule',
+            workStyleTagsJson: '[]',
+            targetSize: maxCap,
+            memberCount: 2,
+            status: teamStatus,
+          })
+          .onConflictDoUpdate({
+            target: schema.teams.teamSlug,
+            set: {
+              memberCount: 2,
+              status: teamStatus,
+            },
+          })
+          .returning();
+
+        const now = new Date();
+        const [memA] = await tx
+          .insert(schema.memberships)
+          .values({
+            membershipKey: `${params.hackathonSlug}_${sortedPair[0]}`,
+            hackathonSlug: params.hackathonSlug,
+            teamSlug,
+            uid: sortedPair[0],
+            role: 'Co-Founder',
+            status: 'active',
+            joinedAt: now,
+          })
+          .onConflictDoUpdate({
+            target: schema.memberships.membershipKey,
+            set: {
+              teamSlug,
+              role: 'Co-Founder',
+              status: 'active',
+              joinedAt: now,
+            },
+          })
+          .returning();
+
+        const [memB] = await tx
+          .insert(schema.memberships)
+          .values({
+            membershipKey: `${params.hackathonSlug}_${sortedPair[1]}`,
+            hackathonSlug: params.hackathonSlug,
+            teamSlug,
+            uid: sortedPair[1],
+            role: 'Co-Founder',
+            status: 'active',
+            joinedAt: now,
+          })
+          .onConflictDoUpdate({
+            target: schema.memberships.membershipKey,
+            set: {
+              teamSlug,
+              role: 'Co-Founder',
+              status: 'active',
+              joinedAt: now,
+            },
+          })
+          .returning();
+
+        const rosterConvUid = `conv_${teamSlug}`;
+        const [rosterConvRow] = await tx
+          .insert(schema.conversations)
+          .values({
+            conversationUid: rosterConvUid,
+            hackathonSlug: params.hackathonSlug,
+            type: 'team_roster',
+            title: `${teamName} — Team Chat`,
+            participantUidsJson: JSON.stringify(sortedPair),
+            teamSlug,
+          })
+          .onConflictDoUpdate({
+            target: schema.conversations.conversationUid,
+            set: {
+              participantUidsJson: JSON.stringify(sortedPair),
+              lastMessageAt: now,
+            },
+          })
+          .returning();
+
+        const readiness = computeTeamRegistrationReadiness({
+          memberCount: 2,
+          minTeamSize: hack?.minTeamSize,
+          maxTeamSize: hack?.maxTeamSize ?? maxCap,
+          hackathonStatus: hack?.status,
+          registrationDeadline: hack?.registrationDeadline,
+          matchable: hack?.matchable,
+        });
+
+        await tx
+          .insert(schema.teamRegistrations)
+          .values({
+            teamSlug,
+            hackathonSlug: params.hackathonSlug,
+            registrationStatus: readiness.computedStatus,
+            officialRegistrationUrl:
+              hack?.registrationUrl ?? hack?.verifiedCanonicalUrl ?? null,
+          })
+          .onConflictDoUpdate({
+            target: schema.teamRegistrations.teamSlug,
+            set: {
+              registrationStatus: readiness.computedStatus,
+              updatedAt: now,
+            },
+          });
+
+        // Expire any pending proposals where either student was a candidate for another team in this hackathon
+        await tx
+          .update(schema.teamProposals)
+          .set({
+            status: 'expired',
+            resolutionNote:
+              'Candidate formed a new 2-person team via mutual match.',
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(schema.teamProposals.hackathonSlug, params.hackathonSlug),
+              inArray(schema.teamProposals.candidateUid, sortedPair),
+              inArray(schema.teamProposals.status, ['pending_votes', 'invited'])
+            )
+          );
+
+        const autoCreatedTeam: Team = {
+          id: teamRow.teamSlug,
+          hackathonId: teamRow.hackathonSlug,
+          leaderId: teamRow.leaderUid,
+          name: teamRow.name,
+          pitch: teamRow.pitch,
+          projectIdea: teamRow.projectIdea ?? undefined,
+          rolesNeeded: safeJsonParse<string[]>(teamRow.rolesNeededJson, []),
+          desiredDomains: safeJsonParse<string[]>(
+            teamRow.desiredDomainsJson,
+            []
+          ),
+          availabilitySummary: teamRow.availabilitySummary,
+          workStyleTags: safeJsonParse<string[]>(teamRow.workStyleTagsJson, []),
+          targetSize: teamRow.targetSize,
+          memberCount: teamRow.memberCount,
+          status: teamStatus,
+          visibility: 'public',
+          createdAt: teamRow.createdAt.toISOString(),
+        };
+
+        const autoCreatedMemberships: Membership[] = [memA, memB].map((m) => ({
+          id: m.membershipKey,
+          hackathonId: m.hackathonSlug,
+          teamId: m.teamSlug,
+          uid: m.uid,
+          role: m.role,
+          joinedAt: m.joinedAt.toISOString(),
+          status: 'active',
+        }));
+
+        const teamRosterConversation: Conversation = {
+          id: rosterConvRow.conversationUid,
+          hackathonId: rosterConvRow.hackathonSlug,
+          type: 'team_roster',
+          title: rosterConvRow.title,
+          participantUids: sortedPair,
+          teamId: teamSlug,
+          createdAt: rosterConvRow.createdAt.toISOString(),
+          lastMessageAt: rosterConvRow.lastMessageAt.toISOString(),
+        };
+
+        return {
+          interest,
+          mutualMatchConversation,
+          autoCreatedTeam,
+          autoCreatedMemberships,
+          teamRosterConversation,
+          initialMessage,
+        };
+      }
+
+      // 3. Subcase 2B: One student is on an existing team and the other student has no team -> Create a TeamProposal!
+      if (
+        recruitingTeamSlug &&
+        candidateUidForProposal &&
+        proposerUidForProposal
+      ) {
+        const teamRows = await tx
+          .select()
+          .from(schema.teams)
+          .where(eq(schema.teams.teamSlug, recruitingTeamSlug))
+          .for('update');
+        const recTeam = teamRows[0];
+
+        const regRows = await tx
+          .select()
+          .from(schema.teamRegistrations)
+          .where(eq(schema.teamRegistrations.teamSlug, recruitingTeamSlug));
+        const isRegisteredLocked =
+          regRows[0]?.registrationStatus === 'registered';
+
+        const effectiveCap = recTeam
+          ? Math.min(maxCap, recTeam.targetSize || maxCap)
+          : maxCap;
+
+        if (
+          recTeam &&
+          recTeam.status === 'open' &&
+          recTeam.memberCount < effectiveCap &&
+          !isRegisteredLocked
+        ) {
+          const teamActiveMemberUids = Array.from(
+            new Set([
+              recTeam.leaderUid,
+              ...activeMemberRows
+                .filter((m) => m.teamSlug === recruitingTeamSlug)
+                .map((m) => m.uid),
+            ])
+          );
+
+          const proposalUid = `prop_${params.hackathonSlug}_${recruitingTeamSlug}_${candidateUidForProposal}`;
+          const now = new Date();
+
+          // Record the proposer's approval vote automatically
+          const voteKey = `${proposalUid}_${proposerUidForProposal}`;
+          await tx
+            .insert(schema.teamProposalVotes)
+            .values({
+              voteKey,
+              proposalUid,
+              teamSlug: recruitingTeamSlug,
+              voterUid: proposerUidForProposal,
+              decision: 'approve',
+              comment: 'Initiated via mutual interest swipe',
+              votedAt: now,
+            })
+            .onConflictDoUpdate({
+              target: schema.teamProposalVotes.voteKey,
+              set: {
+                decision: 'approve',
+                votedAt: now,
+              },
+            });
+
+          // Check all existing votes on this proposal
+          const existingVotes = await tx
+            .select()
+            .from(schema.teamProposalVotes)
+            .where(eq(schema.teamProposalVotes.proposalUid, proposalUid));
+
+          const hasRejection = existingVotes.some(
+            (v) =>
+              v.decision === 'reject' &&
+              teamActiveMemberUids.includes(v.voterUid)
+          );
+          const approvedCount = teamActiveMemberUids.filter((mUid) =>
+            existingVotes.some(
+              (v) => v.voterUid === mUid && v.decision === 'approve'
+            )
+          ).length;
+
+          const allApproved =
+            !hasRejection && approvedCount >= teamActiveMemberUids.length;
+          const nextProposalStatus: TeamProposalStatus = hasRejection
+            ? 'rejected'
+            : allApproved
+            ? 'invited'
+            : 'pending_votes';
+
+          const [propRow] = await tx
+            .insert(schema.teamProposals)
+            .values({
+              proposalUid,
+              hackathonSlug: params.hackathonSlug,
+              teamSlug: recruitingTeamSlug,
+              candidateUid: candidateUidForProposal,
+              proposedByUid: proposerUidForProposal,
+              proposedRole: params.proposedRole || 'Core Builder',
+              message:
+                params.note ||
+                `Mutual match with ${recTeam.name}! Awaiting unanimous team approval.`,
+              status: nextProposalStatus,
+              createdAt: now,
+              updatedAt: now,
+            })
+            .onConflictDoUpdate({
+              target: schema.teamProposals.proposalUid,
+              set: {
+                status: nextProposalStatus,
+                updatedAt: now,
+              },
+            })
+            .returning();
+
+          const teamProposal: TeamProposal = {
+            id: propRow.proposalUid,
+            hackathonId: propRow.hackathonSlug,
+            teamId: propRow.teamSlug,
+            teamName: recTeam.name,
+            candidateUid: propRow.candidateUid,
+            proposedByUid: propRow.proposedByUid,
+            proposedRole: propRow.proposedRole,
+            message: propRow.message ?? undefined,
+            status: nextProposalStatus,
+            votes: existingVotes.map((vr) => ({
+              id: vr.voteKey,
+              proposalId: vr.proposalUid,
+              teamId: vr.teamSlug,
+              voterUid: vr.voterUid,
+              decision: (vr.decision as 'approve' | 'reject') || 'approve',
+              comment: vr.comment ?? undefined,
+              votedAt: vr.votedAt.toISOString(),
+            })),
+            requiredVoterUids: teamActiveMemberUids,
+            approvedCount,
+            requiredCount: teamActiveMemberUids.length,
+            createdAt: propRow.createdAt.toISOString(),
+            updatedAt: propRow.updatedAt.toISOString(),
+          };
+
+          return {
+            interest,
+            mutualMatchConversation,
+            teamProposal,
+            initialMessage,
+          };
+        }
+      }
+
       return {
         interest,
-        mutualMatchConversation: {
-          id: convRow.conversationUid,
-          hackathonId: convRow.hackathonSlug,
-          type: 'direct_match',
-          title: convRow.title,
-          participantUids: sortedPair,
-          createdAt: convRow.createdAt.toISOString(),
-          lastMessageAt: convRow.lastMessageAt.toISOString(),
-        },
+        mutualMatchConversation,
         initialMessage,
       };
-    }
-
-    return { interest };
+    });
   } catch (error) {
     console.error('Database error in recordSwipeAndProcessMatchRecord:', error);
     if (
       error instanceof Error &&
-      (error.message.startsWith('TEAM_FULL:') ||
+      (/^(TEAM_FULL|SELF_SWIPE|BLOCKED_USER|INELIGIBLE_EVENT):/.test(
+        error.message
+      ) ||
         error.message.startsWith('EVENT_'))
     ) {
       throw error;
     }
     throw new Error('Failed to record swipe decision.', { cause: error });
   }
+}
+
+export async function createTeamProposalRecord(params: {
+  hackathonSlug: string;
+  teamSlug: string;
+  proposerUid: string;
+  candidateUid: string;
+  proposedRole?: string;
+  message?: string;
+}): Promise<TeamProposal> {
+  await ensureMatchingAndTeamSchema();
+  if (params.proposerUid === params.candidateUid) {
+    throw new Error('INVALID_PROPOSAL: Cannot propose yourself.');
+  }
+
+  return await db.transaction(async (tx) => {
+    const teamRows = await tx
+      .select()
+      .from(schema.teams)
+      .where(eq(schema.teams.teamSlug, params.teamSlug))
+      .for('update');
+    const teamRow = teamRows[0];
+    if (!teamRow) {
+      throw new Error('NOT_FOUND: Team not found.');
+    }
+
+    const regRows = await tx
+      .select()
+      .from(schema.teamRegistrations)
+      .where(eq(schema.teamRegistrations.teamSlug, params.teamSlug));
+    if (regRows[0]?.registrationStatus === 'registered') {
+      throw new Error(
+        'TEAM_REGISTERED_LOCKED: Cannot add candidates to a team that has already completed official registration.'
+      );
+    }
+
+    const hackRows = await tx
+      .select()
+      .from(schema.hackathons)
+      .where(eq(schema.hackathons.slug, teamRow.hackathonSlug));
+    const hack = hackRows[0];
+    const maxCap = Math.min(
+      4,
+      hack?.maxTeamSize != null && hack.maxTeamSize > 0
+        ? Math.min(teamRow.targetSize, hack.maxTeamSize)
+        : teamRow.targetSize
+    );
+
+    if (teamRow.memberCount >= maxCap || teamRow.status !== 'open') {
+      throw new Error(
+        `TEAM_FULL: Team "${teamRow.name}" has already reached maximum capacity (${maxCap}).`
+      );
+    }
+
+    const memberRows = await tx
+      .select()
+      .from(schema.memberships)
+      .where(
+        and(
+          eq(schema.memberships.hackathonSlug, teamRow.hackathonSlug),
+          eq(schema.memberships.status, 'active')
+        )
+      );
+
+    const teamActiveMemberUids = Array.from(
+      new Set([
+        teamRow.leaderUid,
+        ...memberRows
+          .filter((m) => m.teamSlug === teamRow.teamSlug)
+          .map((m) => m.uid),
+      ])
+    );
+
+    if (!teamActiveMemberUids.includes(params.proposerUid)) {
+      throw new Error(
+        'FORBIDDEN: Only active members of this team can propose a candidate.'
+      );
+    }
+
+    const candidateExistingMembership = memberRows.find(
+      (m) => m.uid === params.candidateUid
+    );
+    if (candidateExistingMembership) {
+      throw new Error(
+        'ALREADY_IN_TEAM: Candidate is already an active member of a team for this hackathon.'
+      );
+    }
+
+    const proposalUid = `prop_${teamRow.hackathonSlug}_${teamRow.teamSlug}_${params.candidateUid}`;
+    const existingProps = await tx
+      .select()
+      .from(schema.teamProposals)
+      .where(eq(schema.teamProposals.proposalUid, proposalUid));
+    if (
+      existingProps[0] &&
+      (existingProps[0].status === 'pending_votes' ||
+        existingProps[0].status === 'invited')
+    ) {
+      throw new Error(
+        'DUPLICATE_PROPOSAL: An active proposal already exists for this candidate and team.'
+      );
+    }
+
+    const now = new Date();
+    // Clear any old votes if a previous proposal was expired/rejected and is being recreated
+    await tx
+      .delete(schema.teamProposalVotes)
+      .where(eq(schema.teamProposalVotes.proposalUid, proposalUid));
+
+    const voteKey = `${proposalUid}_${params.proposerUid}`;
+    const [voteRow] = await tx
+      .insert(schema.teamProposalVotes)
+      .values({
+        voteKey,
+        proposalUid,
+        teamSlug: teamRow.teamSlug,
+        voterUid: params.proposerUid,
+        decision: 'approve',
+        comment: params.message ?? 'Proposed candidate',
+        votedAt: now,
+      })
+      .returning();
+
+    const initialStatus: TeamProposalStatus =
+      teamActiveMemberUids.length <= 1 ? 'invited' : 'pending_votes';
+
+    const [propRow] = await tx
+      .insert(schema.teamProposals)
+      .values({
+        proposalUid,
+        hackathonSlug: teamRow.hackathonSlug,
+        teamSlug: teamRow.teamSlug,
+        candidateUid: params.candidateUid,
+        proposedByUid: params.proposerUid,
+        proposedRole: params.proposedRole || 'Core Builder',
+        message: params.message ?? null,
+        status: initialStatus,
+        resolutionNote: null,
+        createdAt: now,
+        updatedAt: now,
+        resolvedAt: null,
+      })
+      .onConflictDoUpdate({
+        target: schema.teamProposals.proposalUid,
+        set: {
+          proposedByUid: params.proposerUid,
+          proposedRole: params.proposedRole || 'Core Builder',
+          message: params.message ?? null,
+          status: initialStatus,
+          resolutionNote: null,
+          updatedAt: now,
+          resolvedAt: null,
+        },
+      })
+      .returning();
+
+    return {
+      id: propRow.proposalUid,
+      hackathonId: propRow.hackathonSlug,
+      teamId: propRow.teamSlug,
+      teamName: teamRow.name,
+      candidateUid: propRow.candidateUid,
+      proposedByUid: propRow.proposedByUid,
+      proposedRole: propRow.proposedRole,
+      message: propRow.message ?? undefined,
+      status: initialStatus,
+      votes: [
+        {
+          id: voteRow.voteKey,
+          proposalId: voteRow.proposalUid,
+          teamId: voteRow.teamSlug,
+          voterUid: voteRow.voterUid,
+          decision: 'approve',
+          comment: voteRow.comment ?? undefined,
+          votedAt: voteRow.votedAt.toISOString(),
+        },
+      ],
+      requiredVoterUids: teamActiveMemberUids,
+      approvedCount: 1,
+      requiredCount: teamActiveMemberUids.length,
+      createdAt: propRow.createdAt.toISOString(),
+      updatedAt: propRow.updatedAt.toISOString(),
+    };
+  });
+}
+
+export async function voteOnTeamProposalRecord(params: {
+  proposalUid: string;
+  voterUid: string;
+  decision: 'approve' | 'reject';
+  comment?: string;
+}): Promise<{
+  proposal: TeamProposal;
+  unanimouslyApproved: boolean;
+}> {
+  await ensureMatchingAndTeamSchema();
+  return await db.transaction(async (tx) => {
+    const initialProps = await tx
+      .select()
+      .from(schema.teamProposals)
+      .where(eq(schema.teamProposals.proposalUid, params.proposalUid))
+      .limit(1);
+    if (!initialProps[0]) {
+      throw new Error('NOT_FOUND: Team proposal not found.');
+    }
+
+    const teamRows = await tx
+      .select()
+      .from(schema.teams)
+      .where(eq(schema.teams.teamSlug, initialProps[0].teamSlug))
+      .for('update');
+    const teamRow = teamRows[0];
+    if (!teamRow) {
+      throw new Error('NOT_FOUND: Team not found.');
+    }
+
+    const propRows = await tx
+      .select()
+      .from(schema.teamProposals)
+      .where(eq(schema.teamProposals.proposalUid, params.proposalUid))
+      .for('update');
+    const propRow = propRows[0];
+    if (!propRow) {
+      throw new Error('NOT_FOUND: Team proposal not found.');
+    }
+
+    if (propRow.status !== 'pending_votes' && propRow.status !== 'invited') {
+      throw new Error(
+        `ALREADY_RESOLVED: Proposal is already ${propRow.status}.`
+      );
+    }
+
+    const activeMemberRows = await tx
+      .select()
+      .from(schema.memberships)
+      .where(
+        and(
+          eq(schema.memberships.teamSlug, teamRow.teamSlug),
+          eq(schema.memberships.status, 'active')
+        )
+      );
+
+    const requiredVoterUids = Array.from(
+      new Set([teamRow.leaderUid, ...activeMemberRows.map((m) => m.uid)])
+    );
+
+    if (!requiredVoterUids.includes(params.voterUid)) {
+      throw new Error(
+        'FORBIDDEN: Only current active members of this team can vote on candidate proposals.'
+      );
+    }
+
+    const now = new Date();
+    const voteKey = `${params.proposalUid}_${params.voterUid}`;
+
+    await tx
+      .insert(schema.teamProposalVotes)
+      .values({
+        voteKey,
+        proposalUid: params.proposalUid,
+        teamSlug: teamRow.teamSlug,
+        voterUid: params.voterUid,
+        decision: params.decision,
+        comment: params.comment ?? null,
+        votedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: schema.teamProposalVotes.voteKey,
+        set: {
+          decision: params.decision,
+          comment: params.comment ?? null,
+          votedAt: now,
+        },
+      });
+
+    const allVotes = await tx
+      .select()
+      .from(schema.teamProposalVotes)
+      .where(eq(schema.teamProposalVotes.proposalUid, params.proposalUid));
+
+    if (params.decision === 'reject') {
+      const [rejectedRow] = await tx
+        .update(schema.teamProposals)
+        .set({
+          status: 'rejected',
+          resolutionNote:
+            params.comment || 'Rejected by team member vote (unanimity required).',
+          updatedAt: now,
+          resolvedAt: now,
+        })
+        .where(eq(schema.teamProposals.proposalUid, params.proposalUid))
+        .returning();
+
+      const approvedCount = requiredVoterUids.filter((uid) =>
+        allVotes.some((v) => v.voterUid === uid && v.decision === 'approve')
+      ).length;
+
+      return {
+        unanimouslyApproved: false,
+        proposal: {
+          id: rejectedRow.proposalUid,
+          hackathonId: rejectedRow.hackathonSlug,
+          teamId: rejectedRow.teamSlug,
+          teamName: teamRow.name,
+          candidateUid: rejectedRow.candidateUid,
+          proposedByUid: rejectedRow.proposedByUid,
+          proposedRole: rejectedRow.proposedRole,
+          message: rejectedRow.message ?? undefined,
+          status: 'rejected',
+          resolutionNote: rejectedRow.resolutionNote ?? undefined,
+          votes: allVotes.map((vr) => ({
+            id: vr.voteKey,
+            proposalId: vr.proposalUid,
+            teamId: vr.teamSlug,
+            voterUid: vr.voterUid,
+            decision: (vr.decision as 'approve' | 'reject') || 'approve',
+            comment: vr.comment ?? undefined,
+            votedAt: vr.votedAt.toISOString(),
+          })),
+          requiredVoterUids,
+          approvedCount,
+          requiredCount: requiredVoterUids.length,
+          createdAt: rejectedRow.createdAt.toISOString(),
+          updatedAt: rejectedRow.updatedAt.toISOString(),
+          resolvedAt: now.toISOString(),
+        },
+      };
+    }
+
+    // Check if every current active member has voted 'approve'
+    const approvedCount = requiredVoterUids.filter((uid) =>
+      allVotes.some((v) => v.voterUid === uid && v.decision === 'approve')
+    ).length;
+    const anyRejected = allVotes.some(
+      (v) => v.decision === 'reject' && requiredVoterUids.includes(v.voterUid)
+    );
+    const unanimouslyApproved =
+      !anyRejected && approvedCount >= requiredVoterUids.length;
+
+    const nextStatus: TeamProposalStatus = unanimouslyApproved
+      ? 'invited'
+      : 'pending_votes';
+
+    const [updatedPropRow] = await tx
+      .update(schema.teamProposals)
+      .set({
+        status: nextStatus,
+        updatedAt: now,
+      })
+      .where(eq(schema.teamProposals.proposalUid, params.proposalUid))
+      .returning();
+
+    return {
+      unanimouslyApproved,
+      proposal: {
+        id: updatedPropRow.proposalUid,
+        hackathonId: updatedPropRow.hackathonSlug,
+        teamId: updatedPropRow.teamSlug,
+        teamName: teamRow.name,
+        candidateUid: updatedPropRow.candidateUid,
+        proposedByUid: updatedPropRow.proposedByUid,
+        proposedRole: updatedPropRow.proposedRole,
+        message: updatedPropRow.message ?? undefined,
+        status: nextStatus,
+        resolutionNote: updatedPropRow.resolutionNote ?? undefined,
+        votes: allVotes.map((vr) => ({
+          id: vr.voteKey,
+          proposalId: vr.proposalUid,
+          teamId: vr.teamSlug,
+          voterUid: vr.voterUid,
+          decision: (vr.decision as 'approve' | 'reject') || 'approve',
+          comment: vr.comment ?? undefined,
+          votedAt: vr.votedAt.toISOString(),
+        })),
+        requiredVoterUids,
+        approvedCount,
+        requiredCount: requiredVoterUids.length,
+        createdAt: updatedPropRow.createdAt.toISOString(),
+        updatedAt: updatedPropRow.updatedAt.toISOString(),
+      },
+    };
+  });
+}
+
+export async function respondToTeamProposalRecord(params: {
+  proposalUid: string;
+  candidateUid: string;
+  decision: 'accept' | 'decline';
+}): Promise<{
+  proposal: TeamProposal;
+  team?: Team;
+  membership?: Membership;
+  conversation?: Conversation;
+  becomesFull?: boolean;
+}> {
+  await ensureMatchingAndTeamSchema();
+  try {
+    return await db.transaction(async (tx) => {
+      const initialProps = await tx
+        .select()
+        .from(schema.teamProposals)
+        .where(eq(schema.teamProposals.proposalUid, params.proposalUid))
+        .limit(1);
+      if (!initialProps[0]) {
+        throw new Error('NOT_FOUND: Team proposal not found.');
+      }
+
+      const teamRows = await tx
+        .select()
+        .from(schema.teams)
+        .where(eq(schema.teams.teamSlug, initialProps[0].teamSlug))
+        .for('update');
+      const teamRow = teamRows[0];
+      if (!teamRow) {
+        throw new Error('NOT_FOUND: Team not found.');
+      }
+
+      const propRows = await tx
+        .select()
+        .from(schema.teamProposals)
+        .where(eq(schema.teamProposals.proposalUid, params.proposalUid))
+        .for('update');
+      const propRow = propRows[0];
+      if (!propRow) {
+        throw new Error('NOT_FOUND: Team proposal not found.');
+      }
+
+      if (propRow.candidateUid !== params.candidateUid) {
+        throw new Error(
+          'FORBIDDEN: Only the invited candidate can accept or decline this team invitation.'
+        );
+      }
+
+      const allVotes = await tx
+        .select()
+        .from(schema.teamProposalVotes)
+        .where(eq(schema.teamProposalVotes.proposalUid, params.proposalUid));
+
+      const activeMemberRows = await tx
+        .select()
+        .from(schema.memberships)
+        .where(
+          and(
+            eq(schema.memberships.teamSlug, teamRow.teamSlug),
+            eq(schema.memberships.status, 'active')
+          )
+        );
+      const requiredVoterUids = Array.from(
+        new Set([teamRow.leaderUid, ...activeMemberRows.map((m) => m.uid)])
+      );
+      const approvedCount = requiredVoterUids.filter((uid) =>
+        allVotes.some((v) => v.voterUid === uid && v.decision === 'approve')
+      ).length;
+
+      const now = new Date();
+
+      if (params.decision === 'decline') {
+        const [declinedRow] = await tx
+          .update(schema.teamProposals)
+          .set({
+            status: 'declined',
+            resolutionNote: 'Declined by candidate.',
+            updatedAt: now,
+            resolvedAt: now,
+          })
+          .where(eq(schema.teamProposals.proposalUid, params.proposalUid))
+          .returning();
+
+        return {
+          proposal: {
+            id: declinedRow.proposalUid,
+            hackathonId: declinedRow.hackathonSlug,
+            teamId: declinedRow.teamSlug,
+            teamName: teamRow.name,
+            candidateUid: declinedRow.candidateUid,
+            proposedByUid: declinedRow.proposedByUid,
+            proposedRole: declinedRow.proposedRole,
+            message: declinedRow.message ?? undefined,
+            status: 'declined',
+            resolutionNote: declinedRow.resolutionNote ?? undefined,
+            votes: allVotes.map((vr) => ({
+              id: vr.voteKey,
+              proposalId: vr.proposalUid,
+              teamId: vr.teamSlug,
+              voterUid: vr.voterUid,
+              decision: (vr.decision as 'approve' | 'reject') || 'approve',
+              comment: vr.comment ?? undefined,
+              votedAt: vr.votedAt.toISOString(),
+            })),
+            requiredVoterUids,
+            approvedCount,
+            requiredCount: requiredVoterUids.length,
+            createdAt: declinedRow.createdAt.toISOString(),
+            updatedAt: declinedRow.updatedAt.toISOString(),
+            resolvedAt: now.toISOString(),
+          },
+        };
+      }
+
+      if (propRow.status === 'pending_votes') {
+        throw new Error(
+          'UNANIMOUS_APPROVAL_REQUIRED: Every current team member must approve before you can join the team.'
+        );
+      }
+
+      if (propRow.status !== 'invited') {
+        throw new Error(
+          `ALREADY_RESOLVED: Invitation is no longer active (current status: ${propRow.status}).`
+        );
+      }
+
+      // Check if team is locked by completed registration
+      const regRows = await tx
+        .select()
+        .from(schema.teamRegistrations)
+        .where(eq(schema.teamRegistrations.teamSlug, teamRow.teamSlug));
+      if (regRows[0]?.registrationStatus === 'registered') {
+        throw new Error(
+          'TEAM_REGISTERED_LOCKED: This team has already completed official hackathon registration. Roster changes are locked unless registration is amended.'
+        );
+      }
+
+      // Check team capacity (max 4 or verified maxTeamSize)
+      const hackRows = await tx
+        .select()
+        .from(schema.hackathons)
+        .where(eq(schema.hackathons.slug, teamRow.hackathonSlug));
+      const hack = hackRows[0];
+      const maxCap = Math.min(
+        4,
+        hack?.maxTeamSize != null && hack.maxTeamSize > 0
+          ? Math.min(teamRow.targetSize, hack.maxTeamSize)
+          : teamRow.targetSize
+      );
+
+      if (teamRow.memberCount >= maxCap || teamRow.status !== 'open') {
+        throw new Error(
+          `TEAM_FULL: Team "${teamRow.name}" has already reached maximum capacity (${maxCap}).`
+        );
+      }
+
+      // Verify candidate is not already in another active team for this hackathon
+      const membershipKey = `${teamRow.hackathonSlug}_${params.candidateUid}`;
+      const existingCandidateMember = await tx
+        .select()
+        .from(schema.memberships)
+        .where(
+          and(
+            eq(schema.memberships.membershipKey, membershipKey),
+            eq(schema.memberships.status, 'active')
+          )
+        );
+      if (existingCandidateMember.length > 0) {
+        throw new Error(
+          'ALREADY_IN_TEAM: You are already an active member of a team for this hackathon.'
+        );
+      }
+
+      const newCount = teamRow.memberCount + 1;
+      const becomesFull = newCount >= maxCap;
+
+      const [updatedTeamRow] = await tx
+        .update(schema.teams)
+        .set({
+          memberCount: newCount,
+          status: becomesFull ? 'full' : 'open',
+        })
+        .where(eq(schema.teams.teamSlug, teamRow.teamSlug))
+        .returning();
+
+      const [newMemberRow] = await tx
+        .insert(schema.memberships)
+        .values({
+          membershipKey,
+          hackathonSlug: teamRow.hackathonSlug,
+          teamSlug: teamRow.teamSlug,
+          uid: params.candidateUid,
+          role: propRow.proposedRole || 'Core Builder',
+          status: 'active',
+          joinedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: schema.memberships.membershipKey,
+          set: {
+            teamSlug: teamRow.teamSlug,
+            role: propRow.proposedRole || 'Core Builder',
+            status: 'active',
+            joinedAt: now,
+          },
+        })
+        .returning();
+
+      const [acceptedPropRow] = await tx
+        .update(schema.teamProposals)
+        .set({
+          status: 'accepted',
+          resolutionNote: 'Accepted by candidate.',
+          updatedAt: now,
+          resolvedAt: now,
+        })
+        .where(eq(schema.teamProposals.proposalUid, params.proposalUid))
+        .returning();
+
+      // Invalidate any competing proposals/invitations for this candidate in the same hackathon
+      await tx
+        .update(schema.teamProposals)
+        .set({
+          status: 'expired',
+          resolutionNote:
+            'Candidate accepted an invitation from another team in this hackathon.',
+          updatedAt: now,
+          resolvedAt: now,
+        })
+        .where(
+          and(
+            eq(schema.teamProposals.hackathonSlug, teamRow.hackathonSlug),
+            eq(schema.teamProposals.candidateUid, params.candidateUid),
+            ne(schema.teamProposals.proposalUid, params.proposalUid),
+            inArray(schema.teamProposals.status, ['pending_votes', 'invited'])
+          )
+        );
+
+      // If team reached capacity, expire all remaining pending proposals and join requests for this team
+      if (becomesFull) {
+        await tx
+          .update(schema.teamProposals)
+          .set({
+            status: 'expired',
+            resolutionNote: 'Auto-expired because team reached maximum capacity.',
+            updatedAt: now,
+            resolvedAt: now,
+          })
+          .where(
+            and(
+              eq(schema.teamProposals.teamSlug, teamRow.teamSlug),
+              ne(schema.teamProposals.proposalUid, params.proposalUid),
+              inArray(schema.teamProposals.status, ['pending_votes', 'invited'])
+            )
+          );
+
+        await tx
+          .update(schema.joinRequests)
+          .set({
+            status: 'expired',
+            resolutionNote: 'Auto-expired because team reached maximum capacity.',
+            resolvedAt: now,
+          })
+          .where(
+            and(
+              eq(schema.joinRequests.teamSlug, teamRow.teamSlug),
+              eq(schema.joinRequests.status, 'pending')
+            )
+          );
+      }
+
+      // Add new member to team_roster conversation
+      const nextParticipants = Array.from(
+        new Set([...requiredVoterUids, params.candidateUid])
+      );
+      const rosterConvUid = `conv_${teamRow.teamSlug}`;
+      const [convRow] = await tx
+        .insert(schema.conversations)
+        .values({
+          conversationUid: rosterConvUid,
+          hackathonSlug: teamRow.hackathonSlug,
+          type: 'team_roster',
+          title: `${teamRow.name} — Team Chat`,
+          participantUidsJson: JSON.stringify(nextParticipants),
+          teamSlug: teamRow.teamSlug,
+        })
+        .onConflictDoUpdate({
+          target: schema.conversations.conversationUid,
+          set: {
+            participantUidsJson: JSON.stringify(nextParticipants),
+            lastMessageAt: now,
+          },
+        })
+        .returning();
+
+      // Update team registration readiness
+      const readiness = computeTeamRegistrationReadiness({
+        memberCount: newCount,
+        minTeamSize: hack?.minTeamSize,
+        maxTeamSize: hack?.maxTeamSize ?? maxCap,
+        hackathonStatus: hack?.status,
+        registrationDeadline: hack?.registrationDeadline,
+        matchable: hack?.matchable,
+      });
+
+      await tx
+        .insert(schema.teamRegistrations)
+        .values({
+          teamSlug: teamRow.teamSlug,
+          hackathonSlug: teamRow.hackathonSlug,
+          registrationStatus: readiness.computedStatus,
+          officialRegistrationUrl:
+            hack?.registrationUrl ?? hack?.verifiedCanonicalUrl ?? null,
+        })
+        .onConflictDoUpdate({
+          target: schema.teamRegistrations.teamSlug,
+          set: {
+            registrationStatus:
+              regRows[0]?.registrationStatus === 'registration_in_progress' &&
+              readiness.isEligibleToRegister
+                ? 'registration_in_progress'
+                : readiness.computedStatus,
+            updatedAt: now,
+          },
+        });
+
+      const specs = safeJsonParse<string[]>(
+        updatedTeamRow.customSpecializationsJson,
+        []
+      );
+
+      return {
+        becomesFull,
+        proposal: {
+          id: acceptedPropRow.proposalUid,
+          hackathonId: acceptedPropRow.hackathonSlug,
+          teamId: acceptedPropRow.teamSlug,
+          teamName: updatedTeamRow.name,
+          candidateUid: acceptedPropRow.candidateUid,
+          proposedByUid: acceptedPropRow.proposedByUid,
+          proposedRole: acceptedPropRow.proposedRole,
+          message: acceptedPropRow.message ?? undefined,
+          status: 'accepted',
+          resolutionNote: acceptedPropRow.resolutionNote ?? undefined,
+          votes: allVotes.map((vr) => ({
+            id: vr.voteKey,
+            proposalId: vr.proposalUid,
+            teamId: vr.teamSlug,
+            voterUid: vr.voterUid,
+            decision: (vr.decision as 'approve' | 'reject') || 'approve',
+            comment: vr.comment ?? undefined,
+            votedAt: vr.votedAt.toISOString(),
+          })),
+          requiredVoterUids: nextParticipants,
+          approvedCount,
+          requiredCount: requiredVoterUids.length,
+          createdAt: acceptedPropRow.createdAt.toISOString(),
+          updatedAt: acceptedPropRow.updatedAt.toISOString(),
+          resolvedAt: now.toISOString(),
+        },
+        team: {
+          id: updatedTeamRow.teamSlug,
+          hackathonId: updatedTeamRow.hackathonSlug,
+          leaderId: updatedTeamRow.leaderUid,
+          name: updatedTeamRow.name,
+          pitch: updatedTeamRow.pitch,
+          projectIdea: updatedTeamRow.projectIdea ?? undefined,
+          rolesNeeded: safeJsonParse<string[]>(
+            updatedTeamRow.rolesNeededJson,
+            []
+          ),
+          customSpecializations: specs.length > 0 ? specs : undefined,
+          desiredDomains: safeJsonParse<string[]>(
+            updatedTeamRow.desiredDomainsJson,
+            []
+          ),
+          availabilitySummary: updatedTeamRow.availabilitySummary,
+          workStyleTags: safeJsonParse<string[]>(
+            updatedTeamRow.workStyleTagsJson,
+            []
+          ),
+          targetSize: updatedTeamRow.targetSize,
+          memberCount: updatedTeamRow.memberCount,
+          status:
+            (updatedTeamRow.status as 'open' | 'full' | 'locked') || 'open',
+          visibility: 'public',
+          createdAt: updatedTeamRow.createdAt.toISOString(),
+        },
+        membership: {
+          id: newMemberRow.membershipKey,
+          hackathonId: newMemberRow.hackathonSlug,
+          teamId: newMemberRow.teamSlug,
+          uid: newMemberRow.uid,
+          role: newMemberRow.role,
+          joinedAt: newMemberRow.joinedAt.toISOString(),
+          status: 'active',
+        },
+        conversation: {
+          id: convRow.conversationUid,
+          hackathonId: convRow.hackathonSlug,
+          type: 'team_roster',
+          title: convRow.title,
+          participantUids: nextParticipants,
+          teamId: teamRow.teamSlug,
+          createdAt: convRow.createdAt.toISOString(),
+          lastMessageAt: convRow.lastMessageAt.toISOString(),
+        },
+      };
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('TEAM_FULL:')) {
+      await db
+        .update(schema.teamProposals)
+        .set({
+          status: 'expired',
+          resolutionNote: 'Team reached maximum capacity.',
+          resolvedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(schema.teamProposals.proposalUid, params.proposalUid),
+            inArray(schema.teamProposals.status, ['pending_votes', 'invited'])
+          )
+        )
+        .catch(() => {});
+      throw error;
+    }
+    throw error;
+  }
+}
+
+export async function leaveTeamRecord(params: {
+  teamSlug: string;
+  uid: string;
+}): Promise<{
+  team: Team;
+  leftMembership: Membership;
+  remainingMemberUids: string[];
+}> {
+  await ensureMatchingAndTeamSchema();
+  return await db.transaction(async (tx) => {
+    const teamRows = await tx
+      .select()
+      .from(schema.teams)
+      .where(eq(schema.teams.teamSlug, params.teamSlug))
+      .for('update');
+    const teamRow = teamRows[0];
+    if (!teamRow) {
+      throw new Error('NOT_FOUND: Team not found.');
+    }
+
+    const regRows = await tx
+      .select()
+      .from(schema.teamRegistrations)
+      .where(eq(schema.teamRegistrations.teamSlug, params.teamSlug));
+    if (regRows[0]?.registrationStatus === 'registered') {
+      throw new Error(
+        'TEAM_REGISTERED_LOCKED: This team is already marked as officially registered. Amend or unlock registration status before changing team roster.'
+      );
+    }
+
+    const activeMemberRows = await tx
+      .select()
+      .from(schema.memberships)
+      .where(
+        and(
+          eq(schema.memberships.teamSlug, params.teamSlug),
+          eq(schema.memberships.status, 'active')
+        )
+      );
+
+    const memberRow = activeMemberRows.find((m) => m.uid === params.uid);
+    if (!memberRow) {
+      throw new Error('FORBIDDEN: You are not an active member of this team.');
+    }
+
+    const now = new Date();
+    const [updatedMemberRow] = await tx
+      .update(schema.memberships)
+      .set({ status: 'left' })
+      .where(eq(schema.memberships.id, memberRow.id))
+      .returning();
+
+    const remainingMembers = activeMemberRows.filter(
+      (m) => m.uid !== params.uid
+    );
+    const remainingMemberUids = remainingMembers.map((m) => m.uid);
+    const newCount = remainingMembers.length;
+
+    const hackRows = await tx
+      .select()
+      .from(schema.hackathons)
+      .where(eq(schema.hackathons.slug, teamRow.hackathonSlug));
+    const hack = hackRows[0];
+    const maxCap = Math.min(
+      4,
+      hack?.maxTeamSize != null && hack.maxTeamSize > 0
+        ? Math.min(teamRow.targetSize, hack.maxTeamSize)
+        : teamRow.targetSize
+    );
+
+    const nextLeaderUid =
+      newCount === 0
+        ? teamRow.leaderUid
+        : teamRow.leaderUid === params.uid
+        ? remainingMemberUids[0]
+        : teamRow.leaderUid;
+
+    const nextTeamStatus: 'open' | 'full' | 'locked' =
+      newCount === 0 ? 'locked' : newCount >= maxCap ? 'full' : 'open';
+
+    const [updatedTeamRow] = await tx
+      .update(schema.teams)
+      .set({
+        leaderUid: nextLeaderUid,
+        memberCount: newCount,
+        status: nextTeamStatus,
+      })
+      .where(eq(schema.teams.teamSlug, params.teamSlug))
+      .returning();
+
+    // Update team_roster conversation participants
+    const convRows = await tx
+      .select()
+      .from(schema.conversations)
+      .where(eq(schema.conversations.teamSlug, params.teamSlug));
+    if (convRows[0]) {
+      await tx
+        .update(schema.conversations)
+        .set({
+          participantUidsJson: JSON.stringify(remainingMemberUids),
+          lastMessageAt: now,
+        })
+        .where(
+          eq(schema.conversations.conversationUid, convRows[0].conversationUid)
+        );
+    }
+
+    // Re-evaluate pending_votes proposals for this team:
+    // If newCount === 0, expire them. Otherwise, if all remaining active members have approved a pending proposal, transition it to 'invited'.
+    if (newCount === 0) {
+      await tx
+        .update(schema.teamProposals)
+        .set({
+          status: 'expired',
+          resolutionNote: 'Team dissolved because all members left.',
+          updatedAt: now,
+          resolvedAt: now,
+        })
+        .where(
+          and(
+            eq(schema.teamProposals.teamSlug, params.teamSlug),
+            inArray(schema.teamProposals.status, ['pending_votes', 'invited'])
+          )
+        );
+    } else {
+      const pendingProps = await tx
+        .select()
+        .from(schema.teamProposals)
+        .where(
+          and(
+            eq(schema.teamProposals.teamSlug, params.teamSlug),
+            eq(schema.teamProposals.status, 'pending_votes')
+          )
+        );
+      for (const pp of pendingProps) {
+        const votes = await tx
+          .select()
+          .from(schema.teamProposalVotes)
+          .where(eq(schema.teamProposalVotes.proposalUid, pp.proposalUid));
+        const allRemainingApproved = remainingMemberUids.every((mUid) =>
+          votes.some((v) => v.voterUid === mUid && v.decision === 'approve')
+        );
+        if (allRemainingApproved) {
+          await tx
+            .update(schema.teamProposals)
+            .set({ status: 'invited', updatedAt: now })
+            .where(eq(schema.teamProposals.proposalUid, pp.proposalUid));
+        }
+      }
+    }
+
+    // Update team registration readiness
+    const readiness = computeTeamRegistrationReadiness({
+      memberCount: newCount,
+      minTeamSize: hack?.minTeamSize,
+      maxTeamSize: hack?.maxTeamSize ?? maxCap,
+      hackathonStatus: hack?.status,
+      registrationDeadline: hack?.registrationDeadline,
+      matchable: hack?.matchable,
+    });
+
+    await tx
+      .insert(schema.teamRegistrations)
+      .values({
+        teamSlug: params.teamSlug,
+        hackathonSlug: teamRow.hackathonSlug,
+        registrationStatus: readiness.computedStatus,
+        officialRegistrationUrl:
+          hack?.registrationUrl ?? hack?.verifiedCanonicalUrl ?? null,
+      })
+      .onConflictDoUpdate({
+        target: schema.teamRegistrations.teamSlug,
+        set: {
+          registrationStatus: readiness.computedStatus,
+          updatedAt: now,
+        },
+      });
+
+    const specs = safeJsonParse<string[]>(
+      updatedTeamRow.customSpecializationsJson,
+      []
+    );
+
+    return {
+      remainingMemberUids,
+      team: {
+        id: updatedTeamRow.teamSlug,
+        hackathonId: updatedTeamRow.hackathonSlug,
+        leaderId: updatedTeamRow.leaderUid,
+        name: updatedTeamRow.name,
+        pitch: updatedTeamRow.pitch,
+        projectIdea: updatedTeamRow.projectIdea ?? undefined,
+        rolesNeeded: safeJsonParse<string[]>(
+          updatedTeamRow.rolesNeededJson,
+          []
+        ),
+        customSpecializations: specs.length > 0 ? specs : undefined,
+        desiredDomains: safeJsonParse<string[]>(
+          updatedTeamRow.desiredDomainsJson,
+          []
+        ),
+        availabilitySummary: updatedTeamRow.availabilitySummary,
+        workStyleTags: safeJsonParse<string[]>(
+          updatedTeamRow.workStyleTagsJson,
+          []
+        ),
+        targetSize: updatedTeamRow.targetSize,
+        memberCount: updatedTeamRow.memberCount,
+        status: nextTeamStatus,
+        visibility: 'public',
+        createdAt: updatedTeamRow.createdAt.toISOString(),
+      },
+      leftMembership: {
+        id: updatedMemberRow.membershipKey,
+        hackathonId: updatedMemberRow.hackathonSlug,
+        teamId: updatedMemberRow.teamSlug,
+        uid: updatedMemberRow.uid,
+        role: updatedMemberRow.role,
+        joinedAt: updatedMemberRow.joinedAt.toISOString(),
+        status: 'left',
+      },
+    };
+  });
+}
+
+export async function updateTeamDetailsRecord(params: {
+  teamSlug: string;
+  actorUid: string;
+  name?: string;
+  pitch?: string;
+  projectIdea?: string | null;
+  rolesNeeded?: string[];
+  customSpecializations?: string[];
+  desiredDomains?: string[];
+  targetSize?: number;
+}): Promise<Team> {
+  await ensureMatchingAndTeamSchema();
+  return await db.transaction(async (tx) => {
+    const teamRows = await tx
+      .select()
+      .from(schema.teams)
+      .where(eq(schema.teams.teamSlug, params.teamSlug))
+      .for('update');
+    const teamRow = teamRows[0];
+    if (!teamRow) {
+      throw new Error('NOT_FOUND: Team not found.');
+    }
+
+    const activeMembers = await tx
+      .select()
+      .from(schema.memberships)
+      .where(
+        and(
+          eq(schema.memberships.teamSlug, params.teamSlug),
+          eq(schema.memberships.status, 'active')
+        )
+      );
+    const isMember =
+      teamRow.leaderUid === params.actorUid ||
+      activeMembers.some((m) => m.uid === params.actorUid);
+    if (!isMember) {
+      throw new Error('FORBIDDEN: Only active team members can edit team details.');
+    }
+
+    const hackRows = await tx
+      .select()
+      .from(schema.hackathons)
+      .where(eq(schema.hackathons.slug, teamRow.hackathonSlug));
+    const hack = hackRows[0];
+    const maxCap = Math.min(
+      4,
+      hack?.maxTeamSize != null && hack.maxTeamSize > 0 ? hack.maxTeamSize : 4
+    );
+
+    const nextTargetSize =
+      params.targetSize != null
+        ? Math.max(
+            teamRow.memberCount,
+            Math.min(maxCap, Math.max(2, params.targetSize))
+          )
+        : teamRow.targetSize;
+
+    const nextStatus: 'open' | 'full' | 'locked' =
+      teamRow.status === 'locked'
+        ? 'locked'
+        : teamRow.memberCount >= nextTargetSize
+        ? 'full'
+        : 'open';
+
+    const nextName = params.name?.trim() || teamRow.name;
+    const nextPitch = params.pitch?.trim() ?? teamRow.pitch;
+    const nextProjectIdea =
+      params.projectIdea !== undefined
+        ? params.projectIdea
+        : teamRow.projectIdea;
+    const nextRolesNeeded =
+      params.rolesNeeded ?? safeJsonParse<string[]>(teamRow.rolesNeededJson, []);
+    const nextSpecs =
+      params.customSpecializations ??
+      safeJsonParse<string[]>(teamRow.customSpecializationsJson, []);
+    const nextDomains =
+      params.desiredDomains ??
+      safeJsonParse<string[]>(teamRow.desiredDomainsJson, []);
+
+    const [updated] = await tx
+      .update(schema.teams)
+      .set({
+        name: nextName,
+        pitch: nextPitch,
+        projectIdea: nextProjectIdea,
+        rolesNeededJson: JSON.stringify(nextRolesNeeded),
+        customSpecializationsJson: JSON.stringify(nextSpecs),
+        desiredDomainsJson: JSON.stringify(nextDomains),
+        targetSize: nextTargetSize,
+        status: nextStatus,
+      })
+      .where(eq(schema.teams.teamSlug, params.teamSlug))
+      .returning();
+
+    return {
+      id: updated.teamSlug,
+      hackathonId: updated.hackathonSlug,
+      leaderId: updated.leaderUid,
+      name: updated.name,
+      pitch: updated.pitch,
+      projectIdea: updated.projectIdea ?? undefined,
+      rolesNeeded: nextRolesNeeded,
+      customSpecializations: nextSpecs.length > 0 ? nextSpecs : undefined,
+      desiredDomains: nextDomains,
+      availabilitySummary: updated.availabilitySummary,
+      workStyleTags: safeJsonParse<string[]>(updated.workStyleTagsJson, []),
+      targetSize: updated.targetSize,
+      memberCount: updated.memberCount,
+      status: nextStatus,
+      visibility: 'public',
+      createdAt: updated.createdAt.toISOString(),
+    };
+  });
+}
+
+export async function updateTeamRegistrationRecord(params: {
+  teamSlug: string;
+  actorUid: string;
+  status: TeamRegistrationStatus;
+  externalRegistrationReference?: string | null;
+  confirmationNotes?: string | null;
+}): Promise<TeamRegistration> {
+  await ensureMatchingAndTeamSchema();
+  return await db.transaction(async (tx) => {
+    const teamRows = await tx
+      .select()
+      .from(schema.teams)
+      .where(eq(schema.teams.teamSlug, params.teamSlug))
+      .for('update');
+    const teamRow = teamRows[0];
+    if (!teamRow) {
+      throw new Error('NOT_FOUND: Team not found.');
+    }
+
+    const activeMembers = await tx
+      .select()
+      .from(schema.memberships)
+      .where(
+        and(
+          eq(schema.memberships.teamSlug, params.teamSlug),
+          eq(schema.memberships.status, 'active')
+        )
+      );
+    const isMember =
+      teamRow.leaderUid === params.actorUid ||
+      activeMembers.some((m) => m.uid === params.actorUid);
+    if (!isMember) {
+      throw new Error(
+        'FORBIDDEN: Only active team members can update registration status.'
+      );
+    }
+
+    const hackRows = await tx
+      .select()
+      .from(schema.hackathons)
+      .where(eq(schema.hackathons.slug, teamRow.hackathonSlug));
+    const hackRow = hackRows[0];
+    const hackDomain = hackRow ? mapDbHackathonToDomain(hackRow) : undefined;
+
+    const readiness = computeTeamRegistrationReadiness({
+      memberCount: teamRow.memberCount,
+      minTeamSize: hackDomain?.minTeamSize,
+      maxTeamSize: hackDomain?.maxTeamSize ?? teamRow.targetSize,
+      hackathonStatus: hackDomain?.status,
+      registrationDeadline: hackDomain?.registrationDeadline,
+      matchable: hackDomain?.matchable,
+    });
+
+    if (
+      (params.status === 'registration_in_progress' ||
+        params.status === 'registered') &&
+      !readiness.isEligibleToRegister
+    ) {
+      throw new Error(`INELIGIBLE_TEAM_SIZE: ${readiness.readinessReason}`);
+    }
+
+    const now = new Date();
+    const officialUrl =
+      hackDomain?.registrationUrl ||
+      hackDomain?.verifiedCanonicalUrl ||
+      hackDomain?.originalSubmissionUrl ||
+      null;
+
+    const [regRow] = await tx
+      .insert(schema.teamRegistrations)
+      .values({
+        teamSlug: params.teamSlug,
+        hackathonSlug: teamRow.hackathonSlug,
+        registrationStatus: params.status,
+        officialRegistrationUrl: officialUrl,
+        externalRegistrationReference:
+          params.externalRegistrationReference ?? null,
+        confirmationNotes: params.confirmationNotes ?? null,
+        registeredByUid:
+          params.status === 'registered' ? params.actorUid : null,
+        registeredAt: params.status === 'registered' ? now : null,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: schema.teamRegistrations.teamSlug,
+        set: {
+          registrationStatus: params.status,
+          officialRegistrationUrl: officialUrl,
+          externalRegistrationReference:
+            params.externalRegistrationReference !== undefined
+              ? params.externalRegistrationReference
+              : undefined,
+          confirmationNotes:
+            params.confirmationNotes !== undefined
+              ? params.confirmationNotes
+              : undefined,
+          registeredByUid:
+            params.status === 'registered' ? params.actorUid : null,
+          registeredAt: params.status === 'registered' ? now : null,
+          updatedAt: now,
+        },
+      })
+      .returning();
+
+    const teamDomain: Team = {
+      id: teamRow.teamSlug,
+      hackathonId: teamRow.hackathonSlug,
+      leaderId: teamRow.leaderUid,
+      name: teamRow.name,
+      pitch: teamRow.pitch,
+      projectIdea: teamRow.projectIdea ?? undefined,
+      rolesNeeded: safeJsonParse<string[]>(teamRow.rolesNeededJson, []),
+      desiredDomains: safeJsonParse<string[]>(teamRow.desiredDomainsJson, []),
+      availabilitySummary: teamRow.availabilitySummary,
+      workStyleTags: safeJsonParse<string[]>(teamRow.workStyleTagsJson, []),
+      targetSize: teamRow.targetSize,
+      memberCount: teamRow.memberCount,
+      status: (teamRow.status as 'open' | 'full' | 'locked') || 'open',
+      visibility: 'public',
+      createdAt: teamRow.createdAt.toISOString(),
+    };
+
+    return buildTeamRegistrationDomainObject({
+      team: teamDomain,
+      hackathon: hackDomain,
+      regRow,
+    });
+  });
+}
+
+export async function getShortlistForUserRecord(params: {
+  uid: string;
+  hackathonSlug: string;
+}): Promise<ShortlistPayload> {
+  await ensureMatchingAndTeamSchema();
+  const [
+    userRows,
+    profileRows,
+    swipeRows,
+    memberRows,
+    convRows,
+    proposalRows,
+    blockRows,
+  ] = await Promise.all([
+    db.select().from(schema.users),
+    db.select().from(schema.profiles),
+    db
+      .select()
+      .from(schema.swipes)
+      .where(
+        and(
+          eq(schema.swipes.hackathonSlug, params.hackathonSlug),
+          eq(schema.swipes.targetType, 'user')
+        )
+      ),
+    db
+      .select()
+      .from(schema.memberships)
+      .where(
+        and(
+          eq(schema.memberships.hackathonSlug, params.hackathonSlug),
+          eq(schema.memberships.status, 'active')
+        )
+      ),
+    db
+      .select()
+      .from(schema.conversations)
+      .where(eq(schema.conversations.hackathonSlug, params.hackathonSlug)),
+    db
+      .select()
+      .from(schema.teamProposals)
+      .where(eq(schema.teamProposals.hackathonSlug, params.hackathonSlug)),
+    db
+      .select()
+      .from(schema.userBlocks)
+      .where(
+        or(
+          eq(schema.userBlocks.blockerUid, params.uid),
+          eq(schema.userBlocks.blockedUid, params.uid)
+        )
+      ),
+  ]);
+
+  const blockedUids = new Set(
+    blockRows.map((b) =>
+      b.blockerUid === params.uid ? b.blockedUid : b.blockerUid
+    )
+  );
+
+  const userMap = new Map<string, User>();
+  for (const ur of userRows) {
+    userMap.set(ur.uid, mapDbUserToDomain(ur));
+  }
+  const profileMap = new Map<string, Profile>();
+  for (const pr of profileRows) {
+    profileMap.set(pr.uid, mapDbProfileToDomain(pr));
+  }
+
+  const viewerMembership = memberRows.find((m) => m.uid === params.uid);
+  const viewerTeamSlug = viewerMembership?.teamSlug;
+
+  const outgoingInterested = swipeRows.filter(
+    (s) =>
+      s.fromUid === params.uid &&
+      s.decision === 'interested' &&
+      !blockedUids.has(s.targetId)
+  );
+  const incomingInterested = swipeRows.filter(
+    (s) =>
+      s.targetId === params.uid &&
+      s.decision === 'interested' &&
+      !blockedUids.has(s.fromUid)
+  );
+
+  const outgoingByTarget = new Map(
+    outgoingInterested.map((s) => [s.targetId, s])
+  );
+  const incomingBySender = new Map(
+    incomingInterested.map((s) => [s.fromUid, s])
+  );
+
+  const buildEntry = (
+    otherUid: string,
+    swipedAt: Date
+  ): ShortlistEntry | null => {
+    const u = userMap.get(otherUid);
+    const p = profileMap.get(otherUid);
+    if (!u || !p) return null;
+    if (
+      u.privacyPreferences?.profileVisible === false ||
+      p.visibility === 'hidden'
+    ) {
+      return null;
+    }
+
+    const otherMembership = memberRows.find((m) => m.uid === otherUid);
+    const isSameTeam =
+      Boolean(viewerTeamSlug) && otherMembership?.teamSlug === viewerTeamSlug;
+
+    const isMutual =
+      outgoingByTarget.has(otherUid) && incomingBySender.has(otherUid);
+
+    const activeProposal = proposalRows.find(
+      (pr) =>
+        (pr.candidateUid === otherUid || pr.candidateUid === params.uid) &&
+        (pr.teamSlug === viewerTeamSlug ||
+          pr.teamSlug === otherMembership?.teamSlug) &&
+        (pr.status === 'pending_votes' || pr.status === 'invited')
+    );
+
+    const sortedPair = [params.uid, otherUid].sort();
+    const matchConvId = `conv_match_${params.hackathonSlug}_${sortedPair[0]}_${sortedPair[1]}`;
+    const existingConv = convRows.find((c) => c.conversationUid === matchConvId);
+
+    let status: ShortlistEntry['status'] = 'awaiting_response';
+    if (isSameTeam) {
+      status = 'in_your_team';
+    } else if (activeProposal?.status === 'invited') {
+      status = 'proposal_invited';
+    } else if (activeProposal?.status === 'pending_votes') {
+      status = 'proposal_pending_votes';
+    } else if (isMutual) {
+      status = 'mutual_match';
+    } else if (incomingBySender.has(otherUid) && !outgoingByTarget.has(otherUid)) {
+      status = 'interested_in_you';
+    }
+
+    return {
+      uid: otherUid,
+      displayName: u.displayName,
+      campus: u.campus,
+      program: u.program,
+      graduationYear: u.graduationYear,
+      headline: p.headline,
+      skillTags: p.skillTags,
+      interestTags: p.interestTags,
+      preferredRoles: p.preferredRoles,
+      swipedAt: swipedAt.toISOString(),
+      status,
+      conversationId: existingConv?.conversationUid,
+      teamId: isSameTeam
+        ? viewerTeamSlug
+        : activeProposal?.teamSlug ?? otherMembership?.teamSlug,
+      proposalId: activeProposal?.proposalUid,
+    };
+  };
+
+  const interested: ShortlistEntry[] = [];
+  const interestedInYou: ShortlistEntry[] = [];
+  const mutualMatches: ShortlistEntry[] = [];
+
+  for (const out of outgoingInterested) {
+    const entry = buildEntry(out.targetId, out.createdAt);
+    if (!entry) continue;
+    interested.push(entry);
+    if (incomingBySender.has(out.targetId)) {
+      mutualMatches.push(entry);
+    }
+  }
+
+  for (const inc of incomingInterested) {
+    const entry = buildEntry(inc.fromUid, inc.createdAt);
+    if (!entry) continue;
+    interestedInYou.push(entry);
+  }
+
+  return {
+    hackathonId: params.hackathonSlug,
+    interested,
+    interestedInYou,
+    mutualMatches,
+  };
+}
+
+export async function getTeamMessagesRecord(params: {
+  teamSlug: string;
+  viewerUid: string;
+}): Promise<{
+  conversation: Conversation;
+  messages: (Message & { senderName?: string })[];
+}> {
+  await ensureMatchingAndTeamSchema();
+  const teamRows = await db
+    .select()
+    .from(schema.teams)
+    .where(eq(schema.teams.teamSlug, params.teamSlug));
+  const teamRow = teamRows[0];
+  if (!teamRow) {
+    throw new Error('NOT_FOUND: Team not found.');
+  }
+
+  const activeMembers = await db
+    .select()
+    .from(schema.memberships)
+    .where(
+      and(
+        eq(schema.memberships.teamSlug, params.teamSlug),
+        eq(schema.memberships.status, 'active')
+      )
+    );
+  const participantUids = Array.from(
+    new Set([teamRow.leaderUid, ...activeMembers.map((m) => m.uid)])
+  );
+
+  if (!participantUids.includes(params.viewerUid)) {
+    throw new Error(
+      'FORBIDDEN: Only active members of this team can view team chat messages.'
+    );
+  }
+
+  const conversationUid = `conv_${params.teamSlug}`;
+  let convRows = await db
+    .select()
+    .from(schema.conversations)
+    .where(eq(schema.conversations.conversationUid, conversationUid));
+  if (!convRows[0]) {
+    convRows = await db
+      .insert(schema.conversations)
+      .values({
+        conversationUid,
+        hackathonSlug: teamRow.hackathonSlug,
+        type: 'team_roster',
+        title: `${teamRow.name} — Team Chat`,
+        participantUidsJson: JSON.stringify(participantUids),
+        teamSlug: params.teamSlug,
+      })
+      .returning();
+  }
+  const convRow = convRows[0];
+
+  const [msgRows, userRows] = await Promise.all([
+    db
+      .select()
+      .from(schema.messages)
+      .where(eq(schema.messages.conversationUid, conversationUid))
+      .orderBy(schema.messages.createdAt),
+    db
+      .select()
+      .from(schema.users)
+      .where(inArray(schema.users.uid, participantUids)),
+  ]);
+
+  const nameByUid = new Map(userRows.map((u) => [u.uid, u.displayName]));
+
+  return {
+    conversation: {
+      id: convRow.conversationUid,
+      hackathonId: convRow.hackathonSlug,
+      type: 'team_roster',
+      title: convRow.title,
+      participantUids,
+      teamId: params.teamSlug,
+      createdAt: convRow.createdAt.toISOString(),
+      lastMessageAt: convRow.lastMessageAt.toISOString(),
+    },
+    messages: msgRows.map((m) => ({
+      id: m.messageUid,
+      conversationId: m.conversationUid,
+      senderUid: m.senderUid,
+      senderName: nameByUid.get(m.senderUid) ?? m.senderUid,
+      body: m.body,
+      createdAt: m.createdAt.toISOString(),
+      moderationStatus: 'clean',
+    })),
+  };
+}
+
+export async function createTeamMessageRecord(params: {
+  teamSlug: string;
+  senderUid: string;
+  body: string;
+}): Promise<Message & { senderName?: string }> {
+  await ensureMatchingAndTeamSchema();
+  const trimmed = params.body?.trim() ?? '';
+  if (!trimmed) {
+    throw new Error('EMPTY_MESSAGE: Message body cannot be empty.');
+  }
+
+  const teamRows = await db
+    .select()
+    .from(schema.teams)
+    .where(eq(schema.teams.teamSlug, params.teamSlug));
+  const teamRow = teamRows[0];
+  if (!teamRow) {
+    throw new Error('NOT_FOUND: Team not found.');
+  }
+
+  const activeMembers = await db
+    .select()
+    .from(schema.memberships)
+    .where(
+      and(
+        eq(schema.memberships.teamSlug, params.teamSlug),
+        eq(schema.memberships.status, 'active')
+      )
+    );
+  const participantUids = Array.from(
+    new Set([teamRow.leaderUid, ...activeMembers.map((m) => m.uid)])
+  );
+
+  if (!participantUids.includes(params.senderUid)) {
+    throw new Error(
+      'FORBIDDEN: Only active members of this team can send team chat messages.'
+    );
+  }
+
+  const now = new Date();
+  const conversationUid = `conv_${params.teamSlug}`;
+  await db
+    .insert(schema.conversations)
+    .values({
+      conversationUid,
+      hackathonSlug: teamRow.hackathonSlug,
+      type: 'team_roster',
+      title: `${teamRow.name} — Team Chat`,
+      participantUidsJson: JSON.stringify(participantUids),
+      teamSlug: params.teamSlug,
+      lastMessageAt: now,
+    })
+    .onConflictDoUpdate({
+      target: schema.conversations.conversationUid,
+      set: {
+        participantUidsJson: JSON.stringify(participantUids),
+        lastMessageAt: now,
+      },
+    });
+
+  const messageUid = `msg_${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2, 6)}`;
+  const [msgRow] = await db
+    .insert(schema.messages)
+    .values({
+      messageUid,
+      conversationUid,
+      senderUid: params.senderUid,
+      body: trimmed,
+      createdAt: now,
+    })
+    .returning();
+
+  const senderRows = await db
+    .select()
+    .from(schema.users)
+    .where(eq(schema.users.uid, params.senderUid));
+
+  return {
+    id: msgRow.messageUid,
+    conversationId: msgRow.conversationUid,
+    senderUid: msgRow.senderUid,
+    senderName: senderRows[0]?.displayName ?? msgRow.senderUid,
+    body: msgRow.body,
+    createdAt: msgRow.createdAt.toISOString(),
+    moderationStatus: 'clean',
+  };
+}
+
+export async function blockUserRecord(params: {
+  blockerUid: string;
+  blockedUid: string;
+  reason?: string;
+}): Promise<BlockRecord> {
+  await ensureMatchingAndTeamSchema();
+  if (params.blockerUid === params.blockedUid) {
+    throw new Error('INVALID_BLOCK: Cannot block yourself.');
+  }
+  const blockKey = `${params.blockerUid}_${params.blockedUid}`;
+  const now = new Date();
+  const [row] = await db
+    .insert(schema.userBlocks)
+    .values({
+      blockKey,
+      blockerUid: params.blockerUid,
+      blockedUid: params.blockedUid,
+      reason: params.reason ?? null,
+      createdAt: now,
+    })
+    .onConflictDoUpdate({
+      target: schema.userBlocks.blockKey,
+      set: { reason: params.reason ?? null },
+    })
+    .returning();
+
+  return {
+    id: row.blockKey,
+    blockerUid: row.blockerUid,
+    blockedUid: row.blockedUid,
+    createdAt: row.createdAt.toISOString(),
+  };
 }
 
 export async function resolveJoinRequestRecord(params: {
@@ -2248,14 +6228,7 @@ export async function resolveJoinRequestRecord(params: {
   updatedConversation?: Conversation;
 }> {
   try {
-    // The whole resolution runs inside one transaction. The team row is locked
-    // first (`FOR UPDATE`) and the request row second, which gives every
-    // caller the same lock order and therefore serialises concurrent
-    // accept/reject calls for the same team. The member counter, the
-    // membership row and the request status can no longer disagree, and two
-    // simultaneous accepts can no longer push a team past its maximum size.
     return await db.transaction(async (tx) => {
-      // 1. Read the request (unlocked) to learn which team it belongs to.
       const initialReqRows = await tx
         .select()
         .from(schema.joinRequests)
@@ -2266,7 +6239,6 @@ export async function resolveJoinRequestRecord(params: {
         throw new Error('NOT_FOUND: Join request not found.');
       }
 
-      // 2. Lock the team row first (consistent lock order avoids deadlocks).
       const teamRows = await tx
         .select()
         .from(schema.teams)
@@ -2277,7 +6249,6 @@ export async function resolveJoinRequestRecord(params: {
         throw new Error('NOT_FOUND: Team not found.');
       }
 
-      // 3. Lock the request row and re-validate its current state.
       const reqRows = await tx
         .select()
         .from(schema.joinRequests)
@@ -2288,8 +6259,6 @@ export async function resolveJoinRequestRecord(params: {
         throw new Error('NOT_FOUND: Join request not found.');
       }
       if (reqRow.status !== 'pending') {
-        // A request that was auto-expired (e.g. the team reached capacity) no
-        // longer exists as an actionable request, so it is reported as 404.
         if (reqRow.status === 'expired') {
           throw new Error('NOT_FOUND: Join request no longer exists.');
         }
@@ -2298,9 +6267,6 @@ export async function resolveJoinRequestRecord(params: {
         );
       }
 
-      // Verify actor authorization:
-      // - For an 'application', the team leader must accept/reject
-      // - For an 'invitation', the invited applicant (or team leader) can accept/reject
       const isAuthorized =
         (reqRow.direction === 'application' &&
           teamRow.leaderUid === params.actorUid) ||
@@ -2340,20 +6306,19 @@ export async function resolveJoinRequestRecord(params: {
         };
       }
 
-      // Enforce max team size & single-team-per-hackathon constraint
       const hackRows = await tx
         .select()
         .from(schema.hackathons)
         .where(eq(schema.hackathons.slug, reqRow.hackathonSlug));
       const hack = hackRows[0];
-      const maxCap =
+      const maxCap = Math.min(
+        4,
         hack?.maxTeamSize != null
           ? Math.min(teamRow.targetSize, hack.maxTeamSize)
-          : teamRow.targetSize;
+          : teamRow.targetSize
+      );
 
       if (teamRow.memberCount >= maxCap || teamRow.status !== 'open') {
-        // The request is marked as expired by the caller (outside this
-        // transaction) so that the marking survives the rollback.
         throw new Error(
           `TEAM_FULL: Team "${teamRow.name}" has already reached maximum size (${maxCap}).`
         );
@@ -2397,6 +6362,16 @@ export async function resolveJoinRequestRecord(params: {
           uid: reqRow.applicantUid,
           role: reqRow.proposedRole,
           status: 'active',
+          joinedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: schema.memberships.membershipKey,
+          set: {
+            teamSlug: teamRow.teamSlug,
+            role: reqRow.proposedRole,
+            status: 'active',
+            joinedAt: now,
+          },
         })
         .returning();
 
@@ -2422,7 +6397,6 @@ export async function resolveJoinRequestRecord(params: {
           );
       }
 
-      // Add new member to team_roster conversation
       const convRows = await tx
         .select()
         .from(schema.conversations)
@@ -2524,8 +6498,6 @@ export async function resolveJoinRequestRecord(params: {
       error instanceof Error &&
       error.message.startsWith('TEAM_FULL:')
     ) {
-      // The team is full: mark the pending request as expired. This runs
-      // outside the rolled-back transaction so the status is persisted.
       try {
         await db
           .update(schema.joinRequests)
@@ -2643,3 +6615,4 @@ export async function resetPassedSwipesForHackathon(params: {
     throw new Error('Failed to reset passed profiles.', { cause: error });
   }
 }
+
