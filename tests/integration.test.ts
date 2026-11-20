@@ -25,6 +25,7 @@ function createBase64UrlJwt(payload: Record<string, unknown>): string {
 
 test.before(async () => {
   assertIntegrationTestGuard();
+  delete process.env.PESU_OAUTH_REDIRECT_URI;
   await new Promise<void>((resolve) => {
     serverInstance = app.listen(0, '127.0.0.1', () => {
       const addr = serverInstance.address();
