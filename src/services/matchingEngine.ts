@@ -196,9 +196,53 @@ export function computeTfIdfCosineSimilarity(
   return computeFastTfIdfCosine(tokensA, countsA, setA, docB, precomputed);
 }
 
+const INTEREST_CANONICAL_MAP: Record<string, string> = {
+  'ai/ml': 'ai_ml',
+  'ai / ml': 'ai_ml',
+  'applied ai/ml': 'ai_ml',
+  'machine learning': 'ai_ml',
+  'generative ai': 'ai_ml',
+  'web development': 'web_dev',
+  'web dev': 'web_dev',
+  'developer tools': 'web_dev',
+  'full stack': 'web_dev',
+  'cybersecurity': 'cybersecurity',
+  'cybersecurity / ctf': 'cybersecurity',
+  'security/ctfs': 'cybersecurity',
+  'security': 'cybersecurity',
+  'robotics': 'robotics_iot',
+  'robotics/iot': 'robotics_iot',
+  'hardware / iot': 'robotics_iot',
+  'embedded': 'robotics_iot',
+  'data science': 'data_science',
+  'data visualization': 'data_science',
+  'analytics': 'data_science',
+  'design': 'design_ux',
+  'ui/ux': 'design_ux',
+  'product & ui/ux': 'design_ux',
+  'cloud/systems': 'cloud_systems',
+  'systems/cloud': 'cloud_systems',
+  'open-source systems': 'cloud_systems',
+  'mobile apps': 'mobile',
+  'mobile': 'mobile',
+};
+
+function canonicalizeInterestKey(tag: string): string {
+  const norm = String(tag || '').toLowerCase().trim();
+  return INTEREST_CANONICAL_MAP[norm] ?? norm;
+}
+
 function jaccardOverlap(listA: string[], listB: string[]): { score: number; shared: string[] } {
-  const normA = new Map(listA.map((item) => [item.toLowerCase().trim(), item]));
-  const normB = new Map(listB.map((item) => [item.toLowerCase().trim(), item]));
+  const normA = new Map<string, string>();
+  for (const item of listA) {
+    const key = canonicalizeInterestKey(item);
+    if (key && !normA.has(key)) normA.set(key, item.trim());
+  }
+  const normB = new Map<string, string>();
+  for (const item of listB) {
+    const key = canonicalizeInterestKey(item);
+    if (key && !normB.has(key)) normB.set(key, item.trim());
+  }
   if (normA.size === 0 || normB.size === 0) return { score: 0, shared: [] };
 
   const shared: string[] = [];
@@ -227,9 +271,17 @@ export function generateTechnicalIcebreakerDrafts(options: {
 }): string[] {
   const drafts: string[] = [];
   const { viewerProfile, targetTitle, targetProjects, sharedInterests, complementaryRoles, customPrompt } = options;
+  const viewerRolesLabel =
+    viewerProfile.preferredRoles.length > 0
+      ? viewerProfile.preferredRoles.join('/')
+      : 'flexible builder';
+  const viewerSkillsSnippet =
+    viewerProfile.skillTags.length > 0
+      ? viewerProfile.skillTags.slice(0, 3).join(', ')
+      : '';
 
   if (customPrompt) {
-    drafts.push(`Re "${customPrompt}" — I can cover ${viewerProfile.preferredRoles.join('/')} if we team up!`);
+    drafts.push(`Re "${customPrompt}" — I can cover ${viewerRolesLabel} if we team up!`);
   }
 
   if (targetProjects.length > 0) {
@@ -242,7 +294,9 @@ export function generateTechnicalIcebreakerDrafts(options: {
 
   if (complementaryRoles.length > 0) {
     drafts.push(
-      `I see you need ${complementaryRoles.join(' + ')}. I have worked with ${viewerProfile.skillTags.slice(0, 3).join(', ')} and would love to own that slice.`
+      viewerSkillsSnippet
+        ? `I see you bring ${complementaryRoles.slice(0, 2).join(' + ')}. I have worked with ${viewerSkillsSnippet} and would love to collaborate.`
+        : `I see you bring ${complementaryRoles.slice(0, 2).join(' + ')} — would love to team up and divide the build cleanly.`
     );
   }
 
@@ -253,8 +307,11 @@ export function generateTechnicalIcebreakerDrafts(options: {
   }
 
   if (drafts.length === 0) {
+    const firstName = targetTitle.split(' ')[0] || 'there';
     drafts.push(
-      `Hi ${targetTitle.split(' ')[0]}! Looking for focused collaborators for this hackathon — my main stack is ${viewerProfile.skillTags.slice(0, 3).join(', ')}.`
+      viewerSkillsSnippet
+        ? `Hi ${firstName}! Looking for focused collaborators for this hackathon — my main stack is ${viewerSkillsSnippet}.`
+        : `Hi ${firstName}! Looking for teammates for this hackathon — want to compare ideas and see if our roles fit?`
     );
   }
 
@@ -329,6 +386,7 @@ function normalizeControlledTag(tag: string): string {
 
 function normalizeRoleBucket(role: string): string {
   const lower = role.trim().toLowerCase();
+  if (/flexible|generalist|any/i.test(lower)) return 'Flexible';
   if (/front|react|ui\s*dev|web|next|tailwind/i.test(lower)) return 'Frontend / UI';
   if (/back|api|node|express|postgres|database|server|golang|rust/i.test(lower)) return 'Backend / APIs';
   if (/ai|ml|machine\s*learning|data|pytorch|llm|nlp|vision/i.test(lower)) return 'AI / ML';
@@ -338,6 +396,17 @@ function normalizeRoleBucket(role: string): string {
   if (/mobile|android|ios|flutter|kotlin|react\s*native/i.test(lower)) return 'Mobile';
   if (/system|cloud|devops|docker|kubernetes|infra/i.test(lower)) return 'Systems / Cloud';
   return role.trim();
+}
+
+export function isHackathonEligibleForMatching(hackathon: Hackathon): boolean {
+  return Boolean(
+    hackathon.matchable &&
+      hackathon.findTeammatesEligible !== false &&
+      hackathon.registrationStatus !== 'CLOSED' &&
+      hackathon.status !== 'completed' &&
+      hackathon.status !== 'archived' &&
+      hackathon.status !== 'registration_closed'
+  );
 }
 
 export function computeTeamCombinedCapabilities(params: {
@@ -552,7 +621,7 @@ function getEligibleCandidateUsers(params: {
     searchQuery,
   } = params;
 
-  if (!hackathon.matchable) return [];
+  if (!isHackathonEligibleForMatching(hackathon)) return [];
 
   const maxAllowedSize = Math.min(
     4,
@@ -764,7 +833,7 @@ export function countEligibleTeamsForHackathon(params: {
     searchQuery,
   } = params;
 
-  if (!hackathon.matchable) return 0;
+  if (!isHackathonEligibleForMatching(hackathon)) return 0;
 
   const blockedUids = new Set(
     blocks
@@ -1025,8 +1094,8 @@ export function rankPeopleForHackathon(params: {
     viewerSet.add(t);
   }
 
-  // Combined interests & domains of the viewer / viewer's team + hackathon themes
-  const viewerCombinedInterests = Array.from(
+  // Explicit viewer interests (excluding hackathon themes so we know whether viewer provided preferences)
+  const viewerExplicitInterests = Array.from(
     new Set([
       ...teamCaps.teamMemberUids.flatMap((uid) => [
         ...(profiles[uid]?.interestTags ?? []),
@@ -1034,9 +1103,21 @@ export function rankPeopleForHackathon(params: {
         ...(profiles[uid]?.topicsToExplore ?? []),
       ]),
       ...(viewerTeam?.desiredDomains ?? []),
+    ])
+  );
+
+  // Combined interests & domains of the viewer / viewer's team + hackathon themes
+  const viewerCombinedInterests = Array.from(
+    new Set([
+      ...viewerExplicitInterests,
       ...(hackathon.themes ?? []),
     ])
   );
+
+  const hasViewerSkillsOrRoles =
+    teamCaps.combinedSkills.length > 0 ||
+    teamCaps.combinedRoles.some((r) => r.toLowerCase() !== 'flexible');
+  const hasViewerInterests = viewerExplicitInterests.length > 0;
 
   const internalScores = new Map<string, number>();
   const scoredCards: { card: CandidateCard; score: number }[] = [];
@@ -1053,14 +1134,16 @@ export function rankPeopleForHackathon(params: {
     );
 
     // =========================================================================
-    // FACTOR A: SKILL COMPLEMENTARITY (45%)
-    // Evaluated against the combined skills and roles of the viewer's team (or viewer solo)
+    // FACTOR A: SKILL COMPLEMENTARITY (45% base)
+    // Evaluated against the combined skills and roles of the viewer's team (or viewer solo).
+    // Never treats missing information as a negative preference.
     // =========================================================================
     const complementarySkills = candidateSkills.filter(
       (sk) => !teamCaps.combinedNormalizedSkills.has(normalizeControlledTag(sk))
     );
     const complementaryRoles = candidateOfferedRoles.filter((r) => {
       const bucket = normalizeRoleBucket(r).toLowerCase();
+      if (bucket === 'flexible') return false;
       return (
         !teamCaps.combinedNormalizedRoles.has(bucket) ||
         teamCaps.missingRoles.some((mr) => mr.toLowerCase() === bucket)
@@ -1084,17 +1167,19 @@ export function rankPeopleForHackathon(params: {
     const newSkillRatio =
       candidateSkills.length > 0
         ? Math.min(1, complementarySkills.length / Math.min(3, Math.max(1, candidateSkills.length)))
-        : 0.35;
+        : 0.5; // Neutral baseline when candidate has not added skills yet
 
     const missingRoleFillRatio =
-      teamCaps.missingRoles.length > 0
+      candidateOfferedRoles.length === 0
+        ? 0.5 // Neutral baseline when candidate has not selected a role yet
+        : teamCaps.missingRoles.length > 0
         ? Math.min(
             1,
             complementaryRoles.length / Math.min(2, teamCaps.missingRoles.length)
           )
         : complementaryRoles.length > 0
         ? 0.75
-        : 0.4;
+        : 0.5;
 
     const themeSkillBonus = themeAlignedNewSkills.length > 0 ? 0.15 : 0;
 
@@ -1114,7 +1199,7 @@ export function rankPeopleForHackathon(params: {
     }
 
     // =========================================================================
-    // FACTOR B: SHARED INTERESTS & PROJECT THEMES (35%)
+    // FACTOR B: SHARED INTERESTS & PROJECT THEMES (35% base)
     // =========================================================================
     const candidateInterestsAndDomains = Array.from(
       new Set([
@@ -1137,13 +1222,19 @@ export function rankPeopleForHackathon(params: {
       precomputedCorpus
     );
 
-    const sharedInterestsScore = Math.min(
-      1,
-      0.6 * interestSim + 0.4 * Math.min(1, tfidfSim * 2.2)
-    );
+    // Neutral fallback if neither side supplied interests or rich text yet
+    const hasCandidateInterestData =
+      candidateInterestsAndDomains.length > 0 || candidateAbstract.trim().length > 0;
+    const sharedInterestsScore =
+      !hasCandidateInterestData || viewerCombinedInterests.length === 0
+        ? 0.5
+        : Math.min(
+            1,
+            0.6 * interestSim + 0.4 * Math.min(1, tfidfSim * 2.2)
+          );
 
     // =========================================================================
-    // FACTOR C: PAST SWIPE BEHAVIOR (20%)
+    // FACTOR C: PAST SWIPE BEHAVIOR (20% base)
     // =========================================================================
     const swipeAffinity = computePastSwipeAffinity({
       viewerUid,
@@ -1154,14 +1245,39 @@ export function rankPeopleForHackathon(params: {
       interests,
     });
 
-    const coldStartRedistributed = !swipeAffinity.hasSwipeHistory;
-    // When viewer has no prior swipes, redistribute the 20% weight proportionally:
-    // 0.45 / 0.80 = 0.5625 and 0.35 / 0.80 = 0.4375
-    const totalScore = coldStartRedistributed
-      ? 0.5625 * skillComplementarityScore + 0.4375 * sharedInterestsScore
-      : 0.45 * skillComplementarityScore +
-        0.35 * sharedInterestsScore +
-        0.20 * swipeAffinity.score;
+    // Dynamic weight redistribution when inputs are missing (cold-start or sparse quick profile)
+    let skillWeight = 0.45;
+    let interestWeight = 0.35;
+    let swipeWeight = swipeAffinity.hasSwipeHistory ? 0.20 : 0;
+
+    if (!hasViewerSkillsOrRoles && hasViewerInterests) {
+      // Viewer only provided interests: lean more heavily on shared interests without penalizing skills
+      skillWeight = 0.25;
+      interestWeight = 0.55;
+    } else if (hasViewerSkillsOrRoles && !hasViewerInterests) {
+      // Viewer only provided skills/roles: lean more heavily on complementarity
+      skillWeight = 0.58;
+      interestWeight = 0.22;
+    } else if (!hasViewerSkillsOrRoles && !hasViewerInterests) {
+      // Skipped onboarding: balanced neutral weights
+      skillWeight = 0.45;
+      interestWeight = 0.35;
+    }
+
+    const coldStartRedistributed =
+      !swipeAffinity.hasSwipeHistory ||
+      !hasViewerSkillsOrRoles ||
+      !hasViewerInterests;
+
+    const activeWeightSum = skillWeight + interestWeight + swipeWeight;
+    const normSkillW = skillWeight / activeWeightSum;
+    const normInterestW = interestWeight / activeWeightSum;
+    const normSwipeW = swipeWeight / activeWeightSum;
+
+    const totalScore =
+      normSkillW * skillComplementarityScore +
+      normInterestW * sharedInterestsScore +
+      normSwipeW * swipeAffinity.score;
 
     // =========================================================================
     // EXPLAINABLE RECOMMENDATION REASONS (Grounded, human-readable)
@@ -1179,7 +1295,9 @@ export function rankPeopleForHackathon(params: {
       reasons.push(
         isTeamContext
           ? `Complements your team: ${topNewSkills}`
-          : `Complements your skills: ${topNewSkills}`
+          : hasViewerSkillsOrRoles
+          ? `Complements your skills: ${topNewSkills}`
+          : `Skills: ${topNewSkills}`
       );
     } else if (complementaryRoles.length > 0) {
       reasons.push(
@@ -1190,7 +1308,13 @@ export function rankPeopleForHackathon(params: {
     }
 
     if (sharedInterests.length > 0) {
-      reasons.push(`Shared interest in ${sharedInterests.slice(0, 2).join(' & ')}`);
+      reasons.push(
+        hasViewerInterests
+          ? `Both interested in ${sharedInterests.slice(0, 2).join(' & ')}`
+          : `Interested in ${sharedInterests.slice(0, 2).join(' & ')}`
+      );
+    } else if (prof.interestTags.length > 0 && reasons.length < 2) {
+      reasons.push(`Interested in ${prof.interestTags.slice(0, 2).join(' & ')}`);
     } else if (prof.projectDomains.length > 0) {
       reasons.push(`Worked on ${prof.projectDomains.slice(0, 2).join(' & ')} projects`);
     }
@@ -1206,6 +1330,14 @@ export function rankPeopleForHackathon(params: {
       reasons.push(
         `Building with ${candidateTeam.name} (${candidateTeam.memberCount}/${cap} members)`
       );
+    }
+
+    if (reasons.length === 0) {
+      if (candidateOfferedRoles.length > 0) {
+        reasons.push(`Preferred role: ${candidateOfferedRoles[0]}`);
+      } else {
+        reasons.push(`Verified PESU student on ${user.campus}`);
+      }
     }
 
     const viewerAvail = viewerParticipation?.availabilityWindows ?? [];
@@ -1228,6 +1360,12 @@ export function rankPeopleForHackathon(params: {
 
     internalScores.set(user.uid, totalScore);
 
+    const subtitlePrefix =
+      prof.headline?.trim() ||
+      candidateOfferedRoles[0] ||
+      user.program ||
+      'PESU Student';
+
     scoredCards.push({
       score: totalScore,
       card: {
@@ -1235,7 +1373,7 @@ export function rankPeopleForHackathon(params: {
         type: 'person',
         hackathonId: hackathon.id,
         title: user.displayName,
-        subtitle: `${prof.headline} · ${user.campus}`,
+        subtitle: `${subtitlePrefix} · ${user.campus}`,
         campus: user.campus,
         isFirstTimeHacker: prof.isFirstTimeHacker,
         skills: candidateSkills.slice(0, 8),
@@ -1502,8 +1640,7 @@ export function rankTeamsForHackathon(params: {
       team.desiredDomains
     );
 
-    const effectiveThemeSim = Math.max(tfidfSim, domainSim, specMatch.score);
-    const score = 0.45 * combinedRoleSpecScore + 0.35 * domainSim + 0.20 * effectiveThemeSim;
+    const score = 0.45 * combinedRoleSpecScore + 0.3 * domainSim + 0.25 * tfidfSim;
 
     const reasons: string[] = [];
     if (specMatch.matchedOriginalLabels.length > 0) {

@@ -81,12 +81,15 @@ export interface User {
   personaLabel: string;
   createdAt: string;
   accountStatus: 'active' | 'suspended';
+  needsDisplayNameSetup?: boolean;
   privacyPreferences: {
     profileVisible: boolean;
     githubConsent: boolean;
     aiEnrichmentConsent: boolean;
     academyAnnouncementsOptIn: boolean;
     academyTimetableOptIn: boolean;
+    onboardingCompleted?: boolean;
+    customDisplayNameSet?: boolean;
   };
 }
 

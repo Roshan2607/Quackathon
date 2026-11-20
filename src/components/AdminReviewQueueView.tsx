@@ -20,8 +20,10 @@ import {
   ChevronDown,
   ChevronUp,
   ArrowLeft,
+  RefreshCw,
 } from 'lucide-react';
 import { verifyLiveEventUrl } from '../services/adapters';
+import { apiFetch } from '../lib/apiClient';
 
 interface AdminReviewQueueViewProps {
   currentUser: User;
@@ -47,6 +49,8 @@ interface AdminReviewQueueViewProps {
     reportId: string,
     resolution: 'resolved_dismissed' | 'resolved_actioned'
   ) => void;
+  onRefreshCatalog?: () => Promise<void> | void;
+  onNotify?: (message: string) => void;
   onBackToApp?: () => void;
 }
 
@@ -61,11 +65,41 @@ export const AdminReviewQueueView: React.FC<AdminReviewQueueViewProps> = React.m
     onMergeDuplicateCandidate,
     onApplySourceDiffCandidate,
     onResolveReport,
+    onRefreshCatalog,
+    onNotify,
     onBackToApp,
   }) => {
     const [activeSection, setActiveSection] = useState<
       'EVENTS' | 'REPORTS' | 'AUDIT'
     >('EVENTS');
+    const [isSyncingPublic, setIsSyncingPublic] = useState(false);
+
+    const handleSyncEventsPesEdu = async () => {
+      setIsSyncingPublic(true);
+      try {
+        const res = await apiFetch<{ ok?: boolean; userMessage?: string }>(
+          '/api/events/sync-pesu-public',
+          {
+            method: 'POST',
+          }
+        );
+        const data = res.data;
+        if (res.ok && data?.ok) {
+          await onRefreshCatalog?.();
+          onNotify?.(data.userMessage || 'Synced public events from events.pes.edu.');
+        } else {
+          onNotify?.(
+            data?.userMessage ||
+              res.errorMessage ||
+              'Could not sync events.pes.edu right now.'
+          );
+        }
+      } catch {
+        onNotify?.('Failed to reach public events sync endpoint.');
+      } finally {
+        setIsSyncingPublic(false);
+      }
+    };
     const [editingId, setEditingId] = useState<string | null>(null);
     const [expandedDetailIds, setExpandedDetailIds] = useState<
       Record<string, boolean>
@@ -173,40 +207,52 @@ export const AdminReviewQueueView: React.FC<AdminReviewQueueViewProps> = React.m
             </div>
           </div>
 
-          <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              onClick={() => setActiveSection('EVENTS')}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
-                activeSection === 'EVENTS'
-                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
+              disabled={isSyncingPublic}
+              onClick={() => void handleSyncEventsPesEdu()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 text-xs font-semibold text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
             >
-              Event Queue ({pendingCandidatesCount})
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncingPublic ? 'animate-spin' : ''}`} />
+              <span>Sync events.pes.edu</span>
             </button>
-            <button
-              type="button"
-              onClick={() => setActiveSection('REPORTS')}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
-                activeSection === 'REPORTS'
-                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              Reports ({openReportsCount})
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveSection('AUDIT')}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
-                activeSection === 'AUDIT'
-                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              Audit Log ({auditLogs.length})
-            </button>
+
+            <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
+              <button
+                type="button"
+                onClick={() => setActiveSection('EVENTS')}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+                  activeSection === 'EVENTS'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Event Queue ({pendingCandidatesCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveSection('REPORTS')}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+                  activeSection === 'REPORTS'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Reports ({openReportsCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveSection('AUDIT')}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+                  activeSection === 'AUDIT'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Audit Log ({auditLogs.length})
+              </button>
+            </div>
           </div>
         </div>
 

@@ -31,6 +31,7 @@ import {
 import {
   computeInterestCircles,
   computeTeamCombinedCapabilities,
+  isHackathonEligibleForMatching,
   rankPeopleForHackathon,
 } from '../services/matchingEngine';
 import { AVAILABILITY_WINDOWS, ROLE_TAXONOMY } from '../data/seedData';
@@ -66,6 +67,7 @@ interface DiscoverViewProps {
   onResetPassedCards: (hackathonId: string) => void;
   onBlockUser: (targetUid: string) => void;
   onOpenMyTeam?: () => void;
+  onOpenProfile?: () => void;
 }
 
 const SWIPE_THRESHOLD_PX = 85;
@@ -88,6 +90,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
     onResetPassedCards,
     onBlockUser,
     onOpenMyTeam,
+    onOpenProfile,
   }) => {
     const [selectedCircleId, setSelectedCircleId] = useState<string>('ALL');
     const [roleFilter, setRoleFilter] = useState<string>('ALL');
@@ -314,18 +317,23 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
 
     if (!selectedHackathon) {
       return (
-        <div className="p-10 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-center space-y-2">
+        <div className="p-10 bg-white border border-slate-200 rounded-2xl text-center space-y-2">
           <Users className="w-8 h-8 text-slate-400 mx-auto" />
-          <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-            No hackathons published yet
+          <h2 className="text-base font-bold text-slate-900">
+            No upcoming hackathons available
           </h2>
-          <p className="text-xs text-slate-500 max-w-md mx-auto">
-            Open the Events tab to sync public PESU events or submit a campus
-            hackathon to start matching with fellow students.
+          <p className="text-sm text-slate-500 max-w-md mx-auto">
+            Browse the Hackathons tab or suggest an upcoming campus hackathon to start finding teammates.
           </p>
         </div>
       );
     }
+
+    const viewerProfileRecord = profiles[currentUser.uid];
+    const isSparseViewerProfile =
+      (viewerProfileRecord?.skillTags?.length ?? 0) === 0 &&
+      (viewerProfileRecord?.interestTags?.length ?? 0) === 0;
+    const isEventMatchable = isHackathonEligibleForMatching(selectedHackathon);
 
     const handleToggleRole = (role: string) => {
       const currentRoles = viewerParticipation?.desiredRoles ?? ['Backend'];
@@ -364,6 +372,35 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
 
     return (
       <div className="space-y-5">
+        {isSparseViewerProfile && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-200/80 bg-indigo-50/60 px-4 py-3 text-xs text-indigo-950">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-indigo-600 shrink-0" />
+              <span>
+                Add a few interests, skills, or a preferred role in your profile to get stronger teammate recommendations.
+              </span>
+            </div>
+            {onOpenProfile && (
+              <button
+                type="button"
+                onClick={onOpenProfile}
+                className="font-semibold text-indigo-700 hover:text-indigo-900 underline cursor-pointer shrink-0"
+              >
+                Update Profile
+              </button>
+            )}
+          </div>
+        )}
+
+        {!isEventMatchable && (
+          <div className="flex items-center gap-2.5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>
+              Registration is closed or this event has ended. New teammate matching is disabled — choose an upcoming hackathon to find teammates.
+            </span>
+          </div>
+        )}
+
         {/* Top Student Discovery Header: Hackathon Context + Search & Filters */}
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-3.5">
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
@@ -383,11 +420,14 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
                 onChange={(e) => onSelectHackathon(e.target.value)}
                 className="text-xs sm:text-sm font-semibold bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-1.5 text-slate-900 dark:text-slate-100 cursor-pointer max-w-xs sm:max-w-md truncate"
               >
-                {hackathons.map((h) => (
-                  <option key={h.id} value={h.id}>
-                    {h.name} {!h.matchable ? '(Workshop / Non-team)' : ''}
-                  </option>
-                ))}
+                {hackathons.map((h) => {
+                  const eligible = isHackathonEligibleForMatching(h);
+                  return (
+                    <option key={h.id} value={h.id}>
+                      {h.name} {!eligible ? '(Closed / Ended)' : ''}
+                    </option>
+                  );
+                })}
               </select>
             </div>
 

@@ -50,6 +50,12 @@ import {
   validateAndTransformPaashaHackathon,
 } from '../lib/eventsAndAnnouncements.ts';
 import { isSyntheticTestHackathonRecord } from './testCleanup.ts';
+import {
+  chooseUpsertDisplayName,
+  formatSafePublicDisplayName,
+  isPlaceholderOrIdentifierDisplayName,
+  normalizeHumanDisplayName,
+} from '../lib/displayName.ts';
 
 export async function ensureMatchingAndTeamSchema(): Promise<void> {
   // Tables team_proposals, team_proposal_votes, team_registrations, and user_blocks
@@ -107,9 +113,14 @@ const DEFAULT_PRIVACY: User['privacyPreferences'] = {
 };
 
 export function mapDbUserToDomain(row: typeof schema.users.$inferSelect): User {
+  const safeDisplayName = formatSafePublicDisplayName(row.displayName);
+  const needsDisplayNameSetup = isPlaceholderOrIdentifierDisplayName(
+    row.displayName
+  );
   return {
     uid: row.uid,
-    displayName: row.displayName,
+    displayName: safeDisplayName,
+    needsDisplayNameSetup,
     campus: (row.campus as CampusType) || 'RR Campus',
     program: row.program ?? 'B.Tech CSE',
     graduationYear: row.graduationYear ?? 2027,
@@ -420,20 +431,11 @@ export function mapDbCandidateToDomain(
   };
 }
 
-export function isPesuSrnOrPrn(val: unknown): boolean {
-  if (typeof val !== 'string') return false;
-  const s = val.trim().toUpperCase();
-  if (!s) return false;
-  if (/^PES[12]?(UG|PG)?[0-9]{2}[A-Z]{2}[0-9]{3,5}$/i.test(s)) return true;
-  if (/^PES[0-9]{8,12}$/i.test(s)) return true;
-  if (/^PES[0-9A-Z_-]{8,16}$/i.test(s) && /\d{3,}/.test(s)) return true;
-  return false;
-}
-
 export async function upsertUserAndProfile(params: {
   uid: string;
   email: string;
   displayName: string;
+  verifiedHumanName?: boolean;
   campus?: CampusType;
   program?: string;
   graduationYear?: number;
@@ -448,44 +450,34 @@ export async function upsertUserAndProfile(params: {
     const resolvedSub =
       params.pesuOidcSub ?? params.pesPrnOrSrn ?? 'UNVERIFIED';
 
-    // Check if user already exists to preserve custom chosen display name across logins
     const existingUsers = await db
       .select()
       .from(schema.users)
       .where(eq(schema.users.uid, params.uid));
-    const existingUser = existingUsers[0];
+    const existingUserRow = existingUsers[0];
+    const existingPrivacy = existingUserRow
+      ? safeJsonParse<Partial<User['privacyPreferences']>>(
+          existingUserRow.privacyPreferencesJson,
+          {}
+        )
+      : {};
 
-    let targetDisplayName = params.displayName;
-    if (existingUser) {
-      const currentName = existingUser.displayName?.trim();
-      const isParamSrn = isPesuSrnOrPrn(params.displayName);
-      const isParamPlaceholder =
-        !params.displayName || params.displayName === 'PES Student' || isParamSrn;
-      const isCurrentValidHuman =
-        Boolean(currentName && !isPesuSrnOrPrn(currentName) && currentName !== 'PES Student');
-
-      if (isCurrentValidHuman) {
-        // Preserve a student's chosen display name across future logins
-        targetDisplayName = currentName;
-      } else if (!isParamPlaceholder && !isParamSrn) {
-        targetDisplayName = params.displayName.trim();
-      } else {
-        targetDisplayName = 'PES Student';
-      }
-    } else {
-      if (!params.displayName || isPesuSrnOrPrn(params.displayName)) {
-        targetDisplayName = 'PES Student';
-      } else {
-        targetDisplayName = params.displayName.trim();
-      }
-    }
+    const displayNameChoice = chooseUpsertDisplayName({
+      existingDisplayName: existingUserRow?.displayName,
+      existingCustomDisplayNameSet: Boolean(
+        existingPrivacy.customDisplayNameSet
+      ),
+      incomingDisplayName: params.displayName,
+      incomingVerifiedHumanName: params.verifiedHumanName,
+    });
+    const resolvedDisplayName = displayNameChoice.displayName;
 
     const [userRow] = await db
       .insert(schema.users)
       .values({
         uid: params.uid,
         email: params.email,
-        displayName: targetDisplayName,
+        displayName: resolvedDisplayName,
         campus: params.campus ?? 'RR Campus',
         program: params.program ?? 'B.Tech CSE',
         graduationYear: params.graduationYear ?? 2027,
@@ -499,7 +491,7 @@ export async function upsertUserAndProfile(params: {
         target: schema.users.uid,
         set: {
           email: params.email,
-          displayName: targetDisplayName,
+          displayName: resolvedDisplayName,
           pesuOidcSub: resolvedSub,
           updatedAt: now,
         },
@@ -517,24 +509,19 @@ export async function upsertUserAndProfile(params: {
         .insert(schema.profiles)
         .values({
           uid: params.uid,
-          headline: `${params.program ?? 'B.Tech'} Builder at PES University (${
-            params.campus ?? 'RR Campus'
-          })`,
+          headline: '',
           about: '',
           skillTagsJson: JSON.stringify([]),
-          interestTagsJson: JSON.stringify(['Applied AI/ML', 'Developer Tools']),
-          projectDomainsJson: JSON.stringify([
-            'Applied AI/ML',
-            'Developer Tools',
-          ]),
+          interestTagsJson: JSON.stringify([]),
+          projectDomainsJson: JSON.stringify([]),
           topicsToExploreJson: JSON.stringify([]),
           hackathonGoalsJson: JSON.stringify([]),
           portfolioLinksJson: JSON.stringify([]),
-          preferredRolesJson: JSON.stringify(['Generalist']),
+          preferredRolesJson: JSON.stringify([]),
           rolesWantToLearnJson: JSON.stringify([]),
-          workingStyleTagsJson: JSON.stringify(['Fast prototyping']),
+          workingStyleTagsJson: JSON.stringify([]),
           featuredProjectsJson: JSON.stringify([]),
-          isFirstTimeHacker: true,
+          isFirstTimeHacker: false,
           visibility: 'public_verified_students',
           updatedAt: now,
         })
@@ -562,16 +549,11 @@ export async function getUserAndProfileByUid(
   uid: string
 ): Promise<{ user: User; profile: Profile } | null> {
   try {
-    const userRows = await db
-      .select()
-      .from(schema.users)
-      .where(eq(schema.users.uid, uid));
+    const [userRows, profileRows] = await Promise.all([
+      db.select().from(schema.users).where(eq(schema.users.uid, uid)),
+      db.select().from(schema.profiles).where(eq(schema.profiles.uid, uid)),
+    ]);
     if (userRows.length === 0) return null;
-
-    const profileRows = await db
-      .select()
-      .from(schema.profiles)
-      .where(eq(schema.profiles.uid, uid));
 
     const user = mapDbUserToDomain(userRows[0]);
     if (profileRows.length === 0) {
@@ -615,27 +597,32 @@ export async function updateUserProfileAndPrivacy(params: {
       ...(params.privacyPreferences ?? {}),
     };
 
-    const userSetFields: Record<string, unknown> = {
+    const userUpdateSet: Partial<typeof schema.users.$inferInsert> = {
       privacyPreferencesJson: JSON.stringify(mergedPrivacy),
       updatedAt: now,
     };
 
-    if (typeof params.displayName === 'string') {
-      const trimmed = params.displayName.trim();
-      if (trimmed && !isPesuSrnOrPrn(trimmed)) {
-        userSetFields.displayName = trimmed;
+    if (params.displayName !== undefined) {
+      const normalized = normalizeHumanDisplayName(params.displayName);
+      if (!normalized) {
+        throw new Error(
+          'VALIDATION_ERROR: Please enter a valid display name (cannot be empty, an SRN/PRN, or an email address).'
+        );
       }
+      mergedPrivacy.customDisplayNameSet = true;
+      userUpdateSet.displayName = normalized;
+      userUpdateSet.privacyPreferencesJson = JSON.stringify(mergedPrivacy);
     }
 
     const [updatedUserRow] = await db
       .update(schema.users)
-      .set(userSetFields)
+      .set(userUpdateSet)
       .where(eq(schema.users.uid, params.uid))
       .returning();
 
     const p = params.profile;
 
-    // A client may omit fields during partial profile updates. Preserve stored values.
+    // A client may omit fields during partial profile updates. Preserve stored values without inventing defaults.
     const existingProfileRows = await db
       .select()
       .from(schema.profiles)
@@ -643,9 +630,9 @@ export async function updateUserProfileAndPrivacy(params: {
     const existing = existingProfileRows[0];
 
     const headline =
-      typeof p.headline === 'string' && p.headline.trim()
+      typeof p.headline === 'string'
         ? p.headline.trim()
-        : existingP?.headline ?? 'PES University Builder';
+        : existingP?.headline ?? '';
     const about =
       typeof p.about === 'string' ? p.about : existingP?.about ?? '';
     const skillTags = Array.isArray(p.skillTags)
@@ -653,18 +640,18 @@ export async function updateUserProfileAndPrivacy(params: {
       : existingP?.skillTags ?? [];
     const interestTags = Array.isArray(p.interestTags)
       ? p.interestTags
-      : existingP?.interestTags ?? ['Applied AI/ML', 'Developer Tools'];
+      : existingP?.interestTags ?? [];
     const preferredRoles = Array.isArray(p.preferredRoles)
       ? p.preferredRoles
-      : existingP?.preferredRoles ?? ['Generalist'];
+      : existingP?.preferredRoles ?? [];
     const rolesWantToLearn = Array.isArray(p.rolesWantToLearn)
       ? p.rolesWantToLearn
       : existingP?.rolesWantToLearn ?? [];
     const workingStyleTags = Array.isArray(p.workingStyleTags)
       ? p.workingStyleTags
-      : existingP?.workingStyleTags ?? ['Fast prototyping'];
+      : existingP?.workingStyleTags ?? [];
     const featuredProjects = Array.isArray(p.featuredProjects)
-      ? p.featuredProjects
+      ? p.featuredProjects.slice(0, 3)
       : existingP?.featuredProjects ?? [];
     const githubUsername =
       p.githubUsername !== undefined
@@ -758,6 +745,9 @@ export async function updateUserProfileAndPrivacy(params: {
       profile: mapDbProfileToDomain(updatedProfileRow),
     };
   } catch (error) {
+    if (error instanceof Error && error.message.startsWith('VALIDATION_ERROR:')) {
+      throw error;
+    }
     console.error('Database error in updateUserProfileAndPrivacy:', error);
     throw new Error('Failed to save profile updates.', { cause: error });
   }
@@ -1542,7 +1532,29 @@ export async function revokeOAuthSessionRecord(
   }
 }
 
-export async function loadBootstrapData(viewerUid?: string | null): Promise<{
+export function assertHackathonEligibleForTeamFormation(
+  hackRow: typeof schema.hackathons.$inferSelect | undefined
+): void {
+  if (!hackRow) return;
+  const mapped = mapDbHackathonToDomain(hackRow);
+  const ineligible =
+    !mapped.matchable ||
+    mapped.findTeammatesEligible === false ||
+    mapped.registrationStatus === 'CLOSED' ||
+    mapped.status === 'archived' ||
+    mapped.status === 'completed' ||
+    mapped.status === 'registration_closed';
+  if (ineligible) {
+    throw new Error(
+      'INELIGIBLE_EVENT: Registration is closed or this event has already ended. New teammate matching and team creation are disabled.'
+    );
+  }
+}
+
+export async function loadBootstrapData(
+  viewerUid?: string | null,
+  options?: { scope?: 'initial' | 'full' }
+): Promise<{
   users: User[];
   profiles: Record<string, Profile>;
   hackathons: Hackathon[];
@@ -1557,10 +1569,14 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
   teamProposals: TeamProposal[];
   teamRegistrations: Record<string, TeamRegistration>;
   blocks: BlockRecord[];
+  scope: 'initial' | 'full';
 }> {
   try {
     await ensureMatchingAndTeamSchema();
-    const hasViewer = Boolean(viewerUid);
+    const scope: 'initial' | 'full' =
+      options?.scope === 'initial' ? 'initial' : 'full';
+    const isInitialScope = scope === 'initial';
+
     const [
       userRows,
       profileRows,
@@ -1584,42 +1600,48 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
         .select()
         .from(schema.hackathons)
         .orderBy(desc(schema.hackathons.createdAt)),
-      db
-        .select()
-        .from(schema.eventCandidates)
-        .orderBy(desc(schema.eventCandidates.createdAt)),
+      isInitialScope
+        ? Promise.resolve([] as (typeof schema.eventCandidates.$inferSelect)[])
+        : db
+            .select()
+            .from(schema.eventCandidates)
+            .orderBy(desc(schema.eventCandidates.createdAt)),
       db.select().from(schema.participations),
       db.select().from(schema.teams).orderBy(desc(schema.teams.createdAt)),
       db.select().from(schema.memberships),
-      hasViewer
-        ? db
+      isInitialScope
+        ? Promise.resolve([] as (typeof schema.joinRequests.$inferSelect)[])
+        : db
             .select()
             .from(schema.joinRequests)
-            .orderBy(desc(schema.joinRequests.createdAt))
-        : Promise.resolve([]),
-      hasViewer ? db.select().from(schema.swipes) : Promise.resolve([]),
-      hasViewer
-        ? db
+            .orderBy(desc(schema.joinRequests.createdAt)),
+      db.select().from(schema.swipes),
+      isInitialScope
+        ? Promise.resolve([] as (typeof schema.conversations.$inferSelect)[])
+        : db
             .select()
             .from(schema.conversations)
-            .orderBy(desc(schema.conversations.lastMessageAt))
-        : Promise.resolve([]),
-      hasViewer
-        ? db.select().from(schema.messages).orderBy(schema.messages.createdAt)
-        : Promise.resolve([]),
-      hasViewer
-        ? db
+            .orderBy(desc(schema.conversations.lastMessageAt)),
+      isInitialScope
+        ? Promise.resolve([] as (typeof schema.messages.$inferSelect)[])
+        : db.select().from(schema.messages).orderBy(schema.messages.createdAt),
+      isInitialScope
+        ? Promise.resolve([] as (typeof schema.teamProposals.$inferSelect)[])
+        : db
             .select()
             .from(schema.teamProposals)
-            .orderBy(desc(schema.teamProposals.createdAt))
-        : Promise.resolve([]),
-      hasViewer
-        ? db.select().from(schema.teamProposalVotes)
-        : Promise.resolve([]),
-      db.select().from(schema.teamRegistrations),
-      hasViewer
-        ? db.select().from(schema.userBlocks)
-        : Promise.resolve([]),
+            .orderBy(desc(schema.teamProposals.createdAt)),
+      isInitialScope
+        ? Promise.resolve(
+            [] as (typeof schema.teamProposalVotes.$inferSelect)[]
+          )
+        : db.select().from(schema.teamProposalVotes),
+      isInitialScope
+        ? Promise.resolve(
+            [] as (typeof schema.teamRegistrations.$inferSelect)[]
+          )
+        : db.select().from(schema.teamRegistrations),
+      db.select().from(schema.userBlocks),
     ]);
 
     const allUsers = userRows.map(mapDbUserToDomain);
@@ -1639,13 +1661,23 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
     }
 
     // Filter public discoverable users & profiles (always include the viewer's own profile)
-    const users = allUsers.filter(
-      (u) =>
-        u.uid === viewerUid ||
-        (u.accountStatus === 'active' &&
-          u.privacyPreferences?.profileVisible !== false &&
-          allProfiles[u.uid]?.visibility !== 'hidden')
-    );
+    // Mask pesuOidcSub on non-viewer records so verified SRNs/PRNs never leak to other students.
+    const users = allUsers
+      .filter(
+        (u) =>
+          u.uid === viewerUid ||
+          (u.accountStatus === 'active' &&
+            u.privacyPreferences?.profileVisible !== false &&
+            allProfiles[u.uid]?.visibility !== 'hidden')
+      )
+      .map((u) =>
+        u.uid === viewerUid
+          ? u
+          : {
+              ...u,
+              pesuOidcSub: 'VERIFIED',
+            }
+      );
 
     const profiles: Record<string, Profile> = {};
     for (const u of users) {
@@ -1944,6 +1976,7 @@ export async function loadBootstrapData(viewerUid?: string | null): Promise<{
       teamProposals,
       teamRegistrations,
       blocks,
+      scope,
     };
   } catch (error) {
     console.error('Database error in loadBootstrapData:', error);
@@ -1965,6 +1998,14 @@ export async function upsertParticipationRecord(params: {
   discoverable: boolean;
 }): Promise<Participation> {
   try {
+    if (params.discoverable !== false) {
+      const hackRows = await db
+        .select()
+        .from(schema.hackathons)
+        .where(eq(schema.hackathons.slug, params.hackathonSlug));
+      assertHackathonEligibleForTeamFormation(hackRows[0]);
+    }
+
     const participationKey = `${params.hackathonSlug}_${params.uid}`;
     const now = new Date();
     const [row] = await db
@@ -2014,6 +2055,12 @@ export async function upsertParticipationRecord(params: {
       updatedAt: row.updatedAt.toISOString(),
     };
   } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith('INELIGIBLE_EVENT:')
+    ) {
+      throw error;
+    }
     console.error('Database error in upsertParticipationRecord:', error);
     throw new Error('Failed to save hackathon participation.', {
       cause: error,
@@ -3642,19 +3689,7 @@ export async function createTeamWithLeaderRecord(params: {
       .from(schema.hackathons)
       .where(eq(schema.hackathons.slug, params.hackathonSlug));
     const hack = hackRows[0];
-    if (!hack) {
-      throw new Error('EVENT_NOT_FOUND: Hackathon not found.');
-    }
-    if (!hack.matchable) {
-      throw new Error('EVENT_NOT_MATCHABLE: This event is not eligible for team formation.');
-    }
-    if (hack.registrationDeadline && new Date(hack.registrationDeadline).getTime() < Date.now()) {
-      throw new Error('EVENT_REGISTRATION_CLOSED: Registration for this event has closed.');
-    }
-    if (hack.endAt && new Date(hack.endAt).getTime() < Date.now()) {
-      throw new Error('EVENT_ENDED: This event has ended.');
-    }
-
+    assertHackathonEligibleForTeamFormation(hack);
     const maxCap = Math.min(
       4,
       hack?.maxTeamSize != null && hack.maxTeamSize > 0 ? hack.maxTeamSize : 4
@@ -3795,7 +3830,7 @@ export async function createTeamWithLeaderRecord(params: {
     if (
       error instanceof Error &&
       (error.message.startsWith('ALREADY_IN_TEAM:') ||
-        error.message.startsWith('EVENT_'))
+        error.message.startsWith('INELIGIBLE_EVENT:'))
     ) {
       throw error;
     }
@@ -3854,30 +3889,8 @@ export async function recordSwipeAndProcessMatchRecord(params: {
       .from(schema.hackathons)
       .where(eq(schema.hackathons.slug, params.hackathonSlug));
     const hack = hackRows[0];
-    if (!hack) {
-      throw new Error('INELIGIBLE_EVENT: Hackathon not found.');
-    }
-    if (
-      !hack.matchable ||
-      hack.status === 'archived' ||
-      hack.status === 'completed'
-    ) {
-      throw new Error(
-        'INELIGIBLE_EVENT: Team matching is not active for this event.'
-      );
-    }
+    assertHackathonEligibleForTeamFormation(hack);
 
-    if (params.decision === 'interested') {
-      if (!hack.matchable) {
-        throw new Error('EVENT_NOT_MATCHABLE: This event is not eligible for teammate matching.');
-      }
-      if (hack.registrationDeadline && new Date(hack.registrationDeadline).getTime() < Date.now()) {
-        throw new Error('EVENT_REGISTRATION_CLOSED: Registration for this event has closed.');
-      }
-      if (hack.endAt && new Date(hack.endAt).getTime() < Date.now()) {
-        throw new Error('EVENT_ENDED: This event has ended.');
-      }
-    }
     const swipeKey = `${params.hackathonSlug}_${params.fromUid}_${params.targetType}_${params.targetId}`;
     const [swipeRow] = await db
       .insert(schema.swipes)
@@ -4521,10 +4534,9 @@ export async function recordSwipeAndProcessMatchRecord(params: {
     console.error('Database error in recordSwipeAndProcessMatchRecord:', error);
     if (
       error instanceof Error &&
-      (/^(TEAM_FULL|SELF_SWIPE|BLOCKED_USER|INELIGIBLE_EVENT):/.test(
+      /^(TEAM_FULL|SELF_SWIPE|BLOCKED_USER|INELIGIBLE_EVENT):/.test(
         error.message
-      ) ||
-        error.message.startsWith('EVENT_'))
+      )
     ) {
       throw error;
     }

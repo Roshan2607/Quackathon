@@ -12,8 +12,8 @@ import {
   ChevronDown,
   Compass,
   ExternalLink,
+  Loader2,
   Lock,
-  LogIn,
   LogOut,
   MessageSquare,
   ShieldCheck,
@@ -21,14 +21,14 @@ import {
   UserCircle,
   Users,
 } from 'lucide-react';
-import { signInWithPopup, signOut } from 'firebase/auth';
-import { auth, googleAuthProvider } from './lib/firebase';
+import { signOut } from 'firebase/auth';
+import { auth } from './lib/firebase';
 import {
   apiFetch,
-  getApiClientAuthToken,
   setApiClientAuthToken,
 } from './lib/apiClient';
 import { startPesuOAuthSignIn } from './services/adapters';
+import { isHackathonEligibleForMatching } from './services/matchingEngine';
 import {
   AuditLog,
   BlockRecord,
@@ -61,6 +61,8 @@ import { TeamsAndRequestsView } from './components/TeamsAndRequestsView';
 import { OnboardingAndProfileModal } from './components/OnboardingAndProfileModal';
 import { AdminReviewQueueView } from './components/AdminReviewQueueView';
 import { IntegrationTestingView } from './components/IntegrationTestingView';
+import { LoginPage } from './components/LoginPage';
+import { QuickOnboardingView } from './components/QuickOnboardingView';
 
 type NavTab =
   | 'discover'
@@ -71,10 +73,27 @@ type NavTab =
   | 'admin'
   | 'integrations';
 
+type AuthStatus = 'checking' | 'authenticated' | 'unauthenticated';
+
+const POST_AUTH_HASH_KEY = 'quackathon_post_auth_hash';
+
+function logClientAuthTiming(
+  stage: string,
+  durationMs: number,
+  meta?: Record<string, string | number | boolean>
+): void {
+  if (!import.meta.env.DEV) return;
+  console.info('[quackathon-auth-timing]', {
+    stage,
+    durationMs: Math.round(durationMs),
+    ...(meta ?? {}),
+  });
+}
+
 const GUEST_USER: User = {
   uid: 'guest_unauthenticated',
-  displayName: 'PES Student',
-  personaLabel: 'PES University Student',
+  displayName: 'Guest Student',
+  personaLabel: 'Sign in with PESU or Google',
   campus: 'RR Campus',
   program: 'PES University',
   graduationYear: 2028,
@@ -135,67 +154,6 @@ interface BootstrapPayload {
   blocks?: string[];
 }
 
-const LoginPage: React.FC<{
-  onSignInWithPesu: () => void;
-  isSigningIn: boolean;
-  toastMessage: string | null;
-}> = ({ onSignInWithPesu, isSigningIn, toastMessage }) => {
-  return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col justify-center items-center px-4 sm:px-6 lg:px-8 py-12">
-      {toastMessage && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="fixed bottom-4 right-4 z-50 max-w-md bg-slate-900 text-white px-4 py-3 rounded-xl shadow-lg border border-slate-700 flex items-center gap-2.5 text-xs font-medium"
-        >
-          <Bell className="w-4 h-4 text-amber-400 shrink-0" />
-          <span>{toastMessage}</span>
-        </div>
-      )}
-      <div className="max-w-md w-full text-center space-y-8 bg-white dark:bg-slate-900 p-8 sm:p-10 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-xl shadow-slate-100 dark:shadow-none">
-        {/* Quackathon Logo */}
-        <div className="flex flex-col items-center gap-2">
-          <div className="w-16 h-16 rounded-2xl bg-amber-400 text-slate-950 flex items-center justify-center text-3xl shadow-md select-none border border-amber-300">
-            🦆
-          </div>
-          <span className="text-base font-extrabold tracking-tight text-slate-800 dark:text-slate-200">
-            Quackathon
-          </span>
-        </div>
-
-        {/* Heading & One-Sentence Description */}
-        <div className="space-y-3">
-          <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-slate-900 dark:text-slate-100">
-            Find your next hackathon team.
-          </h1>
-          <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed max-w-sm mx-auto">
-            Connect with complementary builders, join open teams, and discover verified PES University hackathons.
-          </p>
-        </div>
-
-        {/* Primary Action Button */}
-        <div className="pt-2 space-y-4">
-          <button
-            type="button"
-            disabled={isSigningIn}
-            onClick={() => onSignInWithPesu()}
-            className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <LogIn className="w-4 h-4" />
-            <span>{isSigningIn ? 'Connecting to PESU OAuth...' : 'Continue with PESU'}</span>
-          </button>
-
-          {/* Small University Authentication Reassurance */}
-          <div className="flex items-center justify-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
-            <ShieldCheck className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-            <span>Verified PES University student access via PESU OAuth2.</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-};
-
 export function App() {
   const getInitialTab = (): NavTab => {
     const hash = window.location.hash;
@@ -204,22 +162,22 @@ export function App() {
     if (hash === '#/profile') return 'profile';
     if (hash === '#/hackathons' || hash === '#/events') return 'hackathons';
     if (hash === '#/matches') return 'matches';
-    if (hash === '#/team' || hash === '#/my-team' || hash === '#/teams') return 'my_team';
+    if (hash === '#/team' || hash === '#/my-team') return 'my_team';
     return 'discover';
   };
 
   const [activeTab, setActiveTab] = useState<NavTab>(getInitialTab);
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('live');
+  const [authStatus, setAuthStatus] = useState<AuthStatus>('checking');
+  const [authError, setAuthError] = useState<string | null>(null);
   const [authenticatedUser, setAuthenticatedUser] = useState<User | null>(null);
-  const [isRestoringSession, setIsRestoringSession] = useState<boolean>(true);
-  const [hasDismissedQuickSetup, setHasDismissedQuickSetup] = useState<boolean>(false);
   const [selectedHackathonId, setSelectedHackathonId] = useState<string>('');
   const [discoveryMode, setDiscoveryMode] = useState<DiscoveryMode>('people');
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showAccountMenu, setShowAccountMenu] = useState(false);
   const [isSigningIn, setIsSigningIn] = useState(false);
 
-  // Real Domain State
+  // Real Domain State (Zero Synthetic Seed Data)
   const [users, setUsers] = useState<User[]>([]);
   const [profiles, setProfiles] = useState<Record<string, Profile>>({});
   const [hackathons, setHackathons] = useState<Hackathon[]>([]);
@@ -262,6 +220,11 @@ export function App() {
   const pesuPopupPollRef = useRef<number | null>(null);
   const activeOAuthStateRef = useRef<string | null>(null);
   const handledOAuthStatesRef = useRef<Set<string>>(new Set());
+  const fullBootstrapLoadedRef = useRef<boolean>(false);
+  const appBootTimeRef = useRef<number>(
+    typeof performance !== 'undefined' ? performance.now() : 0
+  );
+  const loggedTtiRef = useRef<boolean>(false);
 
   const clearPesuPopupMonitor = useCallback(() => {
     if (pesuPopupPollRef.current !== null) {
@@ -295,79 +258,129 @@ export function App() {
 
   const isAuthorizedStaff = Boolean(currentUser.isAdmin);
 
-  const isSparseProfile = useMemo(() => {
-    return (
-      authenticatedUser !== null &&
-      currentProfile.skillTags.length === 0 &&
-      currentProfile.interestTags.length === 0
-    );
-  }, [authenticatedUser, currentProfile]);
-
-  const refreshBootstrap = useCallback(async () => {
-    const res = await apiFetch<BootstrapPayload>('/api/bootstrap');
-    if (res.ok && res.data?.ok) {
-      setUsers(res.data.users ?? []);
-      const rawProfiles = res.data.profiles;
-      if (Array.isArray(rawProfiles)) {
-        const map: Record<string, Profile> = {};
-        for (const p of rawProfiles) {
-          map[p.uid] = p;
-        }
-        setProfiles(map);
-      } else {
-        setProfiles(rawProfiles ?? {});
+  const restoreSavedDeepLink = useCallback(() => {
+    try {
+      const savedHash = sessionStorage.getItem(POST_AUTH_HASH_KEY);
+      if (!savedHash) return;
+      sessionStorage.removeItem(POST_AUTH_HASH_KEY);
+      const allowedHashes: Record<string, NavTab> = {
+        '#/discover': 'discover',
+        '#/hackathons': 'hackathons',
+        '#/events': 'hackathons',
+        '#/matches': 'matches',
+        '#/my-team': 'my_team',
+        '#/team': 'my_team',
+        '#/profile': 'profile',
+      };
+      const targetTab = allowedHashes[savedHash];
+      if (targetTab) {
+        setActiveTab(targetTab);
+        window.history.replaceState(null, '', savedHash);
       }
-      setHackathons(res.data.hackathons ?? []);
-      setEventCandidates(res.data.eventCandidates ?? []);
-      setParticipations(res.data.participations ?? []);
-      setTeams(res.data.teams ?? []);
-      setMemberships(res.data.memberships ?? []);
-      setJoinRequests(res.data.joinRequests ?? []);
-      setTeamProposals(res.data.teamProposals ?? []);
-      setTeamRegistrations(res.data.teamRegistrations ?? []);
-      setInterests(res.data.interests ?? []);
-      setConversations(res.data.conversations ?? []);
-      setMessages(res.data.messages ?? []);
-      if (Array.isArray(res.data.blocks)) {
-        setBlocks(
-          res.data.blocks.map((targetUid) => ({
-            id: `block_${targetUid}`,
-            blockerUid: authenticatedUser?.uid ?? 'self',
-            blockedUid: targetUid,
-            createdAt: new Date().toISOString(),
-          }))
-        );
-      }
-      setSelectedHackathonId((prev) => {
-        if (prev && res.data!.hackathons.some((h) => h.id === prev)) {
-          return prev;
-        }
-        const firstMatchable = res.data!.hackathons.find((h) => h.matchable);
-        return firstMatchable?.id ?? res.data!.hackathons[0]?.id ?? '';
-      });
+    } catch {
+      // ignore storage errors
     }
-  }, [authenticatedUser?.uid]);
+  }, []);
+
+  const refreshBootstrap = useCallback(
+    async (scope: 'initial' | 'full' = 'full') => {
+      const startMs =
+        typeof performance !== 'undefined' ? performance.now() : 0;
+      const endpoint =
+        scope === 'initial' ? '/api/bootstrap?scope=initial' : '/api/bootstrap';
+      const res = await apiFetch<BootstrapPayload>(endpoint);
+      if (res.ok && res.data?.ok) {
+        setUsers(res.data.users ?? []);
+        const rawProfiles = res.data.profiles;
+        if (Array.isArray(rawProfiles)) {
+          const map: Record<string, Profile> = {};
+          for (const p of rawProfiles) {
+            map[p.uid] = p;
+          }
+          setProfiles(map);
+        } else {
+          setProfiles(rawProfiles ?? {});
+        }
+        setHackathons(res.data.hackathons ?? []);
+        setParticipations(res.data.participations ?? []);
+        setTeams(res.data.teams ?? []);
+        setMemberships(res.data.memberships ?? []);
+        setInterests(res.data.interests ?? []);
+
+        if (scope === 'full') {
+          fullBootstrapLoadedRef.current = true;
+          setEventCandidates(res.data.eventCandidates ?? []);
+          setJoinRequests(res.data.joinRequests ?? []);
+          setTeamProposals(res.data.teamProposals ?? []);
+          setTeamRegistrations(res.data.teamRegistrations ?? []);
+          setConversations(res.data.conversations ?? []);
+          setMessages(res.data.messages ?? []);
+        }
+
+        if (Array.isArray(res.data.blocks)) {
+          setBlocks(
+            res.data.blocks.map((targetUid) => ({
+              id: `block_${targetUid}`,
+              blockerUid: authenticatedUser?.uid ?? 'self',
+              blockedUid: targetUid,
+              createdAt: new Date().toISOString(),
+            }))
+          );
+        }
+        setSelectedHackathonId((prev) => {
+          if (prev && res.data!.hackathons.some((h) => h.id === prev)) {
+            return prev;
+          }
+          const firstEligible = res.data!.hackathons.find((h) =>
+            isHackathonEligibleForMatching(h)
+          );
+          return firstEligible?.id ?? res.data!.hackathons[0]?.id ?? '';
+        });
+
+        if (typeof performance !== 'undefined') {
+          const elapsed = performance.now() - startMs;
+          logClientAuthTiming(`bootstrap_${scope}`, elapsed, {
+            hackathons: (res.data.hackathons ?? []).length,
+            users: (res.data.users ?? []).length,
+          });
+          if (!loggedTtiRef.current) {
+            loggedTtiRef.current = true;
+            logClientAuthTiming(
+              'time_to_interactive',
+              performance.now() - appBootTimeRef.current,
+              { scope }
+            );
+          }
+        }
+      }
+    },
+    [authenticatedUser?.uid]
+  );
 
   const restoreAuthSession = useCallback(async (): Promise<User | null> => {
+    const startMs = typeof performance !== 'undefined' ? performance.now() : 0;
     const res = await apiFetch<{
       ok: boolean;
       authenticated: boolean;
       user: User | null;
       profile: Profile | null;
+      canonicalAppOrigin?: string;
     }>('/api/auth/session');
 
-    // Also fetch canonical callback origin from /api/pesu-oauth/session
-    void apiFetch<{
-      ok: boolean;
-      canonicalAppOrigin?: string;
-    }>('/api/pesu-oauth/session').then((oauthSess) => {
-      if (oauthSess.ok && oauthSess.data?.canonicalAppOrigin) {
-        setCanonicalAppOrigin(oauthSess.data.canonicalAppOrigin);
-      }
-    });
+    if (res.ok && res.data?.canonicalAppOrigin) {
+      setCanonicalAppOrigin(res.data.canonicalAppOrigin);
+    }
+
+    if (typeof performance !== 'undefined') {
+      logClientAuthTiming('session_restore', performance.now() - startMs, {
+        authenticated: Boolean(res.ok && res.data?.authenticated && res.data.user),
+      });
+    }
 
     if (res.ok && res.data?.authenticated && res.data.user) {
       setAuthenticatedUser(res.data.user);
+      setAuthStatus('authenticated');
+      setAuthError(null);
       if (res.data.profile) {
         setProfiles((prev) => ({
           ...prev,
@@ -376,12 +389,13 @@ export function App() {
       }
       return res.data.user;
     }
+
+    setAuthenticatedUser(null);
+    setAuthStatus('unauthenticated');
     return null;
   }, []);
 
-  // Initial session restoration without unauthenticated bootstrap flash
   useEffect(() => {
-    let isMounted = true;
     const params = new URLSearchParams(window.location.search);
     const shouldAutoRedirect = params.get('start_pesu_oauth') === 'redirect';
     const wantAnnouncementsScope = params.get('pesu_scope') === 'announcements';
@@ -396,38 +410,56 @@ export function App() {
       window.history.replaceState(null, '', cleanUrl);
     }
 
-    void (async () => {
-      try {
-        const restoredUser = await restoreAuthSession();
-        if (!isMounted) return;
-        if (restoredUser) {
-          await refreshBootstrap();
-          const savedRoute = sessionStorage.getItem('quackathon_post_auth_route');
-          if (savedRoute) {
-            sessionStorage.removeItem('quackathon_post_auth_route');
-            window.location.hash = savedRoute;
+    void restoreAuthSession().then(async (restoredUser) => {
+      if (restoredUser) {
+        restoreSavedDeepLink();
+        const needsFullImmediately =
+          activeTab === 'matches' ||
+          activeTab === 'my_team' ||
+          activeTab === 'admin';
+        void refreshBootstrap(needsFullImmediately ? 'full' : 'initial');
+      }
+
+      if (shouldAutoRedirect && (!restoredUser || wantAnnouncementsScope)) {
+        const scopesToRequest = wantAnnouncementsScope
+          ? ['openid', 'profile', 'email', 'announcements:read']
+          : ['openid', 'profile', 'email'];
+        const startRes = await startPesuOAuthSignIn(
+          scopesToRequest,
+          'redirect'
+        );
+        if (startRes.ok && startRes.authUrl) {
+          if (startRes.state) {
+            activeOAuthStateRef.current = startRes.state;
+            try {
+              sessionStorage.setItem('quackathon_oauth_state', startRes.state);
+            } catch {
+              // ignore storage error
+            }
           }
-        } else {
-          if (
-            window.location.hash &&
-            window.location.hash !== '#/' &&
-            window.location.hash !== '#/discover'
-          ) {
-            sessionStorage.setItem('quackathon_post_auth_route', window.location.hash);
-          }
-        }
-      } finally {
-        if (isMounted) {
-          setIsRestoringSession(false);
+          window.location.assign(startRes.authUrl);
+        } else if (startRes.errorMessage) {
+          setAuthError(startRes.errorMessage);
         }
       }
-    })();
-    return () => {
-      isMounted = false;
-    };
-  }, [restoreAuthSession, refreshBootstrap]);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // Listen for PESU OAuth2 Redirect Callback, Popup Message, or BroadcastChannel
+  // Lazy-load conversations, team proposals, join requests, and admin queue only when needed
+  useEffect(() => {
+    if (authStatus !== 'authenticated') return;
+    if (fullBootstrapLoadedRef.current) return;
+    if (
+      activeTab === 'matches' ||
+      activeTab === 'my_team' ||
+      activeTab === 'admin'
+    ) {
+      void refreshBootstrap('full');
+    }
+  }, [activeTab, authStatus, refreshBootstrap]);
+
+  // Listen for PESU OAuth2 Popup Callback, Same-Origin BroadcastChannel, or Redirect Return
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const oauthQuery = params.get('pesu_oauth');
@@ -442,19 +474,17 @@ export function App() {
       }
       setIsSigningIn(false);
       if (oauthQuery === 'complete') {
+        setAuthStatus('checking');
         void restoreAuthSession().then((restoredUser) => {
-          void refreshBootstrap();
           if (restoredUser) {
-            showToast(`Signed in with PESU as ${restoredUser.displayName}.`);
-            const savedRoute = sessionStorage.getItem('quackathon_post_auth_route');
-            if (savedRoute) {
-              sessionStorage.removeItem('quackathon_post_auth_route');
-              window.location.hash = savedRoute;
-            }
+            restoreSavedDeepLink();
+            fullBootstrapLoadedRef.current = false;
+            void refreshBootstrap('initial');
+            showToast(`Signed in as ${restoredUser.displayName}.`);
           }
         });
       } else {
-        showToast(queryMessage || 'PESU OAuth sign-in did not complete.');
+        setAuthError(queryMessage || 'PESU sign-in did not complete. Please try again.');
       }
     }
 
@@ -489,37 +519,44 @@ export function App() {
 
       const isSuccess = data.status === 'success' && data.ok !== false;
       if (isSuccess) {
-        if (data.user && typeof data.user === 'object') {
-          setAuthenticatedUser(data.user as User);
-        }
-        void restoreAuthSession().then((restoredUser) => {
-          void refreshBootstrap();
-          const identityObj =
-            data.identity && typeof data.identity === 'object'
-              ? (data.identity as { name?: string })
-              : null;
-          const userObj =
-            data.user && typeof data.user === 'object'
-              ? (data.user as { displayName?: string })
-              : null;
-          const displayLabel =
-            restoredUser?.displayName ||
-            identityObj?.name ||
-            userObj?.displayName ||
-            'Verified Student';
-          showToast(`Signed in with PESU as ${displayLabel}.`);
-          const savedRoute = sessionStorage.getItem('quackathon_post_auth_route');
-          if (savedRoute) {
-            sessionStorage.removeItem('quackathon_post_auth_route');
-            window.location.hash = savedRoute;
+        setAuthError(null);
+        const payloadUser =
+          data.user && typeof data.user === 'object' ? (data.user as User) : null;
+        const payloadProfile =
+          data.profile && typeof data.profile === 'object'
+            ? (data.profile as Profile)
+            : null;
+
+        if (payloadUser) {
+          // Fast path: apply verified user & profile immediately without redundant /api/auth/session round-trip
+          setAuthenticatedUser(payloadUser);
+          setAuthStatus('authenticated');
+          if (payloadProfile) {
+            setProfiles((prev) => ({
+              ...prev,
+              [payloadUser.uid]: payloadProfile,
+            }));
           }
-        });
+          restoreSavedDeepLink();
+          fullBootstrapLoadedRef.current = false;
+          void refreshBootstrap('initial');
+          showToast(`Signed in as ${payloadUser.displayName}.`);
+        } else {
+          void restoreAuthSession().then((restoredUser) => {
+            if (restoredUser) {
+              restoreSavedDeepLink();
+              fullBootstrapLoadedRef.current = false;
+              void refreshBootstrap('initial');
+              showToast(`Signed in as ${restoredUser.displayName}.`);
+            }
+          });
+        }
       } else {
         const errMsg =
           (typeof data.error === 'string' && data.error) ||
           (typeof data.userMessage === 'string' && data.userMessage) ||
-          'PESU OAuth sign-in failed.';
-        showToast(errMsg);
+          'PESU sign-in failed. Please try again.';
+        setAuthError(errMsg);
       }
     };
 
@@ -556,7 +593,13 @@ export function App() {
         }
       }
     };
-  }, [clearPesuPopupMonitor, restoreAuthSession, refreshBootstrap, showToast]);
+  }, [
+    clearPesuPopupMonitor,
+    restoreAuthSession,
+    restoreSavedDeepLink,
+    refreshBootstrap,
+    showToast,
+  ]);
 
   // Sync URL hash for routes
   useEffect(() => {
@@ -568,7 +611,7 @@ export function App() {
       else if (hash === '#/hackathons' || hash === '#/events')
         setActiveTab('hackathons');
       else if (hash === '#/matches') setActiveTab('matches');
-      else if (hash === '#/team' || hash === '#/my-team' || hash === '#/teams')
+      else if (hash === '#/team' || hash === '#/my-team')
         setActiveTab('my_team');
       else setActiveTab('discover');
     };
@@ -600,12 +643,6 @@ export function App() {
       window.history.replaceState(null, '', '#/dev/integrations');
     } else if (tab === 'my_team') {
       window.history.replaceState(null, '', '#/my-team');
-    } else if (tab === 'hackathons') {
-      window.history.replaceState(null, '', '#/hackathons');
-    } else if (tab === 'matches') {
-      window.history.replaceState(null, '', '#/matches');
-    } else if (tab === 'profile') {
-      window.history.replaceState(null, '', '#/profile');
     } else if (window.location.hash) {
       window.history.replaceState(null, '', window.location.pathname);
     }
@@ -614,11 +651,21 @@ export function App() {
   // Authentication Handlers
   const handleSignInWithPesu = useCallback(
     async (
-      modeInput?: 'popup' | 'redirect' | unknown,
+      mode: 'popup' | 'redirect' = isEmbeddedPreview ? 'popup' : 'redirect',
       requestedScopes: string[] = ['openid', 'profile', 'email']
     ) => {
-      const mode: 'popup' | 'redirect' = modeInput === 'popup' ? 'popup' : 'redirect';
-      // If full-page redirect mode is requested from inside an embedded iframe,
+      setAuthError(null);
+
+      // Save safe deep-link hash so we restore the intended view after authentication
+      try {
+        if (window.location.hash && window.location.hash.startsWith('#/')) {
+          sessionStorage.setItem(POST_AUTH_HASH_KEY, window.location.hash);
+        }
+      } catch {
+        // ignore storage errors
+      }
+
+      // If full-page redirect mode is explicitly requested from inside an embedded iframe,
       // launch the canonical application URL in a top-level tab so cookies are 1st-party.
       if (mode === 'redirect' && isEmbeddedPreview) {
         const targetBase = canonicalAppOrigin || window.location.origin;
@@ -628,12 +675,8 @@ export function App() {
         const topLevelAuthUrl = `${targetBase}/?start_pesu_oauth=redirect${scopeParam}${window.location.hash || ''}`;
         const opened = window.open(topLevelAuthUrl, '_blank', 'noopener');
         if (!opened) {
-          showToast(
-            `Please open ${targetBase} in a new browser tab to complete full-page PESU sign-in.`
-          );
-        } else {
-          showToast(
-            'Opened top-level tab for PESU OAuth2 full-page sign-in.'
+          setAuthError(
+            'Your browser blocked opening a new tab. Please allow popups and try again.'
           );
         }
         return;
@@ -655,16 +698,18 @@ export function App() {
       setIsSigningIn(true);
       clearPesuPopupMonitor();
 
-      try {
-        if (
-          window.location.hash &&
-          window.location.hash !== '#/' &&
-          window.location.hash !== '#/discover'
-        ) {
-          sessionStorage.setItem('quackathon_post_auth_route', window.location.hash);
-        }
+      const initiateStartMs =
+        typeof performance !== 'undefined' ? performance.now() : 0;
 
+      try {
         const res = await startPesuOAuthSignIn(requestedScopes, mode);
+        if (typeof performance !== 'undefined') {
+          logClientAuthTiming(
+            'oauth_initiate',
+            performance.now() - initiateStartMs,
+            { mode }
+          );
+        }
         if (res.canonicalAppOrigin) {
           setCanonicalAppOrigin(res.canonicalAppOrigin);
         }
@@ -676,8 +721,8 @@ export function App() {
               res.portalManageUrl || 'https://pesu-oauth2.onrender.com/portal',
           });
           setIsSigningIn(false);
-          showToast(
-            'Register the callback URI in PESU OAuth2 Portal and click "Save Changes" first.'
+          setAuthError(
+            'PESU sign-in is temporarily unavailable for this preview URL. Please try again shortly.'
           );
           return;
         } else if (res.providerRedirectUriRegistered === true) {
@@ -685,7 +730,9 @@ export function App() {
         }
         if (!res.ok || !res.authUrl) {
           setIsSigningIn(false);
-          showToast(res.errorMessage || 'Could not start PESU OAuth2 sign-in.');
+          setAuthError(
+            res.errorMessage || 'Could not start PESU sign-in. Please try again.'
+          );
           return;
         }
 
@@ -711,8 +758,8 @@ export function App() {
 
         if (!popup) {
           setIsSigningIn(false);
-          showToast(
-            'Sign-in popup was blocked by your browser. Use "Full-Page Sign In" in the account menu or allow popups.'
+          setAuthError(
+            'Sign-in window was blocked by your browser. Please allow popups for this site and click Continue with PESU again.'
           );
           return;
         }
@@ -720,7 +767,7 @@ export function App() {
         pesuPopupRef.current = popup;
         const launchedState = res.state || '';
 
-        // Monitor popup closure to distinguish user cancellation from completed/failed callback
+        // Monitor popup closure to distinguish user cancellation from completed callback
         pesuPopupPollRef.current = window.setInterval(() => {
           if (!pesuPopupRef.current || pesuPopupRef.current.closed) {
             clearPesuPopupMonitor();
@@ -738,17 +785,19 @@ export function App() {
                 if (launchedState) {
                   handledOAuthStatesRef.current.add(launchedState);
                 }
-                await refreshBootstrap();
-                showToast(`Signed in with PESU as ${restored.displayName}.`);
+                restoreSavedDeepLink();
+                fullBootstrapLoadedRef.current = false;
+                await refreshBootstrap('initial');
+                showToast(`Signed in as ${restored.displayName}.`);
               } else {
-                showToast('PESU sign-in was cancelled before completion.');
+                setAuthError('PESU sign-in was cancelled before completion.');
               }
-            }, 450);
+            }, 350);
           }
-        }, 450);
+        }, 400);
       } catch {
         setIsSigningIn(false);
-        showToast('Could not start PESU OAuth2 sign-in.');
+        setAuthError('Could not connect to PESU authentication. Please try again.');
       }
     },
     [
@@ -758,44 +807,14 @@ export function App() {
       isSigningIn,
       refreshBootstrap,
       restoreAuthSession,
+      restoreSavedDeepLink,
       showToast,
     ]
   );
 
-  const handleSignInWithGoogle = useCallback(async () => {
-    setIsSigningIn(true);
-    try {
-      const cred = await signInWithPopup(auth, googleAuthProvider);
-      const idToken = await cred.user.getIdToken();
-      setApiClientAuthToken(idToken);
-      const res = await apiFetch<{
-        ok: boolean;
-        user?: User;
-        profile?: Profile;
-        error?: string;
-      }>('/api/auth/firebase-sync', {
-        method: 'POST',
-        body: {
-          displayName: cred.user.displayName,
-        },
-      });
-      if (res.ok && res.data?.user) {
-        setAuthenticatedUser(res.data.user);
-        await refreshBootstrap();
-        showToast(`Signed in as ${res.data.user.displayName}.`);
-      } else {
-        showToast(res.errorMessage || 'Could not sync Google account.');
-      }
-    } catch (err) {
-      showToast(
-        err instanceof Error
-          ? err.message
-          : 'Google sign-in popup was closed or blocked.'
-      );
-    } finally {
-      setIsSigningIn(false);
-    }
-  }, [refreshBootstrap, showToast]);
+  const handleContinueWithPesu = useCallback(() => {
+    void handleSignInWithPesu(isEmbeddedPreview ? 'popup' : 'redirect');
+  }, [handleSignInWithPesu, isEmbeddedPreview]);
 
   const handleSignOut = useCallback(async () => {
     await apiFetch('/api/auth/logout', { method: 'POST' });
@@ -805,9 +824,21 @@ export function App() {
       // ignore if not signed in via Firebase
     }
     setApiClientAuthToken(null);
+    fullBootstrapLoadedRef.current = false;
     setAuthenticatedUser(null);
+    setAuthStatus('unauthenticated');
+    setAuthError(null);
     setShowAccountMenu(false);
-    setHasDismissedQuickSetup(false);
+    setUsers([]);
+    setProfiles({});
+    setConversations([]);
+    setMessages([]);
+    setJoinRequests([]);
+    setTeamProposals([]);
+    setInterests([]);
+    setBlocks([]);
+    window.history.replaceState(null, '', window.location.pathname);
+    setActiveTab('discover');
     showToast('Signed out.');
   }, [showToast]);
 
@@ -823,7 +854,7 @@ export function App() {
       >
     ) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU to save your event participation.');
+        showToast('Sign in with PESU or Google to save your event participation.');
         return;
       }
       const res = await apiFetch<{
@@ -856,7 +887,7 @@ export function App() {
       customNote?: string
     ) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU to connect with students or teams.');
+        showToast('Sign in with PESU or Google to connect with students.');
         return;
       }
 
@@ -1060,7 +1091,7 @@ export function App() {
     async (
       updatedProfile: Profile,
       updatedPrivacy: User['privacyPreferences'],
-      displayName?: string
+      updatedDisplayName?: string
     ) => {
       if (!authenticatedUser) {
         showToast('Sign in with PESU to save your profile.');
@@ -1073,9 +1104,9 @@ export function App() {
       }>('/api/profile', {
         method: 'PUT',
         body: {
+          displayName: updatedDisplayName,
           profile: updatedProfile,
           privacyPreferences: updatedPrivacy,
-          displayName,
         },
       });
 
@@ -1093,9 +1124,9 @@ export function App() {
             ? prev.map((u) => (u.uid === savedUser.uid ? savedUser : u))
             : [...prev, savedUser];
         });
-        showToast('Builder profile saved.');
+        showToast('Profile saved.');
       } else {
-        showToast(res.errorMessage || 'Could not save builder profile.');
+        showToast(res.errorMessage || 'Could not save profile.');
       }
     },
     [authenticatedUser, showToast]
@@ -1112,7 +1143,7 @@ export function App() {
       targetSize: number;
     }) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU to create a team.');
+        showToast('Sign in with PESU or Google to create a team.');
         return;
       }
 
@@ -1382,7 +1413,7 @@ export function App() {
   const handleSubmitEventCandidate = useCallback(
     async (candidate: EventCandidate) => {
       if (!authenticatedUser) {
-        showToast('Sign in with PESU to submit a campus event.');
+        showToast('Sign in with PESU or Google to submit a campus event.');
         return;
       }
       const res = await apiFetch<{
@@ -1578,36 +1609,99 @@ export function App() {
     c.participantUids.includes(currentUser.uid)
   ).length;
 
-  // 1. Session Restoration Loading Screen (No navbar or signed-out flash)
-  if (isRestoringSession) {
+  // Determine whether a newly authenticated student needs minimal first-time setup
+  const hasExistingProfileData =
+    (currentProfile.skillTags?.length ?? 0) > 0 ||
+    (currentProfile.interestTags?.length ?? 0) > 0 ||
+    (currentProfile.preferredRoles?.length ?? 0) > 0 ||
+    Boolean(currentProfile.headline?.trim()) ||
+    (currentProfile.featuredProjects?.length ?? 0) > 0;
+
+  const needsQuickOnboarding =
+    authStatus === 'authenticated' &&
+    Boolean(authenticatedUser) &&
+    currentUser.privacyPreferences?.onboardingCompleted !== true &&
+    (!hasExistingProfileData || Boolean(currentUser.needsDisplayNameSetup));
+
+  // Gate 1: Session Restoration Loading State (never flash a signed-out screen!)
+  if (authStatus === 'checking') {
     return (
-      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col items-center justify-center p-4">
-        <div className="w-12 h-12 rounded-2xl bg-slate-900 dark:bg-blue-600 text-amber-400 dark:text-white flex items-center justify-center font-bold text-xl shadow-lg mb-4 animate-pulse">
-          Q
+      <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col items-center justify-center px-4">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-lg">
+            Q
+          </div>
+          <div className="inline-flex items-center gap-2 text-sm font-medium text-slate-600">
+            <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
+            <span>Loading Quackathon...</span>
+          </div>
         </div>
-        <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 tracking-wide">
-          Checking PESU session...
-        </p>
       </div>
     );
   }
 
-  // 2. Unauthenticated Visitor: Dedicated Login Landing Page (No application navbar)
-  if (!authenticatedUser) {
+  // Gate 2: Dedicated Unauthenticated Login Page (NO application navbar)
+  if (authStatus === 'unauthenticated' || !authenticatedUser) {
     return (
       <LoginPage
-        onSignInWithPesu={() => void handleSignInWithPesu('redirect')}
+        onContinueWithPesu={handleContinueWithPesu}
         isSigningIn={isSigningIn}
-        toastMessage={toastMessage}
+        errorMessage={authError}
+        onDismissError={() => setAuthError(null)}
       />
     );
   }
 
-  // 3. Authenticated Student Workspace
+  // Gate 3: Minimal First-Time Quick Setup
+  if (needsQuickOnboarding) {
+    return (
+      <QuickOnboardingView
+        currentUser={currentUser}
+        existingProfile={currentProfile}
+        onComplete={async ({ displayName, profile, privacyPreferences, skipped }) => {
+          await handleSaveProfile(profile, privacyPreferences, displayName);
+          if (skipped) {
+            showToast(
+              'You can add interests and skills anytime under Profile to improve recommendations.'
+            );
+          }
+        }}
+      />
+    );
+  }
+
+  const navItems: {
+    id: NavTab;
+    label: string;
+    icon: React.ReactNode;
+    count?: number;
+  }[] = [
+    { id: 'discover', label: 'Discover', icon: <Compass className="w-4 h-4" /> },
+    { id: 'hackathons', label: 'Hackathons', icon: <Calendar className="w-4 h-4" /> },
+    {
+      id: 'matches',
+      label: 'Matches',
+      icon: <MessageSquare className="w-4 h-4" />,
+      count: myConversationsCount > 0 ? myConversationsCount : undefined,
+    },
+    {
+      id: 'my_team',
+      label: 'My Team',
+      icon: <Users className="w-4 h-4" />,
+      count:
+        pendingProposalsOrInvitesCount > 0
+          ? pendingProposalsOrInvitesCount
+          : myActiveTeamIds.size > 0
+            ? myActiveTeamIds.size
+            : undefined,
+    },
+    { id: 'profile', label: 'Profile', icon: <UserCircle className="w-4 h-4" /> },
+  ];
+
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col">
-      {/* Concise Authenticated Navigation Bar (No horizontal scrollbar) */}
-      <header className="sticky top-0 z-30 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800">
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
+      {/* Clean 3-Zone Top Navigation Bar (Zero desktop overflow / scrollbar) */}
+      <header className="sticky top-0 z-30 bg-white border-b border-slate-200">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4">
           {/* Zone 1: Brand Wordmark */}
           <button
@@ -1615,200 +1709,156 @@ export function App() {
             onClick={() => navigateToTab('discover')}
             className="flex items-center gap-2.5 text-left cursor-pointer shrink-0"
           >
-            <div className="w-8 h-8 rounded-lg bg-slate-900 dark:bg-blue-600 text-amber-400 dark:text-white flex items-center justify-center font-bold text-sm shrink-0">
+            <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-sm shrink-0">
               Q
             </div>
-            <span className="font-bold text-base tracking-tight text-slate-900 dark:text-slate-100 hidden sm:inline">
+            <span className="font-bold text-base tracking-tight text-slate-900 whitespace-nowrap">
               Quackathon
             </span>
           </button>
 
-          {/* Zone 2: Concise 5-Item Student Navigation: Discover | Hackathons | Matches | My Team | Profile */}
+          {/* Zone 2: Concise 5-Item Desktop Navigation */}
           <nav
             aria-label="Main navigation"
-            className="flex items-center gap-1 sm:gap-1.5 py-1"
+            className="hidden md:flex items-center gap-1"
           >
-            <button
-              type="button"
-              onClick={() => navigateToTab('discover')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'discover'
-                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
-              }`}
-            >
-              <Compass className="w-3.5 h-3.5" />
-              <span>Discover</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => navigateToTab('hackathons')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'hackathons'
-                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
-              }`}
-            >
-              <Calendar className="w-3.5 h-3.5" />
-              <span>Hackathons</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => navigateToTab('matches')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'matches'
-                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
-              }`}
-            >
-              <MessageSquare className="w-3.5 h-3.5" />
-              <span>Matches</span>
-              {myConversationsCount > 0 && (
-                <span className="font-mono tabular-nums text-[11px] opacity-80">
-                  {myConversationsCount}
-                </span>
-              )}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => navigateToTab('my_team')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'my_team'
-                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100'
-              }`}
-            >
-              <Users className="w-3.5 h-3.5" />
-              <span>My Team</span>
-              {(myActiveTeamIds.size > 0 || pendingProposalsOrInvitesCount > 0) && (
-                <span className="font-mono tabular-nums text-[11px] opacity-80">
-                  {pendingProposalsOrInvitesCount > 0
-                    ? pendingProposalsOrInvitesCount
-                    : myActiveTeamIds.size}
-                </span>
-              )}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => navigateToTab('profile')}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'profile'
-                  ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800'
-              }`}
-            >
-              <UserCircle className="w-3.5 h-3.5" />
-              <span>Profile</span>
-            </button>
+            {navItems.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => navigateToTab(item.id)}
+                className={`px-3 py-1.5 text-sm font-medium rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                  activeTab === item.id
+                    ? 'bg-slate-900 text-white font-semibold'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                }`}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+                {item.count !== undefined && (
+                  <span className="font-mono tabular-nums text-xs opacity-80">
+                    {item.count}
+                  </span>
+                )}
+              </button>
+            ))}
           </nav>
 
-          {/* Zone 3: Authenticated Account Menu */}
-          <div className="flex items-center gap-2">
-            <div className="relative" ref={accountMenuRef}>
-              <button
-                type="button"
-                onClick={() => setShowAccountMenu((prev) => !prev)}
-                aria-expanded={showAccountMenu}
-                aria-haspopup="menu"
-                className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold text-slate-800 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          {/* Zone 3: Authenticated Student Account Menu */}
+          <div className="relative shrink-0" ref={accountMenuRef}>
+            <button
+              type="button"
+              onClick={() => setShowAccountMenu((prev) => !prev)}
+              aria-expanded={showAccountMenu}
+              aria-haspopup="menu"
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-sm font-medium text-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer max-w-[200px]"
+            >
+              <UserCircle className="w-4 h-4 text-slate-500 shrink-0" />
+              <span className="truncate">{currentUser.displayName}</span>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            </button>
+
+            {showAccountMenu && (
+              <div
+                role="menu"
+                className="absolute right-0 mt-1.5 w-60 rounded-xl bg-white border border-slate-200 shadow-lg py-1.5 z-50 text-xs"
               >
-                <UserCircle className="w-4 h-4 text-slate-500" />
-                <span className="hidden sm:inline">
-                  {currentUser.displayName}
-                </span>
-                <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
-              </button>
-
-              {showAccountMenu && (
-                <div
-                  role="menu"
-                  className="absolute right-0 mt-1.5 w-64 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-lg py-2 z-50 text-xs"
-                >
-                  {/* Current User Header with Verified Display Name */}
-                  <div className="px-3.5 py-2 border-b border-slate-100 dark:border-slate-800">
-                    <div className="font-bold text-slate-900 dark:text-slate-100">
-                      {currentUser.displayName}
-                    </div>
-                    <div className="text-[11px] text-slate-500 truncate">
-                      {`${currentUser.personaLabel} · ${currentUser.campus}`}
-                    </div>
+                {/* Current User Summary */}
+                <div className="px-3.5 py-2.5 border-b border-slate-100">
+                  <div className="font-semibold text-sm text-slate-900 truncate">
+                    {currentUser.displayName}
                   </div>
+                  <div className="text-xs text-slate-500 truncate mt-0.5">
+                    {currentUser.campus} · {currentUser.program}
+                  </div>
+                </div>
 
-                  {/* Actions */}
-                  <div className="py-1 border-b border-slate-100 dark:border-slate-800">
+                {/* Student Actions */}
+                <div className="py-1">
+                  <button
+                    type="button"
+                    onClick={() => navigateToTab('profile')}
+                    className="w-full px-3.5 py-2 text-left text-sm font-medium text-slate-700 hover:bg-slate-50 flex items-center justify-between cursor-pointer"
+                  >
+                    <span>Profile &amp; Settings</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleSignOut()}
+                    className="w-full px-3.5 py-2 text-left text-sm font-medium text-rose-600 hover:bg-slate-50 flex items-center justify-between cursor-pointer"
+                  >
+                    <span>Sign Out</span>
+                    <LogOut className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                {/* Moderator & Developer Routes: STRICTLY hidden from normal students */}
+                {isAuthorizedStaff && (
+                  <div className="pt-1 border-t border-slate-100">
+                    <div className="px-3.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                      Moderator Controls
+                    </div>
+
                     <button
                       type="button"
-                      onClick={() => navigateToTab('profile')}
-                      className="w-full px-3.5 py-2 text-left font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                      onClick={() => navigateToTab('admin')}
+                      className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 cursor-pointer ${
+                        activeTab === 'admin'
+                          ? 'font-semibold text-indigo-600 bg-slate-50'
+                          : 'text-slate-700'
+                      }`}
                     >
-                      <span>Edit Builder Profile</span>
-                      <span className="text-[11px] text-slate-400">
-                        Skills & Role
+                      <span className="inline-flex items-center gap-2">
+                        <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
+                        Admin Event Review
+                      </span>
+                      <span className="font-mono text-[10px] text-slate-400">
+                        {pendingAdminCount}
                       </span>
                     </button>
+
                     <button
                       type="button"
-                      onClick={() => void handleSignOut()}
-                      className="w-full px-3.5 py-2 text-left font-semibold text-red-600 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-between cursor-pointer"
+                      onClick={() => navigateToTab('integrations')}
+                      className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 cursor-pointer ${
+                        activeTab === 'integrations'
+                          ? 'font-semibold text-indigo-600 bg-slate-50'
+                          : 'text-slate-700'
+                      }`}
                     >
-                      <span>Sign Out</span>
-                      <LogOut className="w-3.5 h-3.5" />
+                      <span className="inline-flex items-center gap-2">
+                        <Terminal className="w-3.5 h-3.5 text-slate-500" />
+                        Integration Diagnostics
+                      </span>
                     </button>
                   </div>
-
-                  {/* Staff / Moderator Tools only visible if authorized */}
-                  {isAuthorizedStaff && (
-                    <div className="pt-1">
-                      <div className="px-3.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                        Moderator & Diagnostics
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={() => navigateToTab('admin')}
-                        className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer ${
-                          activeTab === 'admin'
-                            ? 'font-bold text-blue-600 bg-slate-50 dark:bg-slate-800/60'
-                            : 'text-slate-700 dark:text-slate-300'
-                        }`}
-                      >
-                        <span className="inline-flex items-center gap-2">
-                          <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
-                          Admin Event Review
-                        </span>
-                        <span className="font-mono text-[10px] text-slate-400">
-                          {pendingAdminCount}
-                        </span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => navigateToTab('integrations')}
-                        className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer ${
-                          activeTab === 'integrations'
-                            ? 'font-bold text-blue-600 bg-slate-50 dark:bg-slate-800/60'
-                            : 'text-slate-700 dark:text-slate-300'
-                        }`}
-                      >
-                        <span className="inline-flex items-center gap-2">
-                          <Terminal className="w-3.5 h-3.5 text-slate-500" />
-                          Integration Diagnostics
-                        </span>
-                        <span className="font-mono text-[10px] text-slate-400">
-                          #/dev/integrations
-                        </span>
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
+
+        {/* Mobile Navigation Strip (< md) */}
+        <nav
+          aria-label="Mobile navigation"
+          className="md:hidden border-t border-slate-100 bg-white px-2 py-1.5 grid grid-cols-5 gap-1"
+        >
+          {navItems.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => navigateToTab(item.id)}
+              className={`py-1.5 px-1 rounded-lg text-[11px] font-medium flex flex-col items-center justify-center gap-0.5 cursor-pointer ${
+                activeTab === item.id
+                  ? 'bg-slate-900 text-white font-semibold'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              {item.icon}
+              <span className="truncate max-w-full">{item.label}</span>
+            </button>
+          ))}
+        </nav>
       </header>
 
       {/* Toast Notification */}
@@ -1906,6 +1956,8 @@ export function App() {
               onSwipeDecision={handleSwipeDecision}
               onResetPassedCards={handleResetPassedCards}
               onBlockUser={handleBlockUser}
+              onOpenMyTeam={() => navigateToTab('my_team')}
+              onOpenProfile={() => navigateToTab('profile')}
             />
           )}
 
@@ -2010,14 +2062,16 @@ export function App() {
                 onMergeDuplicateCandidate={handleMergeDuplicateCandidate}
                 onApplySourceDiffCandidate={handleApplySourceDiffCandidate}
                 onResolveReport={handleResolveReport}
+                onRefreshCatalog={() => refreshBootstrap('full')}
+                onNotify={showToast}
                 onBackToApp={() => navigateToTab('discover')}
               />
             ) : (
-              <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center max-w-md mx-auto my-8 space-y-3">
+              <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center max-w-md mx-auto my-8 space-y-3">
                 <Lock className="w-7 h-7 text-slate-400 mx-auto" />
                 <h2 className="text-base font-bold">Admin Access Required</h2>
                 <p className="text-xs text-slate-500">
-                  Route #/admin is restricted to verified event moderators.
+                  Event moderation is restricted to authorized moderators.
                 </p>
                 <div className="flex justify-center gap-2 pt-2">
                   <button
@@ -2032,7 +2086,7 @@ export function App() {
             ))}
 
           {activeTab === 'integrations' &&
-            (isAuthorizedStaff || Boolean(getApiClientAuthToken()) ? (
+            (isAuthorizedStaff ? (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <button
@@ -2042,9 +2096,6 @@ export function App() {
                   >
                     ← Back to Student App
                   </button>
-                  <span className="text-[11px] font-mono text-slate-400">
-                    Route: #/dev/integrations
-                  </span>
                 </div>
                 <IntegrationTestingView
                   executionMode={executionMode}
@@ -2052,13 +2103,11 @@ export function App() {
                 />
               </div>
             ) : (
-              <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center max-w-md mx-auto my-8 space-y-3">
+              <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center max-w-md mx-auto my-8 space-y-3">
                 <Lock className="w-7 h-7 text-slate-400 mx-auto" />
-                <h2 className="text-base font-bold">
-                  Developer Console Restricted
-                </h2>
+                <h2 className="text-base font-bold">Access Restricted</h2>
                 <p className="text-xs text-slate-500">
-                  Route #/dev/integrations is reserved for authorized staff verification.
+                  This diagnostics view is restricted to authorized administrators.
                 </p>
                 <div className="flex justify-center gap-2 pt-2">
                   <button
@@ -2074,25 +2123,7 @@ export function App() {
         </Suspense>
       </main>
 
-      {/* First-time quick setup modal for sparse profiles */}
-      {isSparseProfile && !hasDismissedQuickSetup && activeTab !== 'profile' && (
-        <Suspense fallback={<ViewSkeleton />}>
-          <OnboardingAndProfileModal
-            currentUser={currentUser}
-            profile={currentProfile}
-            executionMode={executionMode}
-            isQuickSetup={true}
-            onSaveProfile={(prof, priv, name) => {
-              void handleSaveProfile(prof, priv, name);
-              setHasDismissedQuickSetup(true);
-            }}
-            onClose={() => setHasDismissedQuickSetup(true)}
-            onNotify={showToast}
-          />
-        </Suspense>
-      )}
-
-      {/* Builder Profile Modal (if opened from Account menu directly) */}
+      {/* Builder Profile Modal (if opened from Account menu) */}
       {showProfileModal && (
         <Suspense fallback={<ViewSkeleton />}>
           <OnboardingAndProfileModal
@@ -2108,5 +2139,4 @@ export function App() {
     </div>
   );
 }
-
 export default App;

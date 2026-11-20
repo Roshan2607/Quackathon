@@ -1,6 +1,4 @@
 import 'dotenv/config';
-import dotenv from 'dotenv';
-import fs from 'fs';
 import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
@@ -84,7 +82,6 @@ import {
   loadBootstrapData,
   recordSwipeAndProcessMatchRecord,
   rejectEventCandidateRecord,
-  isPesuSrnOrPrn,
   resetPassedSwipesForHackathon,
   resolveJoinRequestRecord,
   respondToTeamProposalRecord,
@@ -110,6 +107,29 @@ import {
   requireAuth,
   resolveOptionalUser,
 } from './src/middleware/auth.ts';
+import {
+  resolveOAuthDisplayName,
+} from './src/lib/displayName.ts';
+
+const IS_DEV_AUTH_DIAGNOSTICS =
+  process.env.NODE_ENV !== 'production' &&
+  process.env.QUACKATHON_TEST_MODE !== 'true';
+
+function logDevAuthTiming(
+  stage: string,
+  durationMs: number,
+  meta?: Record<string, string | number | boolean | null | undefined>
+): void {
+  if (!IS_DEV_AUTH_DIAGNOSTICS) return;
+  console.info(
+    JSON.stringify({
+      tag: 'quackathon_auth_timing',
+      stage,
+      durationMs: Math.round(durationMs),
+      ...(meta ?? {}),
+    })
+  );
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2360,9 +2380,6 @@ function logOAuthStructuredEvent(params: {
   callbackCookieStatus?: 'valid' | 'missing' | 'invalid_signature' | null;
   sessionBindingMatched?: boolean | null;
   handledByDifferentInstance?: boolean;
-  authMethodUsed?: string | null;
-  hasClientId?: boolean;
-  hasClientSecret?: boolean;
   note?: string;
 }): void {
   const entry = {
@@ -2393,15 +2410,6 @@ function logOAuthStructuredEvent(params: {
       : {}),
     ...(params.handledByDifferentInstance !== undefined
       ? { handledByDifferentInstance: params.handledByDifferentInstance }
-      : {}),
-    ...(params.authMethodUsed !== undefined
-      ? { authMethodUsed: params.authMethodUsed }
-      : {}),
-    ...(params.hasClientId !== undefined
-      ? { hasClientId: params.hasClientId }
-      : {}),
-    ...(params.hasClientSecret !== undefined
-      ? { hasClientSecret: params.hasClientSecret }
       : {}),
     ...(params.note ? { note: params.note } : {}),
   };
@@ -2711,7 +2719,7 @@ let oidcDiscoveryCache: {
   expiresAt: number;
   value: Awaited<ReturnType<typeof discoverPesuOidcEndpoints>>;
 } | null = null;
-const OIDC_DISCOVERY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const OIDC_DISCOVERY_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
   providerReachable: boolean;
@@ -3105,6 +3113,13 @@ async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
   }
 }
 
+const redirectUriProbeCache = new Map<
+  string,
+  { registered: boolean | null; expiresAt: number }
+>();
+const REDIRECT_URI_PROBE_OK_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const REDIRECT_URI_PROBE_FAIL_TTL_MS = 2 * 60 * 1000; // 2 minutes
+
 async function checkProviderRedirectUriRegistration(params: {
   authorizationEndpoint: string | null;
   clientId: string | undefined;
@@ -3118,6 +3133,11 @@ async function checkProviderRedirectUriRegistration(params: {
     Boolean(testOverrides.fetchFn)
   ) {
     return null;
+  }
+  const cacheKey = `${params.authorizationEndpoint}|${params.clientId}|${params.redirectUri}`;
+  const cached = redirectUriProbeCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.registered;
   }
   try {
     const probeUrl = new URL(params.authorizationEndpoint);
@@ -3133,21 +3153,29 @@ async function checkProviderRedirectUriRegistration(params: {
     probeUrl.searchParams.set('code_challenge_method', 'S256');
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
+    const timer = setTimeout(() => controller.abort(), 2500);
     try {
       const resp = await fetch(probeUrl.toString(), {
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal,
       });
+      let registered: boolean;
       if ([301, 302, 303, 307, 308].includes(resp.status)) {
-        return true;
+        registered = true;
+      } else {
+        const body = await resp.text();
+        registered = !body.includes('Redirect URI is not registered');
       }
-      const body = await resp.text();
-      if (body.includes('Redirect URI is not registered')) {
-        return false;
-      }
-      return true;
+      redirectUriProbeCache.set(cacheKey, {
+        registered,
+        expiresAt:
+          Date.now() +
+          (registered
+            ? REDIRECT_URI_PROBE_OK_TTL_MS
+            : REDIRECT_URI_PROBE_FAIL_TTL_MS),
+      });
+      return registered;
     } finally {
       clearTimeout(timer);
     }
@@ -3338,58 +3366,22 @@ app.post('/api/pesu-oauth/logout', async (req, res) => {
   });
 });
 
-function refreshPesuOAuthEnvFromDisk(): void {
-  if (process.env.QUACKATHON_TEST_MODE === 'true') {
-    return;
-  }
-  try {
-    if (fs.existsSync('.env')) {
-      const parsed = dotenv.parse(fs.readFileSync('.env', 'utf8'));
-      if (parsed.PESU_OAUTH_CLIENT_ID !== undefined) {
-        process.env.PESU_OAUTH_CLIENT_ID = parsed.PESU_OAUTH_CLIENT_ID;
-      }
-      if (parsed.PESU_OAUTH_CLIENT_SECRET !== undefined) {
-        process.env.PESU_OAUTH_CLIENT_SECRET = parsed.PESU_OAUTH_CLIENT_SECRET;
-      }
-      if (parsed.PESU_OAUTH_TOKEN_AUTH_METHOD !== undefined) {
-        process.env.PESU_OAUTH_TOKEN_AUTH_METHOD = parsed.PESU_OAUTH_TOKEN_AUTH_METHOD;
-      }
-      if (parsed.PESU_OAUTH_REDIRECT_URI !== undefined) {
-        process.env.PESU_OAUTH_REDIRECT_URI = parsed.PESU_OAUTH_REDIRECT_URI;
-      }
-    }
-  } catch {
-    // ignore disk reading failures
-  }
-}
-
 app.get('/api/pesu-oauth/url', async (req, res) => {
   const startTime = Date.now();
   const requestId = createRequestId('oauth_url');
-  let currentSessionFp: string | null = null;
-  let currentInitiatingOrigin: string | null = null;
-  let currentCallbackOrigin: string | null = null;
-  let currentCookieStatus: 'new' | 'existing' | null = null;
-
-  try {
-    const { session, initiationCookieStatus } = getOrCreateSessionWithDiagnostics(
-      req,
-      res
-    );
-    currentCookieStatus = initiationCookieStatus;
-    refreshPesuOAuthEnvFromDisk();
-    const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
-    const {
-      expectedRedirectUri,
-      allowedRedirectUris,
-      configuredCallbackOrigin,
-      canonicalAppOrigin,
-    } = getAllowedRedirectUris(req);
-    const initiatingOrigin = resolveInitiatingClientOrigin(req);
-    currentInitiatingOrigin = initiatingOrigin;
-    currentCallbackOrigin = configuredCallbackOrigin;
-    const sessionFp = createSafeFingerprint(session.sessionId);
-    currentSessionFp = sessionFp;
+  const { session, initiationCookieStatus } = getOrCreateSessionWithDiagnostics(
+    req,
+    res
+  );
+  const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
+  const {
+    expectedRedirectUri,
+    allowedRedirectUris,
+    configuredCallbackOrigin,
+    canonicalAppOrigin,
+  } = getAllowedRedirectUris(req);
+  const initiatingOrigin = resolveInitiatingClientOrigin(req);
+  const sessionFp = createSafeFingerprint(session.sessionId);
 
   const requestedRedirectUri =
     typeof req.query.redirect_uri === 'string' && req.query.redirect_uri.trim()
@@ -3700,6 +3692,9 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     session.stages.redirectUriValidation = 'mismatch';
   }
   const durationMs = Date.now() - startTime;
+  logDevAuthTiming('oauth_initiate_url', durationMs, {
+    redirectProbeCached: providerRedirectUriRegistered !== null,
+  });
   const diag: DeveloperDiagnosticTelemetry = {
     serviceName: 'pesu_oauth2',
     httpStatus: 200,
@@ -3768,51 +3763,6 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
   };
 
   res.json(resp);
-  } catch (err: any) {
-    console.error('Error generating PESU OAuth URL:', err);
-    const durationMs = Date.now() - startTime;
-    const diag: DeveloperDiagnosticTelemetry = {
-      serviceName: 'pesu_oauth2',
-      httpStatus: 503,
-      errorCategory: 'TRANSIENT_UNAVAILABLE',
-      retryAttempts: 0,
-      durationMs,
-      requestId,
-      timestamp: new Date().toISOString(),
-      sessionFingerprint: currentSessionFp,
-      initiatingOrigin: currentInitiatingOrigin,
-      configuredCallbackOrigin: currentCallbackOrigin,
-      initiationCookieStatus: currentCookieStatus,
-      sessionBindingMatched: null,
-      handledByDifferentInstance: false,
-      note: err?.message || 'Failed to generate OAuth authorization URL',
-    };
-    logOAuthStructuredEvent({
-      requestId,
-      event: 'oauth_url_rejected_network_or_internal_error',
-      stateFingerprint: null,
-      sessionFingerprint: currentSessionFp,
-      transactionStatus: 'failed',
-      callbackOutcome: 'internal_error',
-      httpStatus: 503,
-      durationMs,
-      initiatingOrigin: currentInitiatingOrigin,
-      configuredCallbackOrigin: currentCallbackOrigin,
-      initiationCookieStatus: currentCookieStatus,
-      sessionBindingMatched: null,
-      handledByDifferentInstance: false,
-      note: err?.message || 'Database or internal error',
-    });
-    res.status(503).json({
-      ok: false,
-      live: true,
-      userMessage:
-        'A temporary service or connection error occurred while preparing sign-in. Please try again.',
-      error: err?.message || 'Service temporarily unavailable',
-      errorCategory: 'TRANSIENT_UNAVAILABLE',
-      diagnostics: diag,
-    });
-  }
 });
 
 function decodeJwtPayload(jwtToken: string): Record<string, unknown> | null {
@@ -4412,136 +4362,30 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
   targetSession.stages.authorizationRedirect = 'callback_received';
   targetSession.stages.tokenExchange = 'exchanging';
 
-  refreshPesuOAuthEnvFromDisk();
   const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim() ?? '';
   const clientSecret = process.env.PESU_OAUTH_CLIENT_SECRET?.trim() ?? '';
 
-  // Validate that PESU_OAUTH_CLIENT_ID and PESU_OAUTH_CLIENT_SECRET are loaded from the environment
-  if (!clientId || !clientSecret) {
-    targetSession.stages.configuration = !clientId
-      ? 'missing_client_id'
-      : 'missing_client_secret';
-    targetSession.stages.tokenExchange = 'failed';
-    const missingVar = !clientId ? 'PESU_OAUTH_CLIENT_ID' : 'PESU_OAUTH_CLIENT_SECRET';
-    const userMsg = `Local environment configuration error: ${missingVar} is missing or empty. Please configure it in your backend environment (.env).`;
-    targetSession.lastError = userMsg;
-
-    await completeOAuthTransactionRecord({
-      state,
-      status: 'failed',
-      outcomeStatus: 400,
-      outcomeErrorCategory: 'MISSING_CONFIG',
-      outcomeMessage: userMsg,
-    });
-
-    const durationMs = Date.now() - startTime;
-    const diag: DeveloperDiagnosticTelemetry = {
-      serviceName: 'pesu_oauth2',
-      httpStatus: 400,
-      errorCategory: 'MISSING_CONFIG',
-      retryAttempts: 0,
-      durationMs,
-      requestId,
-      timestamp: new Date().toISOString(),
-      stateFingerprint: stateFp,
-      sessionFingerprint: effectiveSessionFp,
-      transactionStatus: 'failed',
-      callbackOutcome: 'missing_credentials',
-      initiatingOrigin: tx.clientOrigin,
-      configuredCallbackOrigin,
-      callbackCookieStatus,
-      sessionBindingMatched: true,
-      handledByDifferentInstance,
-      note: `${missingVar} is missing from environment`,
-    };
-    targetSession.lastDiagnostics = diag;
-
-    logOAuthStructuredEvent({
-      requestId,
-      event: 'oauth_callback_missing_credentials',
-      stateFingerprint: stateFp,
-      sessionFingerprint: effectiveSessionFp,
-      transactionStatus: 'failed',
-      callbackOutcome: 'missing_credentials',
-      httpStatus: 400,
-      durationMs,
-      initiatingOrigin: tx.clientOrigin,
-      configuredCallbackOrigin,
-      callbackCookieStatus,
-      sessionBindingMatched: true,
-      handledByDifferentInstance,
-      hasClientId: Boolean(clientId),
-      hasClientSecret: Boolean(clientSecret),
-    });
-
-    const payload: PesuOAuthCallbackPostMessage = {
-      type: 'PESU_OAUTH_RESULT',
-      status: 'error',
-      ok: false,
-      state,
-      stages: targetSession.stages,
-      identity: null,
-      userMessage: userMsg,
-      error: userMsg,
-      errorCategory: 'MISSING_CONFIG',
-      diagnostics: diag,
-    };
-    res.status(400).send(renderOAuthCallbackHtml(payload, trustedOrigin));
-    return;
-  }
-
   // Case 5: Perform genuine server-side Authorization Code + PKCE S256 token exchange
-  // using exactly one supported client-authentication method
   const fetchFn = getFetch();
   try {
-    const disc = await discoverPesuOidcEndpoints(req).catch(() => null);
-    const supportedMethods = disc?.tokenEndpointAuthMethodsSupported ?? [
-      'client_secret_basic',
-      'client_secret_post',
-    ];
-
-    const envAuthMethod = (
-      process.env.PESU_OAUTH_TOKEN_AUTH_METHOD ||
-      process.env.PESU_OAUTH_AUTH_METHOD ||
-      ''
-    ).trim().toLowerCase();
-
-    // Default to 'client_secret_basic' per OIDC Core 1.0 Section 9 and RFC 6749 Section 2.3.1
-    // unless 'client_secret_post' is explicitly configured or it is the only supported method.
-    const authMethod: 'client_secret_basic' | 'client_secret_post' =
-      envAuthMethod === 'client_secret_post' || envAuthMethod === 'post'
-        ? 'client_secret_post'
-        : envAuthMethod === 'client_secret_basic' || envAuthMethod === 'basic'
-        ? 'client_secret_basic'
-        : supportedMethods.includes('client_secret_basic') || !supportedMethods.includes('client_secret_post')
-        ? 'client_secret_basic'
-        : 'client_secret_post';
+    const tokenParams = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: tx.redirectUri,
+      client_id: clientId,
+      code_verifier: tx.codeVerifier,
+    });
 
     const tokenHeaders: Record<string, string> = {
       'Content-Type': 'application/x-www-form-urlencoded',
       Accept: 'application/json',
     };
 
-    const tokenParams = new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: tx.redirectUri,
-      code_verifier: tx.codeVerifier,
-    });
-
-    if (authMethod === 'client_secret_basic') {
-      // RFC 6749 Section 2.3.1: client_secret_basic
-      // Credentials sent strictly in Authorization header.
-      // client_secret MUST NOT be sent in request body.
+    if (clientSecret) {
       const basicCredentials = Buffer.from(
         `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`
       ).toString('base64');
       tokenHeaders.Authorization = `Basic ${basicCredentials}`;
-    } else {
-      // RFC 6749 Section 2.3.1: client_secret_post
-      // Credentials sent strictly in request body.
-      // Authorization header MUST NOT be sent.
-      tokenParams.set('client_id', clientId);
       tokenParams.set('client_secret', clientSecret);
     }
 
@@ -4559,57 +4403,23 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     if (!tokenResp.ok || (!tokenData.access_token && !tokenData.id_token)) {
       targetSession.stages.tokenExchange = 'failed';
       targetSession.stages.verifiedIdentity = 'unverified';
-
       const upstreamErr =
-        typeof tokenData.error_description === 'string' && tokenData.error_description
+        typeof tokenData.error_description === 'string'
           ? tokenData.error_description
-          : typeof tokenData.error === 'string' && tokenData.error
+          : typeof tokenData.error === 'string'
           ? tokenData.error
           : `HTTP ${tokenResp.status}`;
-
       const isInvalidClient = tokenData.error === 'invalid_client';
-      const isRedirectMismatch =
-        tokenData.error === 'redirect_uri_mismatch' ||
-        /redirect.*mismatch/i.test(upstreamErr);
-      const isInvalidGrant =
-        tokenData.error === 'invalid_grant' ||
-        tokenData.error === 'expired_token' ||
-        /(grant|code|expired)/i.test(upstreamErr);
-
-      // Safe diagnostic categorization distinguishing the failure mode
-      const diagCategory: 'INVALID_CLIENT' | 'OAUTH_REDIRECT_URI_MISMATCH' | 'OAUTH_INVALID_GRANT' | 'OAUTH_TOKEN_EXCHANGE_FAILED' =
-        isInvalidClient
-          ? 'INVALID_CLIENT'
-          : isRedirectMismatch
-          ? 'OAUTH_REDIRECT_URI_MISMATCH'
-          : isInvalidGrant
-          ? 'OAUTH_INVALID_GRANT'
-          : 'OAUTH_TOKEN_EXCHANGE_FAILED';
-
-      const callbackOutcome: DeveloperDiagnosticTelemetry['callbackOutcome'] =
-        isInvalidClient
-          ? 'rejected_invalid_client'
-          : isRedirectMismatch
-          ? 'rejected_redirect_uri_mismatch'
-          : isInvalidGrant
-          ? 'rejected_invalid_grant'
-          : 'token_exchange_failed';
-
       const userMsg = isInvalidClient
         ? `Token exchange with PESU OAuth2 failed (${upstreamErr}). Verify that PESU_OAUTH_CLIENT_SECRET matches client "${clientId}" in the PESU OAuth2 Developer Portal.`
-        : isRedirectMismatch
-        ? `Token exchange with PESU OAuth2 failed (redirect_uri_mismatch: ${upstreamErr}). Ensure the registered callback URL matches the application callback origin.`
-        : isInvalidGrant
-        ? `Token exchange with PESU OAuth2 failed (invalid_grant: ${upstreamErr}). The authorization code may have expired or already been consumed.`
         : `Token exchange with PESU OAuth2 failed (${upstreamErr}).`;
-
       targetSession.lastError = userMsg;
 
       await completeOAuthTransactionRecord({
         state,
         status: 'failed',
         outcomeStatus: tokenResp.status || 502,
-        outcomeErrorCategory: diagCategory,
+        outcomeErrorCategory: 'OAUTH_TOKEN_EXCHANGE_FAILED',
         outcomeMessage: userMsg,
       });
 
@@ -4617,7 +4427,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       const diag: DeveloperDiagnosticTelemetry = {
         serviceName: 'pesu_oauth2',
         httpStatus: tokenResp.status || 502,
-        errorCategory: diagCategory,
+        errorCategory: 'OAUTH_TOKEN_EXCHANGE_FAILED',
         retryAttempts: 0,
         durationMs,
         requestId,
@@ -4625,14 +4435,12 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         stateFingerprint: stateFp,
         sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
-        callbackOutcome,
+        callbackOutcome: 'token_exchange_failed',
         initiatingOrigin: tx.clientOrigin,
         configuredCallbackOrigin,
         callbackCookieStatus,
         sessionBindingMatched: true,
         handledByDifferentInstance,
-        authMethodUsed: authMethod,
-        note: `Token exchange failed: ${upstreamErr} [${diagCategory}]`,
       };
       targetSession.lastDiagnostics = diag;
 
@@ -4642,7 +4450,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         stateFingerprint: stateFp,
         sessionFingerprint: effectiveSessionFp,
         transactionStatus: 'failed',
-        callbackOutcome,
+        callbackOutcome: 'token_exchange_failed',
         httpStatus: tokenResp.status || 502,
         durationMs,
         initiatingOrigin: tx.clientOrigin,
@@ -4650,9 +4458,6 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         callbackCookieStatus,
         sessionBindingMatched: true,
         handledByDifferentInstance,
-        authMethodUsed: authMethod,
-        hasClientId: Boolean(clientId),
-        hasClientSecret: Boolean(clientSecret),
         note: upstreamErr,
       });
 
@@ -4705,11 +4510,26 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       }
     }
 
-    // Optional userinfo fetch if accessToken is available and userinfoEndpoint exists
+    const tokenExchangeMs = Date.now() - startTime;
+
+    // Optional userinfo fetch only when id_token does not already supply a verified human name + email + campus
+    const idTokenNameResolution = resolveOAuthDisplayName(jwtClaims ?? {});
+    const needsUserinfo =
+      !jwtClaims ||
+      idTokenNameResolution.needsDisplayNameSetup ||
+      typeof jwtClaims.email !== 'string' ||
+      typeof jwtClaims.campus !== 'string';
+
     let userinfoClaims: Record<string, unknown> = {};
-    if (accessToken && tx.userinfoEndpoint) {
+    let userinfoMs = 0;
+    let userinfoSkipped = !needsUserinfo;
+    if (accessToken && tx.userinfoEndpoint && needsUserinfo) {
+      const uiStart = Date.now();
+      const uiController = new AbortController();
+      const uiTimer = setTimeout(() => uiController.abort(), 2500);
       try {
         const uiResp = await fetchFn(tx.userinfoEndpoint, {
+          signal: uiController.signal,
           headers: {
             Authorization: `Bearer ${accessToken}`,
             Accept: 'application/json',
@@ -4719,7 +4539,10 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
           userinfoClaims = (await uiResp.json()) as Record<string, unknown>;
         }
       } catch {
-        // Non-fatal if userinfo endpoint is optional
+        // Non-fatal if userinfo endpoint is optional or timed out
+      } finally {
+        clearTimeout(uiTimer);
+        userinfoMs = Date.now() - uiStart;
       }
     }
 
@@ -4727,43 +4550,15 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
     const sub = String(
       mergedClaims.sub ?? mergedClaims.prn ?? mergedClaims.srn ?? 'pesu_verified_user'
     );
-
-    const extractVerifiedHumanName = (claims: Record<string, unknown>): string | null => {
-      if (typeof claims.name === 'string') {
-        const trimmed = claims.name.trim();
-        if (trimmed && !isPesuSrnOrPrn(trimmed)) return trimmed;
-      }
-      const given = typeof claims.given_name === 'string' ? claims.given_name.trim() : '';
-      const family = typeof claims.family_name === 'string' ? claims.family_name.trim() : '';
-      const combined = `${given} ${family}`.trim();
-      if (combined && !isPesuSrnOrPrn(combined)) return combined;
-
-      if (typeof claims.preferred_username === 'string') {
-        const trimmed = claims.preferred_username.trim();
-        if (trimmed && !isPesuSrnOrPrn(trimmed) && !/^[A-Z0-9_-]{8,}$/i.test(trimmed)) {
-          return trimmed;
-        }
-      }
-      return null;
-    };
-
-    const verifiedHumanName = extractVerifiedHumanName(mergedClaims);
-    const detectedSrn =
-      (typeof mergedClaims.srn === 'string' && mergedClaims.srn) ||
-      (isPesuSrnOrPrn(mergedClaims.preferred_username)
-        ? String(mergedClaims.preferred_username)
-        : undefined) ||
-      (isPesuSrnOrPrn(mergedClaims.name)
-        ? String(mergedClaims.name)
-        : undefined) ||
-      (typeof mergedClaims.prn === 'string' && mergedClaims.prn) ||
-      undefined;
+    const resolvedOAuthName = resolveOAuthDisplayName(mergedClaims);
 
     const verifiedIdentity: PesuVerifiedIdentity = {
       sub,
-      name: verifiedHumanName || undefined,
+      name: resolvedOAuthName.needsDisplayNameSetup
+        ? undefined
+        : resolvedOAuthName.displayName,
       email: typeof mergedClaims.email === 'string' ? mergedClaims.email : undefined,
-      srn: detectedSrn,
+      srn: typeof mergedClaims.srn === 'string' ? mergedClaims.srn : undefined,
       prn: typeof mergedClaims.prn === 'string' ? mergedClaims.prn : undefined,
       campus:
         typeof mergedClaims.campus === 'string' ? mergedClaims.campus : undefined,
@@ -4806,35 +4601,51 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         ? 'EC Campus'
         : 'RR Campus';
 
+    const dbSyncStart = Date.now();
     let syncedUser: User | null = null;
     let syncedProfile: Profile | null = null;
+    const userMsg = `Authenticated and verified identity (${
+      verifiedIdentity.name || 'PESU Student'
+    }) via PKCE S256 token exchange.`;
+
     try {
       const synced = await upsertUserAndProfile({
         uid: dbUid,
         email: verifiedIdentity.email || `${dbUid}@pesu.pes.edu`,
-        displayName: verifiedHumanName || 'PES Student',
+        displayName: resolvedOAuthName.displayName,
+        verifiedHumanName: !resolvedOAuthName.needsDisplayNameSetup,
         campus: resolvedCampus,
         program: verifiedIdentity.program || 'B.Tech CSE',
         pesuOidcSub: sub,
-        pesPrnOrSrn: detectedSrn,
         verificationStatus: 'verified_pesu_oidc',
       });
       syncedUser = synced.user;
       syncedProfile = synced.profile;
 
-      await createOAuthSessionRecord({
-        sessionToken: dbSessionToken,
-        initiatingSessionIdHash: tx.initiatingSessionIdHash,
-        uid: dbUid,
-        pesuSub: sub,
-        accessToken: accessToken || null,
-        refreshToken:
-          typeof tokenData.refresh_token === 'string'
-            ? tokenData.refresh_token
-            : null,
-        scopes: verifiedIdentity.grantedScopes,
-        expiresAt: expiresAtDate,
-      });
+      await Promise.all([
+        createOAuthSessionRecord({
+          sessionToken: dbSessionToken,
+          initiatingSessionIdHash: tx.initiatingSessionIdHash,
+          uid: dbUid,
+          pesuSub: sub,
+          accessToken: accessToken || null,
+          refreshToken:
+            typeof tokenData.refresh_token === 'string'
+              ? tokenData.refresh_token
+              : null,
+          scopes: verifiedIdentity.grantedScopes,
+          expiresAt: expiresAtDate,
+        }),
+        completeOAuthTransactionRecord({
+          state,
+          status: 'completed',
+          completedUid: dbUid,
+          outcomeStatus: 200,
+          outcomeErrorCategory: 'NONE',
+          outcomeMessage: userMsg,
+          outcomeIdentity: verifiedIdentity,
+        }),
+      ]);
 
       const cookieFlags = buildSessionCookieFlags(req, expiresInSec);
       res.append(
@@ -4843,27 +4654,30 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
       );
     } catch (dbErr) {
       console.error('Failed to persist PESU OAuth user/session in PostgreSQL:', dbErr);
+      await completeOAuthTransactionRecord({
+        state,
+        status: 'completed',
+        completedUid: dbUid,
+        outcomeStatus: 200,
+        outcomeErrorCategory: 'NONE',
+        outcomeMessage: userMsg,
+        outcomeIdentity: verifiedIdentity,
+      }).catch(() => undefined);
     }
+    const dbSyncMs = Date.now() - dbSyncStart;
 
     targetSession.dbSessionToken = dbSessionToken;
     targetSession.dbUser = syncedUser;
     targetSession.dbProfile = syncedProfile;
 
-    const userMsg = `Authenticated and verified identity (${
-      verifiedIdentity.name || verifiedIdentity.sub
-    }) via PKCE S256 token exchange.`;
-
-    await completeOAuthTransactionRecord({
-      state,
-      status: 'completed',
-      completedUid: dbUid,
-      outcomeStatus: 200,
-      outcomeErrorCategory: 'NONE',
-      outcomeMessage: userMsg,
-      outcomeIdentity: verifiedIdentity,
-    });
-
     const durationMs = Date.now() - startTime;
+    logDevAuthTiming('oauth_callback_complete', durationMs, {
+      tokenExchangeMs,
+      userinfoMs,
+      userinfoSkipped,
+      dbSyncMs,
+      hasVerifiedHumanName: !resolvedOAuthName.needsDisplayNameSetup,
+    });
     const diag: DeveloperDiagnosticTelemetry = {
       serviceName: 'pesu_oauth2',
       httpStatus: 200,
@@ -4997,38 +4811,53 @@ app.get(['/auth/pesu/callback', '/auth/pesu/callback/'], pesuCallbackHandler);
  * Never returns raw bearer session tokens in JSON responses.
  */
 app.get('/api/auth/session', async (req: AuthenticatedRequest, res) => {
+  const startTime = Date.now();
   try {
     // Ensure the browser has a signed session cookie (`quackathon_sid`) ready before any OAuth flow starts
     getOrCreateSession(req, res);
+    const { canonicalAppOrigin } = getAllowedRedirectUris(req);
 
     const authUser = await resolveOptionalUser(req);
     if (!authUser) {
+      logDevAuthTiming('session_restore', Date.now() - startTime, {
+        authenticated: false,
+      });
       res.json({
         ok: true,
         authenticated: false,
         user: null,
         profile: null,
+        canonicalAppOrigin,
       });
       return;
     }
 
     const record = await getUserAndProfileByUid(authUser.uid);
     if (!record) {
+      logDevAuthTiming('session_restore', Date.now() - startTime, {
+        authenticated: false,
+      });
       res.json({
         ok: true,
         authenticated: false,
         user: null,
         profile: null,
+        canonicalAppOrigin,
       });
       return;
     }
 
+    logDevAuthTiming('session_restore', Date.now() - startTime, {
+      authenticated: true,
+      authSource: authUser.authSource,
+    });
     res.json({
       ok: true,
       authenticated: true,
       authSource: authUser.authSource,
       user: record.user,
       profile: record.profile,
+      canonicalAppOrigin,
     });
   } catch (error) {
     console.error('Error in GET /api/auth/session:', error);
@@ -6027,9 +5856,18 @@ app.get('/api/events/pesu-public', async (req: AuthenticatedRequest, res) => {
  * Loads all real application state from PostgreSQL (zero synthetic seed data).
  */
 app.get('/api/bootstrap', async (req: AuthenticatedRequest, res) => {
+  const startTime = Date.now();
   try {
+    const scope =
+      req.query.scope === 'initial' ? ('initial' as const) : ('full' as const);
     const authUser = await resolveOptionalUser(req);
-    const data = await loadBootstrapData(authUser?.uid ?? null);
+    const data = await loadBootstrapData(authUser?.uid ?? null, { scope });
+    logDevAuthTiming('bootstrap_load', Date.now() - startTime, {
+      scope,
+      authenticated: Boolean(authUser),
+      usersCount: data.users.length,
+      hackathonsCount: data.hackathons.length,
+    });
     res.json({
       ok: true,
       authenticatedUser: authUser
@@ -6367,10 +6205,10 @@ app.get('/api/hackathons/:id', async (req, res, next) => {
 app.put('/api/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const authUser = req.user!;
-    const { profile, privacyPreferences, displayName } = req.body as {
+    const { displayName, profile, privacyPreferences } = req.body as {
+      displayName?: string;
       profile?: Profile;
       privacyPreferences?: User['privacyPreferences'];
-      displayName?: string;
     };
 
     if (!profile) {
@@ -6385,13 +6223,7 @@ app.put('/api/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
       uid: authUser.uid,
       displayName,
       profile: { ...profile, uid: authUser.uid },
-      privacyPreferences: privacyPreferences ?? {
-        profileVisible: true,
-        githubConsent: Boolean(profile.githubUsername),
-        aiEnrichmentConsent: false,
-        academyAnnouncementsOptIn: false,
-        academyTimetableOptIn: false,
-      },
+      privacyPreferences,
     });
 
     res.json({
@@ -6400,11 +6232,9 @@ app.put('/api/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
       profile: updated.profile,
     });
   } catch (error) {
-    console.error('Error in PUT /api/profile:', error);
-    res.status(500).json({
-      ok: false,
-      error: 'Failed to save profile.',
-    });
+    if (handleRepositoryError(error, res, 'Failed to save profile.')) {
+      return;
+    }
   }
 });
 
@@ -6435,7 +6265,7 @@ app.put(
         hackathonSlug,
         uid: authUser.uid,
         intent: body.intent ?? 'looking',
-        desiredRoles: body.desiredRoles ?? prof?.preferredRoles ?? ['Generalist'],
+        desiredRoles: body.desiredRoles ?? prof?.preferredRoles ?? [],
         skillsOffered: body.skillsOffered ?? prof?.skillTags ?? [],
         availabilityWindows: body.availabilityWindows ?? [
           'Sat Morning (8am–1pm)',
@@ -6451,11 +6281,15 @@ app.put(
         participation,
       });
     } catch (error) {
-      console.error('Error in PUT /api/participations/:hackathonSlug:', error);
-      res.status(500).json({
-        ok: false,
-        error: 'Failed to update event participation.',
-      });
+      if (
+        handleRepositoryError(
+          error,
+          res,
+          'Failed to update event participation.'
+        )
+      ) {
+        return;
+      }
     }
   }
 );
@@ -6732,31 +6566,9 @@ app.post('/api/teams', requireAuth, async (req: AuthenticatedRequest, res) => {
       ...created,
     });
   } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.startsWith('ALREADY_IN_TEAM:')
-    ) {
-      res.status(409).json({
-        ok: false,
-        error: error.message.replace('ALREADY_IN_TEAM: ', ''),
-        userMessage: error.message.replace('ALREADY_IN_TEAM: ', ''),
-      });
+    if (handleRepositoryError(error, res, 'Failed to create team.')) {
       return;
     }
-    if (error instanceof Error && error.message.startsWith('EVENT_')) {
-      const cleanMsg = error.message.replace(/^[A-Z_]+:\s*/, '');
-      res.status(400).json({
-        ok: false,
-        error: cleanMsg,
-        userMessage: cleanMsg,
-      });
-      return;
-    }
-    console.error('Error in POST /api/teams:', error);
-    res.status(500).json({
-      ok: false,
-      error: 'Failed to create team.',
-    });
   }
 });
 
@@ -6798,7 +6610,6 @@ function handleRepositoryError(
     msg.startsWith('VALIDATION_ERROR:') ||
     msg.startsWith('SELF_SWIPE:') ||
     msg.startsWith('INELIGIBLE_EVENT:') ||
-    msg.startsWith('EVENT_') ||
     msg.startsWith('EMPTY_MESSAGE:') ||
     msg.startsWith('INVALID_BLOCK:') ||
     msg.startsWith('INVALID_PROPOSAL:')
@@ -6834,10 +6645,15 @@ app.get(
       const searchQuery =
         typeof req.query.q === 'string' ? req.query.q.trim() : '';
 
-      const data = await loadBootstrapData(authUser.uid);
+      const data = await loadBootstrapData(authUser.uid, { scope: 'initial' });
       const hackathon =
         data.hackathons.find((h) => h.id === requestedHackathonId) ??
-        data.hackathons.find((h) => h.matchable) ??
+        data.hackathons.find(
+          (h) =>
+            h.matchable &&
+            h.findTeammatesEligible !== false &&
+            h.registrationStatus !== 'CLOSED'
+        ) ??
         data.hackathons[0] ??
         null;
 
@@ -6845,6 +6661,7 @@ app.get(
         res.json({
           ok: true,
           hackathonId: null,
+          eventEligible: false,
           candidates: [],
           students: [],
           totalEligibleCount: 0,
@@ -6854,14 +6671,35 @@ app.get(
         return;
       }
 
-      const currentUser =
-        data.users.find((u) => u.uid === authUser.uid) ?? authUser;
+      const isHackathonEligible =
+        hackathon.matchable &&
+        hackathon.findTeammatesEligible !== false &&
+        hackathon.registrationStatus !== 'CLOSED' &&
+        hackathon.status !== 'completed' &&
+        hackathon.status !== 'archived' &&
+        hackathon.status !== 'registration_closed';
+
+      if (!isHackathonEligible) {
+        res.json({
+          ok: true,
+          hackathonId: hackathon.id,
+          eventEligible: false,
+          candidates: [],
+          students: [],
+          totalEligibleCount: 0,
+          teamCapabilities: null,
+          activeTeam: null,
+        });
+        return;
+      }
+
       const currentProfile = data.profiles[authUser.uid];
 
       if (!currentProfile) {
         res.json({
           ok: true,
           hackathonId: hackathon.id,
+          eventEligible: true,
           candidates: [],
           students: [],
           totalEligibleCount: 0,
@@ -6910,6 +6748,7 @@ app.get(
       res.json({
         ok: true,
         hackathonId: hackathon.id,
+        eventEligible: true,
         candidates,
         students: candidates,
         totalEligibleCount,
@@ -7265,6 +7104,7 @@ app.get('/api/teams/:id', requireAuth, async (req: AuthenticatedRequest, res) =>
       });
       return;
     }
+
     const summary = buildRichTeamSummary({
       team,
       viewerUid: authUser.uid,

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   ExecutionMode,
   FeaturedProject,
@@ -7,11 +7,13 @@ import {
   User,
 } from '../types/domain';
 import { GitHubRepositoryItem } from '../types/apiContracts';
+import { WORK_STYLE_TAXONOMY } from '../data/seedData';
 import {
-  INTEREST_TAXONOMY,
-  ROLE_TAXONOMY,
-  WORK_STYLE_TAXONOMY,
-} from '../data/seedData';
+  QUICK_INTEREST_OPTIONS,
+  QUICK_ROLE_OPTIONS,
+  QUICK_SKILL_OPTIONS,
+} from './QuickOnboardingView';
+import { normalizeHumanDisplayName } from '../lib/displayName';
 import {
   Github,
   Check,
@@ -20,992 +22,562 @@ import {
   Trash2,
   ChevronDown,
   ChevronUp,
-  Bookmark,
   Search,
-  GitFork,
   ExternalLink,
+  Shield,
+  X,
+  Loader2,
 } from 'lucide-react';
 import {
   fetchLiveGitHubRepositoriesDeterministically,
-  runBoundedGitHubEnrichmentDraft,
   runLiveGitHubAndGeminiEnrichment,
 } from '../services/adapters';
 import { Modal } from './Modal';
-
-interface ChipListEditorProps {
-  label: string;
-  hint?: string;
-  placeholder: string;
-  values: string[];
-  onChange: (values: string[]) => void;
-}
-
-const ChipListEditor: React.FC<ChipListEditorProps> = ({
-  label,
-  hint,
-  placeholder,
-  values,
-  onChange,
-}) => {
-  const [draft, setDraft] = useState('');
-
-  const addValue = () => {
-    const trimmed = draft.trim();
-    if (
-      trimmed &&
-      !values.some((v) => v.toLowerCase() === trimmed.toLowerCase())
-    ) {
-      onChange([...values, trimmed]);
-      setDraft('');
-    }
-  };
-
-  return (
-    <div>
-      <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-        {label}
-        {hint && (
-          <span className="ml-1 font-normal text-slate-400">{hint}</span>
-        )}
-      </label>
-      {values.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-1.5">
-          {values.map((value) => (
-            <span
-              key={value}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 text-xs font-medium"
-            >
-              {value}
-              <button
-                type="button"
-                onClick={() => onChange(values.filter((v) => v !== value))}
-                className="text-slate-400 hover:text-red-600 cursor-pointer"
-                aria-label={`Remove ${value}`}
-              >
-                ×
-              </button>
-            </span>
-          ))}
-        </div>
-      )}
-      <div className="flex gap-2">
-        <input
-          type="text"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              addValue();
-            }
-          }}
-          placeholder={placeholder}
-          className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
-        />
-        <button
-          type="button"
-          onClick={addValue}
-          className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
-        >
-          Add
-        </button>
-      </div>
-    </div>
-  );
-};
-
-interface PortfolioLink {
-  label: string;
-  url: string;
-}
-
-const PortfolioLinkEditor: React.FC<{
-  links: PortfolioLink[];
-  onChange: (links: PortfolioLink[]) => void;
-}> = ({ links, onChange }) => {
-  const [label, setLabel] = useState('');
-  const [url, setUrl] = useState('');
-
-  const addLink = () => {
-    const trimmedLabel = label.trim();
-    const trimmedUrl = url.trim();
-    if (!trimmedUrl) return;
-    onChange([
-      ...links,
-      {
-        label: trimmedLabel || trimmedUrl,
-        url: trimmedUrl,
-      },
-    ]);
-    setLabel('');
-    setUrl('');
-  };
-
-  return (
-    <div>
-      <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-        Portfolio Links
-        <span className="ml-1 font-normal text-slate-400">(Optional)</span>
-      </label>
-      {links.length > 0 && (
-        <div className="space-y-1.5 mb-2">
-          {links.map((link, index) => (
-            <div
-              key={`${link.url}-${index}`}
-              className="flex items-center justify-between gap-2 text-xs text-slate-600 dark:text-slate-400"
-            >
-              <span className="truncate">
-                <strong className="text-slate-700 dark:text-slate-300">
-                  {link.label}
-                </strong>{' '}
-                · {link.url}
-              </span>
-              <button
-                type="button"
-                onClick={() =>
-                  onChange(links.filter((_, i) => i !== index))
-                }
-                className="text-slate-400 hover:text-red-600 cursor-pointer shrink-0"
-                aria-label="Remove portfolio link"
-              >
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-      <div className="flex gap-2">
-        <input
-          type="text"
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          placeholder="Label (e.g. GitHub)"
-          className="w-28 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
-        />
-        <input
-          type="url"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://…"
-          className="flex-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
-        />
-        <button
-          type="button"
-          onClick={addLink}
-          className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
-        >
-          Add
-        </button>
-      </div>
-    </div>
-  );
-};
-
-function normalizeRepoIdentity(repo: {
-  url?: string;
-  htmlUrl?: string;
-  sourceUrl?: string;
-  name?: string;
-  title?: string;
-}, fallbackOwner?: string): string {
-  const rawUrl = (repo.url || repo.htmlUrl || repo.sourceUrl || '').trim();
-  if (rawUrl) {
-    return rawUrl.toLowerCase().replace(/\/+$/, '');
-  }
-  const repoName = (repo.name || repo.title || '').trim().toLowerCase();
-  const owner = (fallbackOwner || '').trim().toLowerCase();
-  return owner ? `https://github.com/${owner}/${repoName}` : repoName;
-}
-
-type RepoFilterTab = 'all' | 'original' | 'forks';
-
-export const QUICK_INTEREST_OPTIONS = [
-  'AI/ML',
-  'Web Development',
-  'Cybersecurity',
-  'Robotics',
-  'Data Science',
-  'Design',
-  'Cloud & DevOps',
-  'Mobile Apps',
-  'Open Source Systems',
-  'Blockchain',
-];
-
-export const QUICK_SKILL_OPTIONS = [
-  'Python',
-  'JavaScript',
-  'React',
-  'TypeScript',
-  'Node.js',
-  'SQL',
-  'C++',
-  'Figma',
-  'Docker',
-  'Go',
-  'PyTorch',
-  'Java',
-];
-
-export const QUICK_ROLE_OPTIONS = [
-  'Frontend',
-  'Backend',
-  'ML/Data',
-  'Design',
-  'Hardware',
-  'Flexible',
-];
 
 interface OnboardingAndProfileModalProps {
   currentUser: User;
   profile: Profile;
   executionMode: ExecutionMode;
   isInline?: boolean;
-  isQuickSetup?: boolean;
   onSaveProfile: (
     updatedProfile: Profile,
     updatedPrivacy: User['privacyPreferences'],
-    displayName?: string
+    updatedDisplayName?: string
   ) => void;
   onClose: () => void;
   onNotify?: (msg: string) => void;
 }
 
-export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps> = ({
+const MAX_FEATURED_PROJECTS = 3;
+
+export const OnboardingAndProfileModal: React.FC<
+  OnboardingAndProfileModalProps
+> = ({
   currentUser,
   profile,
   executionMode,
   isInline = false,
-  isQuickSetup = !isInline,
   onSaveProfile,
   onClose,
   onNotify,
 }) => {
-  const draftStorageKey = `quackathon_profile_draft_${currentUser.uid}`;
-
-  const loadInitialProfile = (): Profile => {
-    try {
-      const saved = localStorage.getItem(draftStorageKey);
-      if (saved) {
-        return { ...profile, ...JSON.parse(saved) };
-      }
-    } catch {
-      // Ignore corrupt draft
-    }
-    return profile;
-  };
-
-  const initial = loadInitialProfile();
-
-  // Display name & essential fields
-  const [displayName, setDisplayName] = useState(currentUser.displayName || '');
-  const [headline, setHeadline] = useState(initial.headline);
-  const [about, setAbout] = useState(initial.about);
-  const [isFirstTimeHacker, setIsFirstTimeHacker] = useState(
-    Boolean(initial.isFirstTimeHacker)
+  const [displayName, setDisplayName] = useState(
+    currentUser.needsDisplayNameSetup ? '' : currentUser.displayName
   );
-  const [interestTags, setInterestTags] = useState<string[]>(initial.interestTags);
-  const [customInterestInput, setCustomInterestInput] = useState('');
-  const [skillTags, setSkillTags] = useState<string[]>(initial.skillTags);
+  const [nameError, setNameError] = useState<string | null>(null);
+
+  const [interestTags, setInterestTags] = useState<string[]>(
+    profile.interestTags ?? []
+  );
+  const [skillTags, setSkillTags] = useState<string[]>(profile.skillTags ?? []);
   const [customSkillInput, setCustomSkillInput] = useState('');
   const [preferredRoles, setPreferredRoles] = useState<string[]>(
-    initial.preferredRoles
+    profile.preferredRoles ?? []
+  );
+
+  // Progressive disclosure sections (collapsed by default)
+  const [showMoreDetails, setShowMoreDetails] = useState(false);
+  const [showPrivacySettings, setShowPrivacySettings] = useState(false);
+
+  // Optional More Details fields
+  const [headline, setHeadline] = useState(profile.headline ?? '');
+  const [about, setAbout] = useState(profile.about ?? '');
+  const [isFirstTimeHacker, setIsFirstTimeHacker] = useState(
+    Boolean(profile.isFirstTimeHacker)
+  );
+  const [githubUsername, setGithubUsername] = useState(
+    profile.githubUsername ?? ''
   );
   const [featuredProjects, setFeaturedProjects] = useState<FeaturedProject[]>(
-    initial.featuredProjects
-  );
-
-  // Progressive disclosure section toggle (collapsed in quick setup, expanded in inline profile)
-  const [showMoreDetails, setShowMoreDetails] = useState(!isQuickSetup);
-
-  // Add Project inline state
-  const [showAddProjectForm, setShowAddProjectForm] = useState(false);
-  const [newProjTitle, setNewProjTitle] = useState('');
-  const [newProjDesc, setNewProjDesc] = useState('');
-  const [newProjTags, setNewProjTags] = useState('');
-
-  // GitHub Import & "Choose your projects" modal state
-  const [githubUsername, setGithubUsername] = useState(
-    initial.githubUsername ?? ''
-  );
-  const [isFetchingGitHub, setIsFetchingGitHub] = useState(false);
-  const [githubStatusError, setGithubStatusError] = useState<string | null>(null);
-  const [showRepoPickerModal, setShowRepoPickerModal] = useState(false);
-  const [fetchedRepos, setFetchedRepos] = useState<GitHubRepositoryItem[]>([]);
-  const [repoSearchQuery, setRepoSearchQuery] = useState('');
-  const [repoFilterTab, setRepoFilterTab] = useState<RepoFilterTab>('original');
-  const [selectedRepoKeys, setSelectedRepoKeys] = useState<Set<string>>(
-    new Set()
-  );
-
-  // Optional AI Enrichment state ("Make my project descriptions better ✨")
-  const [isEnhancingWithAI, setIsEnhancingWithAI] = useState(false);
-  const [enrichmentDraft, setEnrichmentDraft] =
-    useState<ProfileEvidenceDraft | null>(null);
-  const [suggestedBioDraft, setSuggestedBioDraft] = useState<string>('');
-  const [approveSuggestedBio, setApproveSuggestedBio] = useState(false);
-
-  // Collapsed Advanced & Privacy sections
-  const [showPreferencesSection, setShowPreferencesSection] = useState(false);
-  const [showPrivacySection, setShowPrivacySection] = useState(false);
-
-  // Advanced Collaboration Preferences & Privacy Options
-  const [rolesWantToLearn, setRolesWantToLearn] = useState<string[]>(
-    initial.rolesWantToLearn
-  );
-  const [workingStyleTags, setWorkingStyleTags] = useState<string[]>(
-    initial.workingStyleTags
-  );
-  const [icebreakerPrompt, setIcebreakerPrompt] = useState(
-    initial.icebreakerPrompt ?? ''
-  );
-  const [visibility, setVisibility] = useState<Profile['visibility']>(
-    initial.visibility
-  );
-  const [privacyPreferences, setPrivacyPreferences] = useState<
-    User['privacyPreferences']
-  >(currentUser.privacyPreferences);
-  const [projectDomains, setProjectDomains] = useState<string[]>(
-    initial.projectDomains ?? []
-  );
-  const [topicsToExplore, setTopicsToExplore] = useState<string[]>(
-    initial.topicsToExplore ?? []
-  );
-  const [hackathonGoals, setHackathonGoals] = useState<string[]>(
-    initial.hackathonGoals ?? []
+    (profile.featuredProjects ?? []).slice(0, MAX_FEATURED_PROJECTS)
   );
   const [portfolioLinks, setPortfolioLinks] = useState<
     { label: string; url: string }[]
-  >(initial.portfolioLinks ?? []);
+  >(profile.portfolioLinks ?? []);
+  const [workingStyleTags, setWorkingStyleTags] = useState<string[]>(
+    profile.workingStyleTags ?? []
+  );
+  const [rolesWantToLearn, setRolesWantToLearn] = useState<string[]>(
+    profile.rolesWantToLearn ?? []
+  );
+  const [icebreakerPrompt, setIcebreakerPrompt] = useState(
+    profile.icebreakerPrompt ?? ''
+  );
 
-  useEffect(() => {
-    setHeadline(profile.headline);
-    setAbout(profile.about);
-    setIsFirstTimeHacker(Boolean(profile.isFirstTimeHacker));
-    setInterestTags(profile.interestTags);
-    setSkillTags(profile.skillTags);
-    setPreferredRoles(profile.preferredRoles);
-    setFeaturedProjects(profile.featuredProjects);
-    setGithubUsername(profile.githubUsername ?? '');
-    setRolesWantToLearn(profile.rolesWantToLearn);
-    setWorkingStyleTags(profile.workingStyleTags);
-    setIcebreakerPrompt(profile.icebreakerPrompt ?? '');
-    setVisibility(profile.visibility);
-    setPrivacyPreferences(currentUser.privacyPreferences);
-    setProjectDomains(profile.projectDomains ?? []);
-    setTopicsToExplore(profile.topicsToExplore ?? []);
-    setHackathonGoals(profile.hackathonGoals ?? []);
-    setPortfolioLinks(profile.portfolioLinks ?? []);
-  }, [currentUser.uid, profile, currentUser.privacyPreferences]);
+  // Manual project input
+  const [newProjTitle, setNewProjTitle] = useState('');
+  const [newProjDesc, setNewProjDesc] = useState('');
+  const [newProjUrl, setNewProjUrl] = useState('');
 
-  const toggleItem = (
-    item: string,
-    list: string[],
-    setter: React.Dispatch<React.SetStateAction<string[]>>
-  ) => {
-    if (list.includes(item)) {
-      setter(list.filter((i) => i !== item));
-    } else {
-      setter([...list, item]);
-    }
+  // Portfolio link input
+  const [newLinkLabel, setNewLinkLabel] = useState('');
+  const [newLinkUrl, setNewLinkUrl] = useState('');
+
+  // GitHub picker state (user explicitly selects up to 3 repos; never auto-displays all)
+  const [githubRepos, setGithubRepos] = useState<GitHubRepositoryItem[]>([]);
+  const [githubLoading, setGithubLoading] = useState(false);
+  const [githubError, setGithubError] = useState<string | null>(null);
+  const [repoSearch, setRepoSearch] = useState('');
+
+  // Optional AI enrichment (strictly inside More Details with explicit consent + review)
+  const [aiConsentChecked, setAiConsentChecked] = useState(
+    Boolean(currentUser.privacyPreferences?.aiEnrichmentConsent)
+  );
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiDraft, setAiDraft] = useState<{
+    draft: ProfileEvidenceDraft;
+    suggestedBio?: string;
+    suggestedIcebreaker?: string;
+  } | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
+
+  // Privacy preferences
+  const [profileVisible, setProfileVisible] = useState(
+    currentUser.privacyPreferences?.profileVisible !== false &&
+      profile.visibility !== 'hidden'
+  );
+  const [academyOptIn, setAcademyOptIn] = useState(
+    Boolean(currentUser.privacyPreferences?.academyAnnouncementsOptIn)
+  );
+
+  const interestOptions = useMemo(() => {
+    const merged = new Set<string>([...QUICK_INTEREST_OPTIONS, ...interestTags]);
+    return Array.from(merged);
+  }, [interestTags]);
+
+  const roleOptions = useMemo(() => {
+    const merged = new Set<string>([...QUICK_ROLE_OPTIONS, ...preferredRoles]);
+    return Array.from(merged);
+  }, [preferredRoles]);
+
+  const customSkillsOnly = useMemo(
+    () =>
+      skillTags.filter(
+        (sk) =>
+          !QUICK_SKILL_OPTIONS.some(
+            (preset) => preset.toLowerCase() === sk.toLowerCase()
+          )
+      ),
+    [skillTags]
+  );
+
+  const filteredGithubRepos = useMemo(() => {
+    const q = repoSearch.trim().toLowerCase();
+    if (!q) return githubRepos;
+    return githubRepos.filter(
+      (r) =>
+        r.name.toLowerCase().includes(q) ||
+        (r.description ?? '').toLowerCase().includes(q) ||
+        (r.language ?? '').toLowerCase().includes(q)
+    );
+  }, [githubRepos, repoSearch]);
+
+  const toggleInterest = (tag: string) => {
+    setInterestTags((prev) => {
+      if (prev.includes(tag)) return prev.filter((t) => t !== tag);
+      if (prev.length >= 3) return prev;
+      return [...prev, tag];
+    });
   };
 
-  const handleAddCustomInterest = () => {
-    const trimmed = customInterestInput.trim();
-    if (trimmed && !interestTags.includes(trimmed)) {
-      setInterestTags([...interestTags, trimmed]);
-      setCustomInterestInput('');
-    }
+  const toggleSkill = (sk: string) => {
+    setSkillTags((prev) =>
+      prev.includes(sk) ? prev.filter((s) => s !== sk) : [...prev, sk]
+    );
   };
 
   const handleAddCustomSkill = () => {
     const trimmed = customSkillInput.trim();
-    if (trimmed && !skillTags.includes(trimmed)) {
-      setSkillTags([...skillTags, trimmed]);
-      setCustomSkillInput('');
+    if (!trimmed) return;
+    if (!skillTags.some((s) => s.toLowerCase() === trimmed.toLowerCase())) {
+      setSkillTags((prev) => [...prev, trimmed]);
+    }
+    setCustomSkillInput('');
+  };
+
+  const toggleRole = (role: string) => {
+    setPreferredRoles((prev) =>
+      prev.includes(role) ? prev.filter((r) => r !== role) : [role]
+    );
+  };
+
+  const toggleWorkStyle = (style: string) => {
+    setWorkingStyleTags((prev) =>
+      prev.includes(style) ? prev.filter((s) => s !== style) : [...prev, style]
+    );
+  };
+
+  const handleFetchGithubRepos = async () => {
+    const handle = githubUsername.trim().replace(/^@/, '');
+    if (!handle) {
+      setGithubError('Enter a GitHub username first.');
+      return;
+    }
+    setGithubLoading(true);
+    setGithubError(null);
+    try {
+      const res = await fetchLiveGitHubRepositoriesDeterministically({
+        uid: currentUser.uid,
+        githubUsername: handle,
+      });
+      if (!res.ok || !res.repositories) {
+        setGithubError(res.errorMessage || 'Could not load public repositories.');
+        setGithubRepos([]);
+      } else {
+        setGithubRepos(res.repositories);
+        if (res.repositories.length === 0) {
+          setGithubError('No public repositories found for this username.');
+        }
+      }
+    } catch {
+      setGithubError('Unable to reach GitHub right now.');
+    } finally {
+      setGithubLoading(false);
     }
   };
 
-  const handleAddProject = () => {
-    if (!newProjTitle.trim() || !newProjDesc.trim()) return;
+  const isRepoFeatured = (repo: GitHubRepositoryItem) => {
+    const targetUrl = (repo.htmlUrl || '').toLowerCase().replace(/\/+$/, '');
+    return featuredProjects.some(
+      (p) =>
+        (p.sourceUrl &&
+          p.sourceUrl.toLowerCase().replace(/\/+$/, '') === targetUrl) ||
+        p.title.toLowerCase() === repo.name.toLowerCase()
+    );
+  };
+
+  const toggleRepoFeatured = (repo: GitHubRepositoryItem) => {
+    const targetUrl = (repo.htmlUrl || '').toLowerCase().replace(/\/+$/, '');
+    const exists = isRepoFeatured(repo);
+    if (exists) {
+      setFeaturedProjects((prev) =>
+        prev.filter(
+          (p) =>
+            !(
+              (p.sourceUrl &&
+                p.sourceUrl.toLowerCase().replace(/\/+$/, '') === targetUrl) ||
+              p.title.toLowerCase() === repo.name.toLowerCase()
+            )
+        )
+      );
+      return;
+    }
+    if (featuredProjects.length >= MAX_FEATURED_PROJECTS) {
+      onNotify?.(
+        `You can feature up to ${MAX_FEATURED_PROJECTS} projects. Deselect one first.`
+      );
+      return;
+    }
     const proj: FeaturedProject = {
-      id: `proj_${Date.now()}`,
-      title: newProjTitle.trim(),
-      description: newProjDesc.trim(),
-      tags: newProjTags
-        .split(',')
-        .map((t) => t.trim())
-        .filter(Boolean),
+      id: `gh_${repo.name}_${Date.now()}`,
+      title: repo.name,
+      description:
+        repo.description?.trim() ||
+        `Public GitHub repository (${repo.language || 'Code'})`,
+      tags: Array.from(
+        new Set([repo.language, ...(repo.topics ?? [])].filter(Boolean) as string[])
+      ).slice(0, 5),
+      sourceUrl: repo.htmlUrl,
     };
-    setFeaturedProjects([...featuredProjects, proj]);
+    setFeaturedProjects((prev) => [...prev, proj]);
+  };
+
+  const handleAddManualProject = () => {
+    if (!newProjTitle.trim()) return;
+    if (featuredProjects.length >= MAX_FEATURED_PROJECTS) {
+      onNotify?.(`You can feature up to ${MAX_FEATURED_PROJECTS} projects.`);
+      return;
+    }
+    setFeaturedProjects((prev) => [
+      ...prev,
+      {
+        id: `manual_${Date.now()}`,
+        title: newProjTitle.trim(),
+        description: newProjDesc.trim(),
+        tags: [],
+        sourceUrl: newProjUrl.trim() || undefined,
+      },
+    ]);
     setNewProjTitle('');
     setNewProjDesc('');
-    setNewProjTags('');
-    setShowAddProjectForm(false);
-    onNotify?.('Project added to profile.');
+    setNewProjUrl('');
   };
 
-  // Opens "Choose your projects" modal with all public GitHub repositories (0 Gemini calls)
-  const handleImportFromGitHub = async () => {
-    const username = githubUsername.trim().replace(/^@/, '');
-    if (!username) {
-      setGithubStatusError('Enter your GitHub username first.');
+  const handleAddPortfolioLink = () => {
+    const url = newLinkUrl.trim();
+    if (!url) return;
+    setPortfolioLinks((prev) => [
+      ...prev,
+      { label: newLinkLabel.trim() || url, url },
+    ]);
+    setNewLinkLabel('');
+    setNewLinkUrl('');
+  };
+
+  const handleRunOptionalAiEnrichment = async () => {
+    if (!aiConsentChecked) {
+      setAiError('Please enable consent above before requesting an AI draft.');
       return;
     }
-    setIsFetchingGitHub(true);
-    setGithubStatusError(null);
+    const handle = githubUsername.trim().replace(/^@/, '');
+    if (!handle) {
+      setAiError('Enter your GitHub username above to draft suggestions.');
+      return;
+    }
+    setAiLoading(true);
+    setAiError(null);
+    setAiDraft(null);
     try {
-      if (executionMode === 'live') {
-        const res = await fetchLiveGitHubRepositoriesDeterministically({
-          uid: currentUser.uid,
-          githubUsername: username,
-          includeForks: true,
-        });
-        if (res.ok) {
-          const allRepos =
-            res.allRepositories ??
-            res.repositories ??
-            res.rawGitHubPayload?.allRepositories ??
-            res.rawGitHubPayload?.repositories ??
-            [];
-          setFetchedRepos(allRepos);
-          setRepoSearchQuery('');
-          // Default to Original tab unless the user only has forks
-          const hasOriginal = allRepos.some((r) => !r.fork);
-          setRepoFilterTab(hasOriginal ? 'original' : 'all');
-
-          // Pre-check repositories that are already in featuredProjects by URL/identity
-          const existingKeys = new Set(
-            featuredProjects.map((fp) => normalizeRepoIdentity(fp, username))
-          );
-          const initialSelected = new Set<string>();
-          for (const repo of allRepos) {
-            const key = normalizeRepoIdentity(repo, username);
-            if (existingKeys.has(key)) {
-              initialSelected.add(key);
-            }
-          }
-          setSelectedRepoKeys(initialSelected);
-          setShowRepoPickerModal(true);
-          return;
-        }
-        setGithubStatusError(
-          res.errorMessage || 'Could not fetch GitHub repositories for this username.'
-        );
-        return;
-      }
-
-      const demoDraft = runBoundedGitHubEnrichmentDraft({
+      const selectedRepos = githubRepos.filter((repo) => isRepoFeatured(repo));
+      const result = await runLiveGitHubAndGeminiEnrichment({
         uid: currentUser.uid,
-        githubUsername: username,
-      });
-      const sampleRepos: GitHubRepositoryItem[] = (
-        demoDraft.suggestedProjects ?? [demoDraft.suggestedProject]
-      ).map((p) => ({
-        name: p.title,
-        url: p.sourceUrl || `https://github.com/${username}/${p.title}`,
-        htmlUrl: p.sourceUrl || `https://github.com/${username}/${p.title}`,
-        description: p.description,
-        language: p.tags[0] ?? 'TypeScript',
-        topics: p.tags.slice(1),
-        stars: 1,
-        fork: false,
-      }));
-      setFetchedRepos(sampleRepos);
-      setRepoSearchQuery('');
-      setRepoFilterTab('original');
-      setSelectedRepoKeys(new Set());
-      setShowRepoPickerModal(true);
-    } finally {
-      setIsFetchingGitHub(false);
-    }
-  };
-
-  const countsByTab = useMemo(() => {
-    const total = fetchedRepos.length;
-    const forks = fetchedRepos.filter((r) => Boolean(r.fork)).length;
-    const original = total - forks;
-    return { total, original, forks };
-  }, [fetchedRepos]);
-
-  const visiblePickerRepos = useMemo(() => {
-    const cleanOwner = githubUsername.trim().replace(/^@/, '');
-    const q = repoSearchQuery.trim().toLowerCase();
-    return fetchedRepos.filter((repo) => {
-      if (repoFilterTab === 'original' && repo.fork) return false;
-      if (repoFilterTab === 'forks' && !repo.fork) return false;
-      if (!q) return true;
-      const hay = [
-        repo.name,
-        repo.description,
-        repo.language ?? '',
-        ...(repo.topics ?? []),
-        normalizeRepoIdentity(repo, cleanOwner),
-      ]
-        .join(' ')
-        .toLowerCase();
-      return hay.includes(q);
-    });
-  }, [fetchedRepos, githubUsername, repoFilterTab, repoSearchQuery]);
-
-  const toggleRepoSelection = (repo: GitHubRepositoryItem) => {
-    const cleanOwner = githubUsername.trim().replace(/^@/, '');
-    const key = normalizeRepoIdentity(repo, cleanOwner);
-    setSelectedRepoKeys((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) {
-        next.delete(key);
-      } else {
-        if (next.size >= 3) {
-          onNotify?.('You can select up to 3 featured projects.');
-          return prev;
-        }
-        next.add(key);
-      }
-      return next;
-    });
-  };
-
-  const handleSelectAllVisibleRepos = () => {
-    const cleanOwner = githubUsername.trim().replace(/^@/, '');
-    setSelectedRepoKeys((prev) => {
-      const next = new Set(prev);
-      for (const repo of visiblePickerRepos) {
-        if (next.size >= 3) break;
-        next.add(normalizeRepoIdentity(repo, cleanOwner));
-      }
-      if (visiblePickerRepos.length > 3) {
-        onNotify?.('Selected the first 3 featured projects (maximum 3).');
-      }
-      return next;
-    });
-  };
-
-  const handleClearRepoSelection = () => {
-    setSelectedRepoKeys(new Set());
-  };
-
-  const handleAddSelectedProjectsFromModal = () => {
-    const cleanOwner = githubUsername.trim().replace(/^@/, '');
-    const selectedRepos = fetchedRepos.filter((repo) =>
-      selectedRepoKeys.has(normalizeRepoIdentity(repo, cleanOwner))
-    );
-
-    if (selectedRepos.length === 0) {
-      setShowRepoPickerModal(false);
-      return;
-    }
-
-    const existingByIdentity = new Map<string, FeaturedProject>();
-    for (const proj of featuredProjects) {
-      existingByIdentity.set(normalizeRepoIdentity(proj, cleanOwner), proj);
-    }
-
-    const updatedProjects = [...featuredProjects];
-    let addedCount = 0;
-
-    for (const repo of selectedRepos) {
-      const repoUrl =
-        repo.url ||
-        repo.htmlUrl ||
-        `https://github.com/${cleanOwner}/${repo.name}`;
-      const identityKey = normalizeRepoIdentity(
-        { url: repoUrl, name: repo.name },
-        cleanOwner
-      );
-
-      if (existingByIdentity.has(identityKey)) {
-        continue;
-      }
-
-      const tags = Array.from(
-        new Set([
-          ...(repo.language ? [repo.language] : []),
-          ...(repo.topics ?? []).slice(0, 4),
-        ])
-      );
-
-      const newProj: FeaturedProject = {
-        id: `gh_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-        title: repo.name,
-        description:
-          repo.description?.trim() ||
-          `Public ${repo.language ? `${repo.language} ` : ''}repository on GitHub.`,
-        sourceUrl: repoUrl,
-        tags,
-      };
-      updatedProjects.push(newProj);
-      existingByIdentity.set(identityKey, newProj);
-      addedCount++;
-    }
-
-    setFeaturedProjects(updatedProjects);
-    setShowRepoPickerModal(false);
-    onNotify?.(
-      addedCount > 0
-        ? `Added ${addedCount} selected project${addedCount === 1 ? '' : 's'} to your profile.`
-        : 'Selected projects are already in your profile.'
-    );
-  };
-
-  // Optional Gemini enrichment strictly for the user's selected/featured projects
-  const handleImproveSelectedProjectsWithAI = async () => {
-    if (featuredProjects.length === 0) {
-      setGithubStatusError(
-        'Select or add at least one project first before improving descriptions.'
-      );
-      return;
-    }
-
-    const cleanOwner = githubUsername.trim().replace(/^@/, '') || 'builder';
-    const selectedReposForAI: GitHubRepositoryItem[] = featuredProjects.map(
-      (proj) => ({
-        name: proj.title,
-        url: proj.sourceUrl,
-        htmlUrl: proj.sourceUrl,
-        description: proj.description,
-        language: proj.tags[0] ?? null,
-        topics: proj.tags.slice(1),
-      })
-    );
-
-    setIsEnhancingWithAI(true);
-    setGithubStatusError(null);
-    try {
-      const res = await runLiveGitHubAndGeminiEnrichment({
-        uid: currentUser.uid,
-        githubUsername: cleanOwner,
-        selectedRepositories: selectedReposForAI,
+        githubUsername: handle,
+        selectedRepositories: selectedRepos.length > 0 ? selectedRepos : undefined,
         useGemini: true,
       });
+      if (!result.ok || !result.draft) {
+        setAiError(result.errorMessage || 'Could not generate a draft right now.');
+      } else {
+        setAiDraft({
+          draft: result.draft,
+          suggestedBio: result.suggestedBio,
+          suggestedIcebreaker: result.suggestedIcebreaker,
+        });
+      }
+    } catch {
+      setAiError('Enrichment service unavailable.');
+    } finally {
+      setAiLoading(false);
+    }
+  };
 
-      if (res.ok && res.draft) {
-        setEnrichmentDraft(res.draft);
-        setSuggestedBioDraft(res.suggestedBio ?? '');
-        setApproveSuggestedBio(false);
-        onNotify?.(
-          'Generated project description & skill suggestions. Review and approve what you want to keep.'
+  const handleApplyAiDraft = () => {
+    if (!aiDraft) return;
+    if (aiDraft.suggestedBio) setAbout(aiDraft.suggestedBio);
+    if (aiDraft.suggestedIcebreaker) {
+      setIcebreakerPrompt(aiDraft.suggestedIcebreaker);
+    }
+    if (aiDraft.draft.suggestedSkills.length > 0) {
+      const names = aiDraft.draft.suggestedSkills.map((s) => s.name);
+      setSkillTags((prev) => Array.from(new Set([...prev, ...names])));
+    }
+    setAiDraft(null);
+    onNotify?.('Draft suggestions applied. Review and click Save Profile to persist.');
+  };
+
+  const handleSave = () => {
+    setNameError(null);
+    let updatedDisplayName: string | undefined;
+
+    const trimmedName = displayName.trim();
+    const currentIsPlaceholder = Boolean(currentUser.needsDisplayNameSetup);
+    if (trimmedName && (currentIsPlaceholder || trimmedName !== currentUser.displayName)) {
+      const normalized = normalizeHumanDisplayName(trimmedName);
+      if (!normalized) {
+        setNameError(
+          'Enter a real display name (cannot be an SRN/PRN or email address).'
         );
         return;
       }
-
-      setGithubStatusError(
-        res.errorMessage || 'AI description helper is unavailable right now.'
-      );
-    } finally {
-      setIsEnhancingWithAI(false);
-    }
-  };
-
-  const toggleSuggestedSkill = (idx: number) => {
-    if (!enrichmentDraft) return;
-    const next = [...enrichmentDraft.suggestedSkills];
-    next[idx] = { ...next[idx], approved: !next[idx].approved };
-    setEnrichmentDraft({ ...enrichmentDraft, suggestedSkills: next });
-  };
-
-  const toggleSuggestedProject = (idx: number) => {
-    if (!enrichmentDraft || !enrichmentDraft.suggestedProjects) return;
-    const next = [...enrichmentDraft.suggestedProjects];
-    next[idx] = { ...next[idx], approved: !next[idx].approved };
-    setEnrichmentDraft({
-      ...enrichmentDraft,
-      suggestedProjects: next,
-    });
-  };
-
-  const updateSuggestedProjectDescription = (idx: number, newDesc: string) => {
-    if (!enrichmentDraft || !enrichmentDraft.suggestedProjects) return;
-    const next = [...enrichmentDraft.suggestedProjects];
-    next[idx] = { ...next[idx], description: newDesc };
-    setEnrichmentDraft({
-      ...enrichmentDraft,
-      suggestedProjects: next,
-    });
-  };
-
-  const handleApplyApprovedSuggestions = () => {
-    if (!enrichmentDraft) return;
-    const approvedSkills = enrichmentDraft.suggestedSkills
-      .filter((s) => s.approved)
-      .map((s) => s.name);
-    if (approvedSkills.length > 0) {
-      setSkillTags(Array.from(new Set([...skillTags, ...approvedSkills])));
+      updatedDisplayName = normalized;
+    } else if (currentIsPlaceholder && trimmedName.length === 0) {
+      // Optional; leave as-is if untouched
+      updatedDisplayName = undefined;
     }
 
-    const cleanOwner = githubUsername.trim().replace(/^@/, '');
-    let updatedProjectCount = 0;
+    const updatedProfile: Profile = {
+      ...profile,
+      uid: currentUser.uid,
+      headline: headline.trim(),
+      about: about.trim(),
+      skillTags,
+      interestTags,
+      projectDomains:
+        interestTags.length > 0 ? interestTags : profile.projectDomains ?? [],
+      preferredRoles,
+      rolesWantToLearn,
+      workingStyleTags,
+      featuredProjects: featuredProjects.slice(0, MAX_FEATURED_PROJECTS),
+      portfolioLinks,
+      githubUsername: githubUsername.trim().replace(/^@/, '') || undefined,
+      icebreakerPrompt: icebreakerPrompt.trim() || undefined,
+      isFirstTimeHacker,
+      visibility: profileVisible ? 'public_verified_students' : 'hidden',
+      updatedAt: new Date().toISOString(),
+    };
 
-    if (
-      enrichmentDraft.suggestedProjects &&
-      enrichmentDraft.suggestedProjects.length > 0
-    ) {
-      const nextProjects = [...featuredProjects];
-      for (const sp of enrichmentDraft.suggestedProjects) {
-        if (!sp.approved) continue;
-        const spKey = normalizeRepoIdentity(sp, cleanOwner);
-        const existingIdx = nextProjects.findIndex(
-          (fp) =>
-            normalizeRepoIdentity(fp, cleanOwner) === spKey ||
-            fp.title.toLowerCase() === sp.title.toLowerCase()
-        );
-        if (existingIdx >= 0) {
-          nextProjects[existingIdx] = {
-            ...nextProjects[existingIdx],
-            description: sp.description,
-            tags:
-              sp.tags && sp.tags.length > 0
-                ? sp.tags
-                : nextProjects[existingIdx].tags,
-          };
-        } else {
-          nextProjects.push({
-            id: `gh_ai_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            title: sp.title,
-            description: sp.description,
-            sourceUrl: sp.sourceUrl,
-            tags: sp.tags,
-          });
-        }
-        updatedProjectCount++;
-      }
-      setFeaturedProjects(nextProjects);
-    }
+    const updatedPrivacy: User['privacyPreferences'] = {
+      ...currentUser.privacyPreferences,
+      profileVisible,
+      githubConsent: Boolean(githubUsername.trim()),
+      aiEnrichmentConsent: aiConsentChecked,
+      academyAnnouncementsOptIn: academyOptIn,
+      onboardingCompleted: true,
+      ...(updatedDisplayName ? { customDisplayNameSet: true } : {}),
+    };
 
-    if (approveSuggestedBio && suggestedBioDraft.trim()) {
-      setAbout(suggestedBioDraft.trim());
-    }
-
-    setEnrichmentDraft(null);
-    setSuggestedBioDraft('');
-    setApproveSuggestedBio(false);
-    onNotify?.(
-      `Applied ${approvedSkills.length} skill(s) and ${updatedProjectCount} improved project description(s).`
-    );
+    onSaveProfile(updatedProfile, updatedPrivacy, updatedDisplayName);
   };
-
-  const buildUpdatedProfile = (): Profile => ({
-    ...profile,
-    headline: headline.trim() || 'PES University Builder',
-    about: about.trim(),
-    interestTags,
-    skillTags,
-    projectDomains:
-      projectDomains.length > 0 ? projectDomains : interestTags,
-    topicsToExplore,
-    preferredRoles:
-      preferredRoles.length > 0 ? preferredRoles : ['Generalist'],
-    rolesWantToLearn,
-    workingStyleTags,
-    hackathonGoals,
-    portfolioLinks,
-    featuredProjects,
-    githubUsername: githubUsername.trim() || undefined,
-    icebreakerPrompt: icebreakerPrompt.trim() || undefined,
-    isFirstTimeHacker,
-    visibility,
-    updatedAt: new Date().toISOString(),
-  });
-
-  const handleSaveFinal = () => {
-    const updated = buildUpdatedProfile();
-    try {
-      localStorage.removeItem(draftStorageKey);
-    } catch {
-      // ignore
-    }
-    onSaveProfile(updated, privacyPreferences, displayName.trim() || undefined);
-    if (!isInline) {
-      onClose();
-    }
-  };
-
-  const isUnsetDisplayName =
-    !currentUser.displayName ||
-    currentUser.displayName === 'PES Student' ||
-    currentUser.displayName.startsWith('PES Student');
 
   const formContent = (
-    <div className="space-y-4">
-      {/* 1. Student Display Name */}
-      <div className="space-y-1">
-        <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-          Display Name {isUnsetDisplayName && <span className="text-amber-500">*</span>}
-        </label>
-        <input
-          type="text"
-          value={displayName}
-          onChange={(e) => setDisplayName(e.target.value)}
-          placeholder="e.g., Roshan Kumar"
-          className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs text-slate-900 dark:text-slate-100"
-        />
-        <p className="text-[11px] text-slate-400">
-          Your name as seen by prospective teammates. Verified SRNs/PRNs are kept private and never exposed publicly.
-        </p>
-      </div>
-
-      {/* 2. Core Quick Setup: Interests, Skills & Preferred Role */}
-      <div className="space-y-3.5 pt-3 border-t border-slate-100 dark:border-slate-800">
-        {/* A. Interests (Up to 3) */}
+    <div className="space-y-6">
+      {/* Core Essentials */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-6">
         <div>
-          <div className="flex items-center justify-between mb-1.5">
-            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-              A. Interests <span className="text-slate-400 font-normal">(Choose up to 3)</span>
+          <h2 className="text-lg font-bold text-slate-900">Your Profile</h2>
+          <p className="text-sm text-slate-600 mt-0.5">
+            Keep your name, interests, skills, and role up to date for better teammate recommendations.
+          </p>
+        </div>
+
+        {/* Display Name */}
+        <div>
+          <label
+            htmlFor="profile-display-name"
+            className="block text-sm font-semibold text-slate-900"
+          >
+            Display Name
+          </label>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Shown on your profile, teammate cards, and messages. Your PESU SRN is never shown publicly.
+          </p>
+          <input
+            id="profile-display-name"
+            type="text"
+            value={displayName}
+            onChange={(e) => {
+              setDisplayName(e.target.value);
+              if (nameError) setNameError(null);
+            }}
+            placeholder="Your full name"
+            maxLength={60}
+            className="mt-2 w-full max-w-md rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+          />
+          {nameError && (
+            <p className="mt-1.5 text-xs text-rose-600">{nameError}</p>
+          )}
+        </div>
+
+        {/* A. Interests */}
+        <div>
+          <div className="flex items-baseline justify-between gap-2">
+            <label className="text-sm font-semibold text-slate-900">
+              Interests
             </label>
-            <span className="text-[11px] font-mono text-slate-400">
-              {interestTags.length}/3 selected
+            <span className="text-xs text-slate-500">
+              Up to 3 ({interestTags.length}/3)
             </span>
           </div>
-          <div className="flex flex-wrap gap-1.5 mb-2">
-            {QUICK_INTEREST_OPTIONS.map((interest) => {
+          <div className="mt-2.5 flex flex-wrap gap-2">
+            {interestOptions.map((interest) => {
               const active = interestTags.includes(interest);
+              const disabled = !active && interestTags.length >= 3;
               return (
                 <button
                   key={interest}
                   type="button"
-                  onClick={() => {
-                    if (active) {
-                      setInterestTags(interestTags.filter((i) => i !== interest));
-                    } else if (interestTags.length >= 3) {
-                      onNotify?.('You can select up to 3 interest areas.');
-                    } else {
-                      setInterestTags([...interestTags, interest]);
-                    }
-                  }}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  disabled={disabled}
+                  onClick={() => toggleInterest(interest)}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
                     active
-                      ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
-                      : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                      ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                      : disabled
+                      ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
                   }`}
                 >
-                  {interest}
+                  {active && <Check className="w-3.5 h-3.5" />}
+                  <span>{interest}</span>
                 </button>
               );
             })}
-          </div>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={customInterestInput}
-              onChange={(e) => setCustomInterestInput(e.target.value)}
-              onKeyDown={(e) =>
-                e.key === 'Enter' &&
-                (e.preventDefault(),
-                customInterestInput.trim() &&
-                  (interestTags.length >= 3
-                    ? onNotify?.('You can select up to 3 interest areas.')
-                    : handleAddCustomInterest()))
-              }
-              placeholder="Or type a custom interest..."
-              className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
-            />
-            <button
-              type="button"
-              onClick={() => {
-                if (interestTags.length >= 3) {
-                  onNotify?.('You can select up to 3 interest areas.');
-                } else {
-                  handleAddCustomInterest();
-                }
-              }}
-              className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              Add
-            </button>
           </div>
         </div>
 
         {/* B. Skills */}
         <div>
-          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
-            B. Skills <span className="text-slate-400 font-normal">(Choose a few or type custom)</span>
+          <label className="block text-sm font-semibold text-slate-900">
+            Skills
           </label>
-          <div className="flex flex-wrap gap-1.5 mb-2">
-            {QUICK_SKILL_OPTIONS.map((skill) => {
-              const active = skillTags.includes(skill);
+          <div className="mt-2.5 flex flex-wrap gap-2">
+            {QUICK_SKILL_OPTIONS.map((sk) => {
+              const active = skillTags.includes(sk);
               return (
                 <button
-                  key={skill}
+                  key={sk}
                   type="button"
-                  onClick={() => {
-                    if (active) {
-                      setSkillTags(skillTags.filter((s) => s !== skill));
-                    } else {
-                      setSkillTags([...skillTags, skill]);
-                    }
-                  }}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  onClick={() => toggleSkill(sk)}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
                     active
-                      ? 'bg-blue-600 text-white border-blue-600 font-semibold'
-                      : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                      ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
                   }`}
                 >
-                  {skill}
+                  {active && <Check className="w-3.5 h-3.5" />}
+                  <span>{sk}</span>
                 </button>
               );
             })}
+            {customSkillsOnly.map((sk) => (
+              <span
+                key={sk}
+                className="inline-flex items-center gap-1 rounded-lg border border-indigo-600 bg-indigo-50 px-3 py-1.5 text-sm font-medium text-indigo-700"
+              >
+                <span>{sk}</span>
+                <button
+                  type="button"
+                  onClick={() => toggleSkill(sk)}
+                  aria-label={`Remove ${sk}`}
+                  className="text-indigo-500 hover:text-indigo-800 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </span>
+            ))}
           </div>
-          {skillTags.filter((s) => !QUICK_SKILL_OPTIONS.includes(s)).length > 0 && (
-            <div className="flex flex-wrap gap-1.5 mb-2">
-              {skillTags
-                .filter((s) => !QUICK_SKILL_OPTIONS.includes(s))
-                .map((skill) => (
-                  <span
-                    key={skill}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-blue-50 dark:bg-blue-950 text-blue-800 dark:text-blue-200 border border-blue-200 dark:border-blue-800 text-xs font-medium"
-                  >
-                    {skill}
-                    <button
-                      type="button"
-                      onClick={() => setSkillTags(skillTags.filter((s) => s !== skill))}
-                      className="text-blue-400 hover:text-red-600 cursor-pointer"
-                      aria-label={`Remove ${skill}`}
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
-            </div>
-          )}
-          <div className="flex gap-2">
+          <div className="mt-3 flex gap-2 max-w-md">
             <input
               type="text"
               value={customSkillInput}
               onChange={(e) => setCustomSkillInput(e.target.value)}
-              onKeyDown={(e) =>
-                e.key === 'Enter' &&
-                (e.preventDefault(), handleAddCustomSkill())
-              }
-              placeholder="Add other skills (e.g. Kotlin, Solifity, Tailwind)..."
-              className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  handleAddCustomSkill();
+                }
+              }}
+              placeholder="Add custom skill (e.g. Go, Tailwind, ROS2)"
+              className="flex-1 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
             />
             <button
               type="button"
               onClick={handleAddCustomSkill}
-              className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+              disabled={!customSkillInput.trim()}
+              className="inline-flex items-center gap-1 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
             >
-              Add Skill
+              <Plus className="w-4 h-4" />
+              <span>Add</span>
             </button>
           </div>
         </div>
 
         {/* C. Preferred Role */}
         <div>
-          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
-            C. Preferred Role <span className="text-slate-400 font-normal">(Primary focus on a team)</span>
+          <label className="block text-sm font-semibold text-slate-900">
+            Preferred Role
           </label>
-          <div className="flex flex-wrap gap-1.5">
-            {QUICK_ROLE_OPTIONS.map((role) => {
+          <div className="mt-2.5 flex flex-wrap gap-2">
+            {roleOptions.map((role) => {
               const active = preferredRoles.includes(role);
               return (
                 <button
                   key={role}
                   type="button"
-                  onClick={() => setPreferredRoles([role])}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  onClick={() => toggleRole(role)}
+                  className={`rounded-lg border px-3.5 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
                     active
-                      ? 'bg-blue-600 text-white border-blue-600 font-semibold shadow-xs'
-                      : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                      ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
                   }`}
                 >
                   {role}
@@ -1016,224 +588,398 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
         </div>
       </div>
 
-      {/* 3. Progressive Disclosure: More Details & Portfolio (Optional) */}
-      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+      {/* Collapsible More Details (Progressive Disclosure) */}
+      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
         <button
           type="button"
-          onClick={() => setShowMoreDetails(!showMoreDetails)}
-          className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
+          onClick={() => setShowMoreDetails((v) => !v)}
+          className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-slate-50 transition-colors cursor-pointer"
         >
-          <span>More Details (Optional) — Bio, GitHub, Projects & Preferences</span>
+          <div>
+            <div className="text-sm font-semibold text-slate-900">
+              More Details (Optional)
+            </div>
+            <div className="text-xs text-slate-500 mt-0.5">
+              Headline, bio, GitHub featured projects (up to 3), portfolio, collaboration style
+            </div>
+          </div>
           {showMoreDetails ? (
-            <ChevronUp className="w-4 h-4 text-slate-400" />
+            <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" />
           ) : (
-            <ChevronDown className="w-4 h-4 text-slate-400" />
+            <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />
           )}
         </button>
 
         {showMoreDetails && (
-          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-4 border-t border-slate-200 dark:border-slate-800 text-xs">
-            {/* Headline & About */}
-            <div className="space-y-3">
+          <div className="px-6 pb-6 pt-2 border-t border-slate-100 space-y-6">
+            {/* Headline & Bio */}
+            <div className="grid grid-cols-1 gap-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                <label className="block text-sm font-medium text-slate-800">
                   Headline
                 </label>
                 <input
                   type="text"
                   value={headline}
                   onChange={(e) => setHeadline(e.target.value)}
-                  placeholder="e.g., CSE builder into Backend APIs & Applied AI"
-                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs text-slate-900 dark:text-slate-100"
+                  placeholder="e.g. Full-stack & ML student building fast prototypes"
+                  maxLength={120}
+                  className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
                 />
               </div>
-
               <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                <label className="block text-sm font-medium text-slate-800">
                   About Me
                 </label>
                 <textarea
-                  rows={2}
+                  rows={3}
                   value={about}
                   onChange={(e) => setAbout(e.target.value)}
-                  placeholder="Tell potential teammates about what you love building..."
-                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs text-slate-900 dark:text-slate-100"
+                  placeholder="What do you like building during hackathons?"
+                  className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
                 />
-                <div className="flex items-center gap-2 mt-1">
-                  <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-400 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={isFirstTimeHacker}
-                      onChange={(e) => setIsFirstTimeHacker(e.target.checked)}
-                      className="rounded border-slate-300"
-                    />
-                    First hackathon? Let teammates know.
-                  </label>
-                </div>
               </div>
+              <label className="inline-flex items-center gap-2.5 text-sm text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={isFirstTimeHacker}
+                  onChange={(e) => setIsFirstTimeHacker(e.target.checked)}
+                  className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                />
+                <span>This is my first hackathon</span>
+              </label>
             </div>
 
-            {/* Featured Projects (Max 3) & GitHub Import */}
-            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-2.5">
-              <div className="flex items-center justify-between">
-                <label className="block font-semibold text-slate-700 dark:text-slate-300">
-                  Featured Projects <span className="font-normal text-slate-400">(Up to 3)</span>
-                </label>
-                {!showAddProjectForm && (
-                  <button
-                    type="button"
-                    onClick={() => setShowAddProjectForm(true)}
-                    className="text-xs text-blue-600 dark:text-blue-400 hover:underline font-medium cursor-pointer"
-                  >
-                    + Add Project Manually
-                  </button>
-                )}
+            {/* GitHub & Featured Projects (max 3) */}
+            <div className="pt-4 border-t border-slate-100 space-y-4">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+                  <Github className="w-4 h-4 text-slate-600" />
+                  <span>Featured Projects (Up to {MAX_FEATURED_PROJECTS})</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Optionally link GitHub to pick up to {MAX_FEATURED_PROJECTS} repositories, or add a project manually. Repositories are never added automatically.
+                </p>
               </div>
 
-              <div className="flex flex-col sm:flex-row gap-2">
-                <div className="relative flex-1">
-                  <Github className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                  <input
-                    type="text"
-                    value={githubUsername}
-                    onChange={(e) => setGithubUsername(e.target.value)}
-                    placeholder="GitHub username (e.g. octocat)"
-                    className="w-full pl-8 pr-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
-                  />
-                </div>
+              <div className="flex flex-wrap gap-2">
+                <input
+                  type="text"
+                  value={githubUsername}
+                  onChange={(e) => setGithubUsername(e.target.value)}
+                  placeholder="GitHub username (optional)"
+                  className="flex-1 min-w-[200px] rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                />
                 <button
                   type="button"
-                  disabled={isFetchingGitHub}
-                  onClick={handleImportFromGitHub}
-                  className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+                  onClick={handleFetchGithubRepos}
+                  disabled={githubLoading || !githubUsername.trim()}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
                 >
-                  <Github className="w-3.5 h-3.5" />
-                  {isFetchingGitHub ? 'Loading...' : 'Select Projects'}
+                  {githubLoading ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Search className="w-4 h-4" />
+                  )}
+                  <span>Browse Repositories</span>
                 </button>
               </div>
 
+              {githubError && (
+                <p className="text-xs text-amber-700">{githubError}</p>
+              )}
+
+              {githubRepos.length > 0 && (
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-slate-700">
+                      Select up to {MAX_FEATURED_PROJECTS} to feature ({featuredProjects.length}/{MAX_FEATURED_PROJECTS} selected)
+                    </span>
+                    <input
+                      type="text"
+                      value={repoSearch}
+                      onChange={(e) => setRepoSearch(e.target.value)}
+                      placeholder="Filter repos..."
+                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-800"
+                    />
+                  </div>
+                  <div className="max-h-52 overflow-y-auto divide-y divide-slate-200/70 rounded-lg border border-slate-200 bg-white">
+                    {filteredGithubRepos.slice(0, 20).map((repo) => {
+                      const selected = isRepoFeatured(repo);
+                      return (
+                        <div
+                          key={repo.name}
+                          className="flex items-center justify-between gap-3 px-3 py-2.5 text-sm"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-medium text-slate-900 truncate">
+                              {repo.name}
+                            </div>
+                            {repo.description && (
+                              <div className="text-xs text-slate-500 truncate">
+                                {repo.description}
+                              </div>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => toggleRepoFeatured(repo)}
+                            className={`shrink-0 rounded-lg border px-2.5 py-1 text-xs font-medium cursor-pointer ${
+                              selected
+                                ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                                : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                            }`}
+                          >
+                            {selected ? 'Selected' : 'Select'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Current Featured Projects List */}
               {featuredProjects.length > 0 && (
-                <div className="space-y-1.5">
+                <div className="space-y-2">
                   {featuredProjects.map((proj) => (
                     <div
                       key={proj.id}
-                      className="p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 flex items-start justify-between gap-2"
+                      className="flex items-start justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3.5 py-2.5"
                     >
                       <div className="min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-semibold text-slate-900">
                             {proj.title}
                           </span>
                           {proj.sourceUrl && (
                             <a
                               href={proj.sourceUrl}
                               target="_blank"
-                              rel="noreferrer"
-                              className="text-slate-400 hover:text-blue-600 shrink-0"
+                              rel="noopener noreferrer"
+                              className="text-xs text-indigo-600 hover:underline inline-flex items-center gap-0.5"
                             >
+                              <span>Link</span>
                               <ExternalLink className="w-3 h-3" />
                             </a>
                           )}
                         </div>
-                        <p className="text-[11px] text-slate-600 dark:text-slate-400 line-clamp-1">
-                          {proj.description}
-                        </p>
+                        {proj.description && (
+                          <p className="text-xs text-slate-600 mt-0.5">
+                            {proj.description}
+                          </p>
+                        )}
                       </div>
                       <button
                         type="button"
                         onClick={() =>
-                          setFeaturedProjects(featuredProjects.filter((p) => p.id !== proj.id))
+                          setFeaturedProjects((prev) =>
+                            prev.filter((p) => p.id !== proj.id)
+                          )
                         }
-                        className="text-slate-400 hover:text-red-600 p-1 shrink-0 cursor-pointer"
-                        title="Remove project"
+                        aria-label={`Remove ${proj.title}`}
+                        className="text-slate-400 hover:text-rose-600 p-1 cursor-pointer"
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        <Trash2 className="w-4 h-4" />
                       </button>
                     </div>
                   ))}
-
-                  {/* Optional AI Polish inside advanced details only */}
-                  <div className="pt-1 flex justify-end">
-                    <button
-                      type="button"
-                      disabled={isEnhancingWithAI}
-                      onClick={handleImproveSelectedProjectsWithAI}
-                      className="inline-flex items-center gap-1 text-[11px] text-slate-500 hover:text-blue-600 font-medium cursor-pointer disabled:opacity-50"
-                    >
-                      <Sparkles className="w-3 h-3 text-amber-500" />
-                      {isEnhancingWithAI
-                        ? 'Polishing descriptions...'
-                        : 'Optionally polish descriptions with AI ✨'}
-                    </button>
-                  </div>
                 </div>
               )}
 
-              {showAddProjectForm && (
-                <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <input
-                      type="text"
-                      value={newProjTitle}
-                      onChange={(e) => setNewProjTitle(e.target.value)}
-                      placeholder="Project title"
-                      className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
-                    />
-                    <input
-                      type="text"
-                      value={newProjTags}
-                      onChange={(e) => setNewProjTags(e.target.value)}
-                      placeholder="Tags (comma separated)"
-                      className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
-                    />
-                  </div>
+              {/* Manual Add Project */}
+              {featuredProjects.length < MAX_FEATURED_PROJECTS && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <input
+                    type="text"
+                    value={newProjTitle}
+                    onChange={(e) => setNewProjTitle(e.target.value)}
+                    placeholder="Project title"
+                    className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                  />
                   <input
                     type="text"
                     value={newProjDesc}
                     onChange={(e) => setNewProjDesc(e.target.value)}
-                    placeholder="Brief description of what you built"
-                    className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 text-xs bg-white dark:bg-slate-950"
+                    placeholder="Short description"
+                    className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
                   />
-                  <div className="flex justify-end gap-2">
+                  <div className="flex gap-2">
+                    <input
+                      type="url"
+                      value={newProjUrl}
+                      onChange={(e) => setNewProjUrl(e.target.value)}
+                      placeholder="URL (optional)"
+                      className="flex-1 min-w-0 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                    />
                     <button
                       type="button"
-                      onClick={() => setShowAddProjectForm(false)}
-                      className="px-2.5 py-1 rounded text-xs text-slate-600 dark:text-slate-400 cursor-pointer"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleAddProject}
-                      className="px-3 py-1 rounded bg-blue-600 text-white text-xs font-medium cursor-pointer"
+                      onClick={handleAddManualProject}
+                      disabled={!newProjTitle.trim()}
+                      className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer shrink-0"
                     >
                       Add
                     </button>
                   </div>
                 </div>
               )}
+
+              {/* Optional AI Enrichment (strictly opt-in with explicit review) */}
+              {executionMode === 'live' && githubUsername.trim() && (
+                <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 space-y-3">
+                  <label className="flex items-start gap-2.5 text-xs text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={aiConsentChecked}
+                      onChange={(e) => setAiConsentChecked(e.target.checked)}
+                      className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <span>
+                      Allow optional AI summary drafting from my public GitHub profile (you will review before anything is applied).
+                    </span>
+                  </label>
+                  <button
+                    type="button"
+                    disabled={!aiConsentChecked || aiLoading}
+                    onClick={handleRunOptionalAiEnrichment}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                  >
+                    {aiLoading ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="w-3.5 h-3.5 text-indigo-500" />
+                    )}
+                    <span>Draft Suggestions for Review</span>
+                  </button>
+                  {aiError && (
+                    <p className="text-xs text-amber-700">{aiError}</p>
+                  )}
+                  {aiDraft && (
+                    <div className="rounded-lg border border-indigo-200 bg-white p-3 space-y-2 text-xs">
+                      <div className="font-semibold text-slate-900">
+                        Review Draft Suggestions
+                      </div>
+                      {aiDraft.suggestedBio && (
+                        <p className="text-slate-700">
+                          <span className="font-medium">About:</span>{' '}
+                          {aiDraft.suggestedBio}
+                        </p>
+                      )}
+                      {aiDraft.suggestedIcebreaker && (
+                        <p className="text-slate-700">
+                          <span className="font-medium">Icebreaker:</span>{' '}
+                          {aiDraft.suggestedIcebreaker}
+                        </p>
+                      )}
+                      {aiDraft.draft.suggestedSkills.length > 0 && (
+                        <p className="text-slate-700">
+                          <span className="font-medium">Skills:</span>{' '}
+                          {aiDraft.draft.suggestedSkills
+                            .map((s) => s.name)
+                            .join(', ')}
+                        </p>
+                      )}
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={handleApplyAiDraft}
+                          className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 cursor-pointer"
+                        >
+                          Apply Draft
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setAiDraft(null)}
+                          className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 cursor-pointer"
+                        >
+                          Discard
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
-            {/* Collaboration Style & Portfolio */}
-            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-3">
+            {/* Portfolio Links */}
+            <div className="pt-4 border-t border-slate-100 space-y-3">
+              <label className="block text-sm font-semibold text-slate-900">
+                Portfolio Links
+              </label>
+              {portfolioLinks.length > 0 && (
+                <div className="space-y-1.5">
+                  {portfolioLinks.map((link, idx) => (
+                    <div
+                      key={`${link.url}-${idx}`}
+                      className="flex items-center justify-between gap-2 text-sm text-slate-700"
+                    >
+                      <a
+                        href={link.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-indigo-600 hover:underline truncate"
+                      >
+                        {link.label}
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPortfolioLinks((prev) =>
+                            prev.filter((_, i) => i !== idx)
+                          )
+                        }
+                        className="text-slate-400 hover:text-rose-600 cursor-pointer"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-wrap gap-2">
+                <input
+                  type="text"
+                  value={newLinkLabel}
+                  onChange={(e) => setNewLinkLabel(e.target.value)}
+                  placeholder="Label (e.g. Portfolio, LinkedIn)"
+                  className="w-44 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                />
+                <input
+                  type="url"
+                  value={newLinkUrl}
+                  onChange={(e) => setNewLinkUrl(e.target.value)}
+                  placeholder="https://..."
+                  className="flex-1 min-w-[180px] rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddPortfolioLink}
+                  disabled={!newLinkUrl.trim()}
+                  className="rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+
+            {/* Collaboration Style & Icebreaker */}
+            <div className="pt-4 border-t border-slate-100 space-y-4">
               <div>
-                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                <label className="block text-sm font-semibold text-slate-900">
                   Collaboration Style
                 </label>
-                <div className="flex flex-wrap gap-1.5">
+                <div className="mt-2 flex flex-wrap gap-2">
                   {WORK_STYLE_TAXONOMY.map((style) => {
                     const active = workingStyleTags.includes(style);
                     return (
                       <button
                         key={style}
                         type="button"
-                        onClick={() =>
-                          toggleItem(style, workingStyleTags, setWorkingStyleTags)
-                        }
-                        className={`px-2.5 py-1 rounded-lg text-xs font-medium border cursor-pointer ${
+                        onClick={() => toggleWorkStyle(style)}
+                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium cursor-pointer ${
                           active
-                            ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
-                            : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                            ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                            : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
                         }`}
                       >
                         {style}
@@ -1244,302 +990,146 @@ export const OnboardingAndProfileModal: React.FC<OnboardingAndProfileModalProps>
               </div>
 
               <div>
-                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Conversation Icebreaker
+                <label className="block text-sm font-medium text-slate-800">
+                  Roles to Explore
+                </label>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {QUICK_ROLE_OPTIONS.map((role) => {
+                    const active = rolesWantToLearn.includes(role);
+                    return (
+                      <button
+                        key={role}
+                        type="button"
+                        onClick={() =>
+                          setRolesWantToLearn((prev) =>
+                            prev.includes(role)
+                              ? prev.filter((r) => r !== role)
+                              : [...prev, role]
+                          )
+                        }
+                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium cursor-pointer ${
+                          active
+                            ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                            : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                        }`}
+                      >
+                        {role}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-800">
+                  Conversation Starter / Icebreaker
                 </label>
                 <input
                   type="text"
                   value={icebreakerPrompt}
                   onChange={(e) => setIcebreakerPrompt(e.target.value)}
-                  placeholder="What part of the stack do you want to build together?"
-                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+                  placeholder="e.g. Ask me about shipping real-time web apps in 24 hours"
+                  className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900"
                 />
               </div>
-
-              <PortfolioLinkEditor
-                links={portfolioLinks}
-                onChange={setPortfolioLinks}
-              />
             </div>
           </div>
         )}
       </div>
 
-      {/* 4. Privacy & Settings (Accessible, Defaults Preserved) */}
-      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+      {/* Collapsible Privacy & Account Settings */}
+      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
         <button
           type="button"
-          onClick={() => setShowPrivacySection(!showPrivacySection)}
-          className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
+          onClick={() => setShowPrivacySettings((v) => !v)}
+          className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-slate-50 transition-colors cursor-pointer"
         >
-          <span>Privacy & Settings</span>
-          {showPrivacySection ? (
-            <ChevronUp className="w-4 h-4 text-slate-400" />
+          <div className="flex items-center gap-2.5">
+            <Shield className="w-4 h-4 text-slate-500 shrink-0" />
+            <div>
+              <div className="text-sm font-semibold text-slate-900">
+                Privacy &amp; Account Settings
+              </div>
+              <div className="text-xs text-slate-500 mt-0.5">
+                Control profile visibility and optional PESU Academy features
+              </div>
+            </div>
+          </div>
+          {showPrivacySettings ? (
+            <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" />
           ) : (
-            <ChevronDown className="w-4 h-4 text-slate-400" />
+            <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />
           )}
         </button>
 
-        {showPrivacySection && (
-          <div className="p-3.5 bg-white dark:bg-slate-900 space-y-3 border-t border-slate-200 dark:border-slate-800 text-xs">
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-slate-700 dark:text-slate-300">
-                Profile Visibility
-              </span>
-              <select
-                value={visibility}
-                onChange={(e) =>
-                  setVisibility(e.target.value as Profile['visibility'])
-                }
-                className="px-2.5 py-1 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-              >
-                <option value="public_verified_students">
-                  Visible to Verified PES Students
-                </option>
-                <option value="hidden">Hidden from Discover</option>
-              </select>
-            </div>
-
-            <label className="flex items-center gap-2 text-slate-700 dark:text-slate-300 cursor-pointer">
+        {showPrivacySettings && (
+          <div className="px-6 pb-6 pt-3 border-t border-slate-100 space-y-4">
+            <label className="flex items-start gap-3 text-sm text-slate-700 cursor-pointer">
               <input
                 type="checkbox"
-                checked={privacyPreferences.academyAnnouncementsOptIn}
-                onChange={(e) =>
-                  setPrivacyPreferences({
-                    ...privacyPreferences,
-                    academyAnnouncementsOptIn: e.target.checked,
-                  })
-                }
+                checked={profileVisible}
+                onChange={(e) => setProfileVisible(e.target.checked)}
+                className="mt-1 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
               />
-              Fetch PESU Academy announcements when signed in with PESU OAuth
+              <span>
+                <span className="font-medium text-slate-900 block">
+                  Visible in teammate discovery
+                </span>
+                <span className="text-xs text-slate-500">
+                  Allow other verified PESU students to see your profile card in Discover. Your SRN is always hidden.
+                </span>
+              </span>
+            </label>
+
+            <label className="flex items-start gap-3 text-sm text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={academyOptIn}
+                onChange={(e) => setAcademyOptIn(e.target.checked)}
+                className="mt-1 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+              />
+              <span>
+                <span className="font-medium text-slate-900 block">
+                  Enable private PESU Academy announcements section
+                </span>
+                <span className="text-xs text-slate-500">
+                  Opt in to view your own private PESU Academy notices inside the Hackathons tab.
+                </span>
+              </span>
             </label>
           </div>
         )}
       </div>
 
-      {/* 5. Footer Actions: Single Primary Action 'Continue' / 'Save Profile', Skip for now link */}
-      <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-        {!isInline ? (
+      {/* Single Primary Action */}
+      <div className="flex items-center justify-end gap-3">
+        {!isInline && (
           <button
             type="button"
-            onClick={() => {
-              onNotify?.(
-                'Setup skipped. You can complete your profile anytime in Settings to get better recommendations.'
-              );
-              onClose();
-            }}
-            className="text-xs text-slate-500 hover:text-slate-800 dark:hover:text-slate-300 underline cursor-pointer"
+            onClick={onClose}
+            className="rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
           >
-            Skip for now
+            Cancel
           </button>
-        ) : (
-          <div />
         )}
-
         <button
           type="button"
-          onClick={handleSaveFinal}
-          className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+          onClick={handleSave}
+          className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-6 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 focus-visible:ring-offset-2 transition-colors cursor-pointer"
         >
-          {!isInline ? 'Continue' : 'Save Profile'}
+          <span>Save Profile</span>
         </button>
       </div>
     </div>
   );
 
-  // "Choose your projects" GitHub Repository Selection Popup Modal
-  const repoPickerModal = showRepoPickerModal ? (
-    <Modal
-      title="Choose your projects"
-      subtitle={`@${githubUsername.trim().replace(/^@/, '')} · ${countsByTab.total} public repositories found`}
-      onClose={() => setShowRepoPickerModal(false)}
-      maxWidthClass="max-w-lg"
-    >
-      <div className="space-y-3">
-        {/* Search Bar */}
-        <div className="relative">
-          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-          <input
-            type="text"
-            value={repoSearchQuery}
-            onChange={(e) => setRepoSearchQuery(e.target.value)}
-            placeholder="Search repositories by name, language, or description..."
-            className="w-full pl-8 pr-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs text-slate-900 dark:text-slate-100"
-          />
-        </div>
-
-        {/* Filter Tabs (All / Original / Forks) + Selection Controls */}
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-800 p-0.5 bg-slate-50 dark:bg-slate-900">
-            <button
-              type="button"
-              onClick={() => setRepoFilterTab('all')}
-              className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
-                repoFilterTab === 'all'
-                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              All ({countsByTab.total})
-            </button>
-            <button
-              type="button"
-              onClick={() => setRepoFilterTab('original')}
-              className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
-                repoFilterTab === 'original'
-                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              Original ({countsByTab.original})
-            </button>
-            <button
-              type="button"
-              onClick={() => setRepoFilterTab('forks')}
-              className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
-                repoFilterTab === 'forks'
-                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400'
-              }`}
-            >
-              Forks ({countsByTab.forks})
-            </button>
-          </div>
-
-          <div className="flex items-center gap-2 text-[11px]">
-            <button
-              type="button"
-              onClick={handleSelectAllVisibleRepos}
-              className="text-blue-600 dark:text-blue-400 hover:underline font-medium cursor-pointer"
-            >
-              Select all visible
-            </button>
-            <span className="text-slate-300 dark:text-slate-700">·</span>
-            <button
-              type="button"
-              onClick={handleClearRepoSelection}
-              className="text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 cursor-pointer"
-            >
-              Clear selection
-            </button>
-          </div>
-        </div>
-
-        {/* Scrollable Repository List */}
-        <div className="max-h-72 overflow-y-auto space-y-1.5 pr-1">
-          {visiblePickerRepos.length > 0 ? (
-            visiblePickerRepos.map((repo) => {
-              const cleanOwner = githubUsername.trim().replace(/^@/, '');
-              const repoKey = normalizeRepoIdentity(repo, cleanOwner);
-              const isSelected = selectedRepoKeys.has(repoKey);
-              return (
-                <label
-                  key={repoKey}
-                  className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer ${
-                    isSelected
-                      ? 'border-blue-500 bg-blue-50/40 dark:bg-blue-950/30'
-                      : 'border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/50'
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={isSelected}
-                    onChange={() => toggleRepoSelection(repo)}
-                    className="mt-0.5 rounded border-slate-300"
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center flex-wrap gap-1.5">
-                      <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                        {repo.name}
-                      </span>
-                      {repo.language && (
-                        <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-[10px] font-medium text-slate-600 dark:text-slate-300">
-                          {repo.language}
-                        </span>
-                      )}
-                      {repo.fork && (
-                        <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-950/40 text-[10px] font-medium text-amber-700 dark:text-amber-300">
-                          <GitFork className="w-2.5 h-2.5" />
-                          Fork
-                        </span>
-                      )}
-                    </div>
-                    {repo.description ? (
-                      <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5 line-clamp-2">
-                        {repo.description}
-                      </p>
-                    ) : (
-                      <p className="text-[11px] text-slate-400 italic mt-0.5">
-                        No description provided
-                      </p>
-                    )}
-                  </div>
-                </label>
-              );
-            })
-          ) : (
-            <div className="py-8 text-center text-xs text-slate-500">
-              No repositories match your filter.
-            </div>
-          )}
-        </div>
-
-        {/* Footer with Selected Counter & Primary Action */}
-        <div className="pt-2.5 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-          <span className="text-xs font-medium text-slate-600 dark:text-slate-400">
-            {selectedRepoKeys.size} project{selectedRepoKeys.size === 1 ? '' : 's'} selected
-          </span>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setShowRepoPickerModal(false)}
-              className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 cursor-pointer"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={handleAddSelectedProjectsFromModal}
-              className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer"
-            >
-              Add Selected Projects
-            </button>
-          </div>
-        </div>
-      </div>
-    </Modal>
-  ) : null;
-
   if (isInline) {
-    return (
-      <>
-        <div className="max-w-2xl mx-auto bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-5">
-          <div className="border-b border-slate-100 dark:border-slate-800 pb-3">
-            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-              Builder Profile
-            </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              {currentUser.displayName} · {currentUser.campus} · {currentUser.program}
-            </p>
-          </div>
-          {formContent}
-        </div>
-        {repoPickerModal}
-      </>
-    );
+    return <div className="max-w-3xl mx-auto">{formContent}</div>;
   }
 
   return (
-    <>
-      <Modal
-        title="Edit Builder Profile"
-        subtitle={`${currentUser.displayName} · ${currentUser.campus}`}
-        onClose={onClose}
-        maxWidthClass="max-w-xl"
-      >
-        {formContent}
-      </Modal>
-      {repoPickerModal}
-    </>
+    <Modal onClose={onClose} title="Edit Profile">
+      {formContent}
+    </Modal>
   );
 };

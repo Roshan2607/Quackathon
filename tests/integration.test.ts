@@ -25,7 +25,6 @@ function createBase64UrlJwt(payload: Record<string, unknown>): string {
 
 test.before(async () => {
   assertIntegrationTestGuard();
-  delete process.env.PESU_OAUTH_REDIRECT_URI;
   await new Promise<void>((resolve) => {
     serverInstance = app.listen(0, '127.0.0.1', () => {
       const addr = serverInstance.address();
@@ -1155,11 +1154,8 @@ test('22. Profile detail fields (domains, topics to explore, goals, portfolio li
     pesuOidcSub: 'PES1UG23CS900',
   });
 
-  // New accounts start from the interest-based defaults.
-  assert.deepEqual(createdProfile.projectDomains, [
-    'Applied AI/ML',
-    'Developer Tools',
-  ]);
+  // New accounts start empty without inventing user preferences.
+  assert.deepEqual(createdProfile.projectDomains, []);
   assert.deepEqual(createdProfile.topicsToExplore, []);
   assert.deepEqual(createdProfile.hackathonGoals, []);
   assert.deepEqual(createdProfile.portfolioLinks, []);
@@ -5405,686 +5401,718 @@ test('38. PAASHA microservice adapter, cross-source deduplication, strict 5-stat
   );
 });
 
-test('39. Missing OAuth full-name claim does not default displayName to SRN and keeps SRN separate', async () => {
+test('39. Student Display Names: SRN/PRN never treated as human name, custom name preserved across OAuth logins, invalid names rejected, and zero cross-user SRN leakage', async () => {
+  const { resolveOAuthDisplayName, PLACEHOLDER_DISPLAY_NAME } = await import(
+    '../src/lib/displayName.ts'
+  );
+  const {
+    upsertUserAndProfile,
+    createOAuthSessionRecord,
+    getUserAndProfileByUid,
+  } = await import('../src/db/repository.ts');
   const { db } = await import('../src/db/index.ts');
   const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
-  const { eq } = await import('drizzle-orm');
+  const { inArray } = await import('drizzle-orm');
 
-  resetServerTestOverrides();
-  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_client_123';
-  process.env.PESU_OAUTH_CLIENT_SECRET = 'test_pesu_secret_123';
-  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
-
-  setServerTestOverrides({
-    fetchFn: async (input) => {
-      const url = String(input);
-      if (url.includes('/.well-known/openid-configuration')) {
-        return new Response(
-          JSON.stringify({
-            issuer: 'https://oauth.pesu.mock',
-            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
-            token_endpoint: 'https://oauth.pesu.mock/token',
-            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
-            scopes_supported: ['openid', 'profile', 'email'],
-            code_challenge_methods_supported: ['S256'],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/token') {
-        const idToken = createBase64UrlJwt({
-          iss: 'https://oauth.pesu.mock',
-          aud: 'test_pesu_client_123',
-          sub: 'pesu_srn_student_01',
-          preferred_username: 'PES1UG23CS777',
-          exp: Math.floor(Date.now() / 1000) + 3600,
-        });
-        return new Response(
-          JSON.stringify({
-            access_token: 'token_srn_test_1',
-            token_type: 'Bearer',
-            expires_in: 3600,
-            scope: 'openid profile email',
-            id_token: idToken,
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/userinfo') {
-        return new Response(
-          JSON.stringify({
-            sub: 'pesu_srn_student_01',
-            preferred_username: 'PES1UG23CS777',
-            srn: 'PES1UG23CS777',
-            email: 'student777@pesu.pes.edu',
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      return new Response('Not found', { status: 404 });
-    },
+  // 1. Unit checks on OAuth claim resolution
+  const fromVerifiedName = resolveOAuthDisplayName({
+    sub: 'PES1UG22CS123',
+    preferred_username: 'PES1UG22CS123',
+    name: 'Ananya Rao',
   });
+  assert.equal(fromVerifiedName.displayName, 'Ananya Rao');
+  assert.equal(fromVerifiedName.verifiedName, 'Ananya Rao');
+  assert.equal(fromVerifiedName.needsDisplayNameSetup, false);
 
-  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
-  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
-  const urlData = await urlRes.json();
-
-  const cbRes = await fetch(
-    `${baseUrl}/auth/pesu/callback?code=srn_code_1&state=${encodeURIComponent(urlData.state)}`,
-    { headers: { Cookie: sidCookie } }
-  );
-  const cbHtml = await cbRes.text();
-  assert.equal(cbRes.status, 200);
-
-  // Extract postMessage payload from callback HTML
-  const match = cbHtml.match(/var payload = ({.*?});/);
-  assert.ok(match, 'Callback HTML must contain payload');
-  const payload = JSON.parse(match[1]);
-
-  assert.equal(payload.ok, true);
-  assert.ok(!payload.user.displayName.includes('PES1UG23CS777'), 'displayName must NOT be an SRN');
-  assert.equal(payload.user.displayName, 'PES Student');
-  assert.equal(payload.identity.srn, 'PES1UG23CS777');
-  assert.ok(!payload.identity.name, 'identity.name must be null/undefined when only SRN is given');
-
-  // Verify DB session restoration
-  const oauthCookie = (cbRes.headers.get('set-cookie') ?? '').split(';')[0];
-  const sessRes = await fetch(`${baseUrl}/api/auth/session`, {
-    headers: { Cookie: `${sidCookie}; ${oauthCookie}` },
+  const fromSrnOnly = resolveOAuthDisplayName({
+    sub: 'PES1UG22CS999',
+    preferred_username: 'PES1UG22CS999',
   });
-  const sessData = await sessRes.json();
-  assert.equal(sessData.ok, true);
-  assert.equal(sessData.authenticated, true);
-  assert.equal(sessData.user.displayName, 'PES Student');
+  assert.equal(fromSrnOnly.verifiedName, null);
+  assert.equal(fromSrnOnly.displayName, PLACEHOLDER_DISPLAY_NAME);
+  assert.equal(fromSrnOnly.needsDisplayNameSetup, true);
+  assert.ok(!fromSrnOnly.displayName.includes('PES1UG22CS999'));
 
-  // Cleanup
-  await db.delete(oauthSessions).where(eq(oauthSessions.uid, payload.user.uid));
-  await db.delete(profiles).where(eq(profiles.uid, payload.user.uid));
-  await db.delete(users).where(eq(users.uid, payload.user.uid));
-});
-
-test('40. Preserves chosen display name across future OAuth re-logins and does not overwrite with OAuth claims', async () => {
-  const { db } = await import('../src/db/index.ts');
-  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
-  const { eq } = await import('drizzle-orm');
-
-  resetServerTestOverrides();
-  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_client_123';
-  process.env.PESU_OAUTH_CLIENT_SECRET = 'test_pesu_secret_123';
-  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
-
-  setServerTestOverrides({
-    fetchFn: async (input) => {
-      const url = String(input);
-      if (url.includes('/.well-known/openid-configuration')) {
-        return new Response(
-          JSON.stringify({
-            issuer: 'https://oauth.pesu.mock',
-            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
-            token_endpoint: 'https://oauth.pesu.mock/token',
-            scopes_supported: ['openid', 'profile', 'email'],
-            code_challenge_methods_supported: ['S256'],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/token') {
-        const idToken = createBase64UrlJwt({
-          iss: 'https://oauth.pesu.mock',
-          aud: 'test_pesu_client_123',
-          sub: 'pesu_relogin_user_02',
-          preferred_username: 'PES1UG23CS555',
-          exp: Math.floor(Date.now() / 1000) + 3600,
-        });
-        return new Response(
-          JSON.stringify({
-            access_token: 'token_relogin_1',
-            token_type: 'Bearer',
-            expires_in: 3600,
-            scope: 'openid profile email',
-            id_token: idToken,
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      return new Response('Not found', { status: 404 });
-    },
-  });
-
-  // Step 1: Initial Login
-  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
-  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
-  const urlData = await urlRes.json();
-
-  const cbRes = await fetch(
-    `${baseUrl}/auth/pesu/callback?code=relogin_code_1&state=${encodeURIComponent(urlData.state)}`,
-    { headers: { Cookie: sidCookie } }
-  );
-  const cbCookie = (cbRes.headers.get('set-cookie') ?? '').split(';')[0];
-  const authHeaders = { Cookie: `${sidCookie}; ${cbCookie}` };
-
-  // Step 2: Student chooses a custom display name "Ananya Rao"
-  const updateRes = await fetch(`${baseUrl}/api/profile`, {
-    method: 'PUT',
-    headers: { ...authHeaders, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      displayName: 'Ananya Rao',
-      profile: {
-        headline: 'AI Builder',
-        skillTags: ['Python', 'PyTorch'],
-        interestTags: ['Applied AI/ML'],
-        preferredRoles: ['ML/Data'],
-      },
-    }),
-  });
-  const updateData = await updateRes.json();
-  assert.equal(updateRes.status, 200);
-  assert.equal(updateData.user.displayName, 'Ananya Rao');
-
-  // Step 3: Student logs in again later via PESU OAuth
-  const urlRes2 = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
-  const sidCookie2 = (urlRes2.headers.get('set-cookie') ?? '').split(';')[0];
-  const urlData2 = await urlRes2.json();
-
-  const cbRes2 = await fetch(
-    `${baseUrl}/auth/pesu/callback?code=relogin_code_2&state=${encodeURIComponent(urlData2.state)}`,
-    { headers: { Cookie: sidCookie2 } }
-  );
-  const cbCookie2 = (cbRes2.headers.get('set-cookie') ?? '').split(';')[0];
-
-  const sessRes = await fetch(`${baseUrl}/api/auth/session`, {
-    headers: { Cookie: `${sidCookie2}; ${cbCookie2}` },
-  });
-  const sessData = await sessRes.json();
-  assert.equal(sessData.ok, true);
-  assert.equal(sessData.authenticated, true);
-  assert.equal(
-    sessData.user.displayName,
-    'Ananya Rao',
-    'Custom display name must be preserved across OAuth re-logins'
-  );
-
-  // Cleanup
-  await db.delete(oauthSessions).where(eq(oauthSessions.uid, sessData.user.uid));
-  await db.delete(profiles).where(eq(profiles.uid, sessData.user.uid));
-  await db.delete(users).where(eq(users.uid, sessData.user.uid));
-});
-
-test('41. Closed, ended, or non-matchable hackathons reject new team creation and swipe matching in backend APIs', async () => {
-  const { upsertUserAndProfile, createOAuthSessionRecord, createPublishedHackathonDirect } = await import('../src/db/repository.ts');
-  const { db } = await import('../src/db/index.ts');
-  const { hackathons, users, profiles, oauthSessions, teams, swipes } = await import('../src/db/schema.ts');
-  const { eq } = await import('drizzle-orm');
-
-  // Create test user
-  const testUid = `elig_user_${Date.now()}`;
-  await upsertUserAndProfile({
-    uid: testUid,
-    displayName: 'Eligibility Tester',
-    email: 'elig@pesu.pes.edu',
-    pesuOidcSub: `sub_elig_${Date.now()}`,
-    isAdmin: false,
-  });
-
-  const sessionToken = `pesu_tok_elig_${Date.now()}`;
-  await createOAuthSessionRecord({
-    sessionToken,
-    uid: testUid,
-    pesuSub: `sub_elig_${Date.now()}`,
-    accessToken: null,
-    refreshToken: null,
-    scopes: ['openid', 'profile'],
-    expiresAt: new Date(Date.now() + 3600000),
-  });
-
-  const authHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${sessionToken}`,
-  };
-
-  // 1. Create a closed hackathon (registrationDeadline in past)
-  const uniqueId = Date.now();
-  const closedSlug = `closed_hack_${uniqueId}`;
-  const createdHack = await createPublishedHackathonDirect({
-    slug: closedSlug,
-    name: `Closed Hackathon ${uniqueId}`,
-    organizer: 'Past Club',
-    description: 'Past event where registration has ended.',
-    eventType: 'hackathon',
-    matchable: true,
-    themes: ['AI/ML'],
-    campus: 'RR Campus',
-    venueName: 'Auditorium',
-    format: 'onsite',
-    startAt: '2025-10-10',
-    endAt: '2025-10-11',
-    registrationDeadline: '2025-10-01',
-    minTeamSize: 2,
-    maxTeamSize: 4,
-    registrationUrl: `https://events.pes.edu/past_${uniqueId}`,
-    verifiedCanonicalUrl: `https://events.pes.edu/past_${uniqueId}`,
-    sourceUrlStatus: 'verified',
-    createdByUid: testUid,
-  });
-  const targetHackathonId = createdHack.id || closedSlug;
-
-  // Attempting to create a team for the closed event should return 400
-  const teamRes = await fetch(`${baseUrl}/api/teams`, {
-    method: 'POST',
-    headers: authHeaders,
-    body: JSON.stringify({
-      hackathonId: targetHackathonId,
-      name: 'Late Team',
-      pitch: 'Trying to register late',
-    }),
-  });
-  const teamData = await teamRes.json();
-  assert.equal(teamRes.status, 400);
-  assert.equal(teamData.ok, false);
-  assert.match(teamData.error, /Registration for this event has closed|ended/);
-
-  // Attempting to swipe interested on the closed event should return 400
-  const swipeRes = await fetch(`${baseUrl}/api/swipes`, {
-    method: 'POST',
-    headers: authHeaders,
-    body: JSON.stringify({
-      hackathonId: targetHackathonId,
-      targetType: 'user',
-      targetId: 'target_student_123',
-      decision: 'interested',
-    }),
-  });
-  const swipeData = await swipeRes.json();
-  assert.equal(swipeRes.status, 400);
-  assert.equal(swipeData.ok, false);
-  assert.match(swipeData.error, /Registration for this event has closed|ended/);
-
-  // Cleanup
-  await db.delete(swipes).where(eq(swipes.hackathonSlug, targetHackathonId));
-  await db.delete(teams).where(eq(teams.hackathonSlug, targetHackathonId));
-  await db.delete(hackathons).where(eq(hackathons.slug, targetHackathonId));
-  await db.delete(oauthSessions).where(eq(oauthSessions.uid, testUid));
-  await db.delete(profiles).where(eq(profiles.uid, testUid));
-  await db.delete(users).where(eq(users.uid, testUid));
-});
-
-test('42. Token exchange sends client credentials via client_secret_basic (Authorization header ONLY, no client_secret in body)', async () => {
-  const { db } = await import('../src/db/index.ts');
-  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
-  const { eq } = await import('drizzle-orm');
-
-  resetServerTestOverrides();
-  delete process.env.PESU_OAUTH_TOKEN_AUTH_METHOD;
-  const clientId = 'test_basic_auth_client';
-  const clientSecret = 'test_secret_basic_xyz_123';
-  process.env.PESU_OAUTH_CLIENT_ID = clientId;
-  process.env.PESU_OAUTH_CLIENT_SECRET = clientSecret;
-  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
-
-  let capturedAuthHeader = '';
-  let capturedBodyString = '';
-
-  setServerTestOverrides({
-    fetchFn: async (input, init) => {
-      const url = String(input);
-      if (url.includes('/.well-known/openid-configuration')) {
-        return new Response(
-          JSON.stringify({
-            issuer: 'https://oauth.pesu.mock',
-            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
-            token_endpoint: 'https://oauth.pesu.mock/token',
-            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
-            scopes_supported: ['openid', 'profile', 'email'],
-            code_challenge_methods_supported: ['S256'],
-            token_endpoint_auth_methods_supported: ['client_secret_basic'],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/token') {
-        const hdrs = (init?.headers ?? {}) as Record<string, string>;
-        capturedAuthHeader = hdrs.Authorization || hdrs.authorization || '';
-        capturedBodyString = String(init?.body ?? '');
-
-        const idToken = createBase64UrlJwt({
-          iss: 'https://oauth.pesu.mock',
-          aud: clientId,
-          sub: 'pesu_student_basic_01',
-          name: 'Basic Auth Student',
-          email: 'basic.student@pesu.pes.edu',
-          exp: Math.floor(Date.now() / 1000) + 3600,
-        });
-        return new Response(
-          JSON.stringify({
-            access_token: 'token_basic_success',
-            token_type: 'Bearer',
-            expires_in: 3600,
-            scope: 'openid profile email',
-            id_token: idToken,
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/userinfo') {
-        return new Response(
-          JSON.stringify({
-            sub: 'pesu_student_basic_01',
-            name: 'Basic Auth Student',
-            email: 'basic.student@pesu.pes.edu',
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      return new Response('Not found', { status: 404 });
-    },
-  });
-
-  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
-  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
-  const urlData = await urlRes.json();
-
-  const cbRes = await fetch(
-    `${baseUrl}/auth/pesu/callback?code=basic_code_1&state=${encodeURIComponent(urlData.state)}`,
-    { headers: { Cookie: sidCookie } }
-  );
-  assert.equal(cbRes.status, 200);
-
-  // Verify client_secret_basic: Authorization header must be present, client_secret MUST NOT be in body
-  assert.ok(capturedAuthHeader.startsWith('Basic '), 'Must send Basic authorization header');
-  const decodedCreds = Buffer.from(capturedAuthHeader.replace(/^Basic\s+/i, ''), 'base64').toString('utf-8');
-  assert.equal(
-    decodedCreds,
-    `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`
-  );
-
-  const bodyParams = new URLSearchParams(capturedBodyString);
-  assert.equal(
-    bodyParams.get('client_secret'),
-    null,
-    'client_secret MUST NOT be sent in request body when using client_secret_basic'
-  );
-  assert.equal(bodyParams.get('grant_type'), 'authorization_code');
-  assert.ok(bodyParams.get('code_verifier'), 'PKCE code_verifier must be present in body');
-
-  // Cleanup
-  await db.delete(oauthSessions).where(eq(oauthSessions.uid, 'pesu_pesu_student_basic_01'));
-  await db.delete(profiles).where(eq(profiles.uid, 'pesu_pesu_student_basic_01'));
-  await db.delete(users).where(eq(users.uid, 'pesu_pesu_student_basic_01'));
-});
-
-test('43. Token exchange sends client credentials via client_secret_post (request body ONLY, no Authorization header)', async () => {
-  const { db } = await import('../src/db/index.ts');
-  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
-  const { eq } = await import('drizzle-orm');
-
-  resetServerTestOverrides();
-  process.env.PESU_OAUTH_TOKEN_AUTH_METHOD = 'client_secret_post';
-  const clientId = 'test_post_auth_client';
-  const clientSecret = 'test_secret_post_abc_456';
-  process.env.PESU_OAUTH_CLIENT_ID = clientId;
-  process.env.PESU_OAUTH_CLIENT_SECRET = clientSecret;
-  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
-
-  let capturedAuthHeader = '';
-  let capturedBodyString = '';
-
-  setServerTestOverrides({
-    fetchFn: async (input, init) => {
-      const url = String(input);
-      if (url.includes('/.well-known/openid-configuration')) {
-        return new Response(
-          JSON.stringify({
-            issuer: 'https://oauth.pesu.mock',
-            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
-            token_endpoint: 'https://oauth.pesu.mock/token',
-            userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
-            scopes_supported: ['openid', 'profile', 'email'],
-            code_challenge_methods_supported: ['S256'],
-            token_endpoint_auth_methods_supported: ['client_secret_post'],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/token') {
-        const hdrs = (init?.headers ?? {}) as Record<string, string>;
-        capturedAuthHeader = hdrs.Authorization || hdrs.authorization || '';
-        capturedBodyString = String(init?.body ?? '');
-
-        const idToken = createBase64UrlJwt({
-          iss: 'https://oauth.pesu.mock',
-          aud: clientId,
-          sub: 'pesu_student_post_01',
-          name: 'Post Auth Student',
-          email: 'post.student@pesu.pes.edu',
-          exp: Math.floor(Date.now() / 1000) + 3600,
-        });
-        return new Response(
-          JSON.stringify({
-            access_token: 'token_post_success',
-            token_type: 'Bearer',
-            expires_in: 3600,
-            scope: 'openid profile email',
-            id_token: idToken,
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/userinfo') {
-        return new Response(
-          JSON.stringify({
-            sub: 'pesu_student_post_01',
-            name: 'Post Auth Student',
-            email: 'post.student@pesu.pes.edu',
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      return new Response('Not found', { status: 404 });
-    },
-  });
-
-  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
-  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
-  const urlData = await urlRes.json();
-
-  const cbRes = await fetch(
-    `${baseUrl}/auth/pesu/callback?code=post_code_1&state=${encodeURIComponent(urlData.state)}`,
-    { headers: { Cookie: sidCookie } }
-  );
-  assert.equal(cbRes.status, 200);
-
-  // Verify client_secret_post: Authorization header MUST NOT be sent, credentials MUST be in body
-  assert.equal(capturedAuthHeader, '', 'Must NOT send Authorization header when using client_secret_post');
-
-  const bodyParams = new URLSearchParams(capturedBodyString);
-  assert.equal(bodyParams.get('client_id'), clientId, 'client_id must be in request body');
-  assert.equal(bodyParams.get('client_secret'), clientSecret, 'client_secret must be in request body');
-  assert.equal(bodyParams.get('grant_type'), 'authorization_code');
-  assert.ok(bodyParams.get('code_verifier'), 'PKCE code_verifier must be in request body');
-
-  // Cleanup
-  delete process.env.PESU_OAUTH_TOKEN_AUTH_METHOD;
-  await db.delete(oauthSessions).where(eq(oauthSessions.uid, 'pesu_pesu_student_post_01'));
-  await db.delete(profiles).where(eq(profiles.uid, 'pesu_pesu_student_post_01'));
-  await db.delete(users).where(eq(users.uid, 'pesu_pesu_student_post_01'));
-});
-
-test('44. Token exchange with invalid client credentials returns safe INVALID_CLIENT diagnostic without secret leakage', async () => {
-  resetServerTestOverrides();
-  const clientId = 'test_invalid_client_app';
-  const clientSecret = 'super_secret_that_must_not_leak_987';
-  process.env.PESU_OAUTH_CLIENT_ID = clientId;
-  process.env.PESU_OAUTH_CLIENT_SECRET = clientSecret;
-  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
-
-  setServerTestOverrides({
-    fetchFn: async (input) => {
-      const url = String(input);
-      if (url.includes('/.well-known/openid-configuration')) {
-        return new Response(
-          JSON.stringify({
-            issuer: 'https://oauth.pesu.mock',
-            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
-            token_endpoint: 'https://oauth.pesu.mock/token',
-            scopes_supported: ['openid', 'profile', 'email'],
-            code_challenge_methods_supported: ['S256'],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/token') {
-        return new Response(
-          JSON.stringify({
-            error: 'invalid_client',
-            error_description: 'Client authentication failed: invalid client secret',
-          }),
-          { status: 401, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      return new Response('Not found', { status: 404 });
-    },
-  });
-
-  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
-  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
-  const urlData = await urlRes.json();
-
-  const cbRes = await fetch(
-    `${baseUrl}/auth/pesu/callback?code=bad_secret_code&state=${encodeURIComponent(urlData.state)}`,
-    { headers: { Cookie: sidCookie } }
-  );
-  const cbHtml = await cbRes.text();
-  assert.equal(cbRes.status, 502);
-
-  // Extract postMessage payload
-  const match = cbHtml.match(/var payload = ({.*?});/);
-  assert.ok(match, 'Callback HTML must contain payload');
-  const payload = JSON.parse(match[1]);
-
-  assert.equal(payload.ok, false);
-  assert.equal(payload.diagnostics.errorCategory, 'INVALID_CLIENT');
-  assert.equal(payload.diagnostics.callbackOutcome, 'rejected_invalid_client');
-  assert.equal(payload.diagnostics.httpStatus, 401);
-  assert.equal(payload.stages.tokenExchange, 'failed');
-
-  // Verify that the secret was NEVER leaked into the HTML, userMessage, or diagnostics
-  assert.ok(!cbHtml.includes(clientSecret), 'Client secret MUST NEVER be present in callback HTML');
-  assert.ok(!payload.userMessage.includes(clientSecret));
-  assert.ok(!payload.error.includes(clientSecret));
-  assert.ok(!JSON.stringify(payload.diagnostics).includes(clientSecret));
-});
-
-test('45. Missing local backend credentials (missing PESU_OAUTH_CLIENT_SECRET) fails callback with 400 MISSING_CONFIG before network exchange', async () => {
-  resetServerTestOverrides();
-  process.env.PESU_OAUTH_CLIENT_ID = 'test_valid_client_id';
-  const prevSecret = process.env.PESU_OAUTH_CLIENT_SECRET;
-  delete process.env.PESU_OAUTH_CLIENT_SECRET;
-  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
-
-  let tokenEndpointCalled = false;
-
-  setServerTestOverrides({
-    fetchFn: async (input) => {
-      const url = String(input);
-      if (url.includes('/.well-known/openid-configuration')) {
-        return new Response(
-          JSON.stringify({
-            issuer: 'https://oauth.pesu.mock',
-            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
-            token_endpoint: 'https://oauth.pesu.mock/token',
-            scopes_supported: ['openid', 'profile', 'email'],
-            code_challenge_methods_supported: ['S256'],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/token') {
-        tokenEndpointCalled = true;
-        return new Response(JSON.stringify({ error: 'should_not_reach' }), { status: 500 });
-      }
-      return new Response('Not found', { status: 404 });
-    },
-  });
+  // 2. End-to-end DB persistence + preservation across future OAuth upserts
+  const suffix = Date.now();
+  const uidA = `pesu_dn_a_${suffix}`;
+  const uidB = `pesu_dn_b_${suffix}`;
+  const tokA = `pesu_tok_dn_a_${suffix}`;
+  const tokB = `pesu_tok_dn_b_${suffix}`;
 
   try {
-    const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
-    const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
-    const urlData = await urlRes.json();
+    // Student A logs in when OAuth lacks full name (only SRN in sub/preferred_username)
+    const createdA = await upsertUserAndProfile({
+      uid: uidA,
+      email: `dn_a_${suffix}@pesu.pes.edu`,
+      displayName: 'PES1UG22CS401',
+      verifiedHumanName: false,
+      pesuOidcSub: 'PES1UG22CS401',
+    });
+    assert.equal(createdA.user.displayName, PLACEHOLDER_DISPLAY_NAME);
+    assert.equal(createdA.user.needsDisplayNameSetup, true);
 
-    const cbRes = await fetch(
-      `${baseUrl}/auth/pesu/callback?code=missing_secret_code&state=${encodeURIComponent(urlData.state)}`,
-      { headers: { Cookie: sidCookie } }
+    await createOAuthSessionRecord({
+      sessionToken: tokA,
+      uid: uidA,
+      pesuSub: 'PES1UG22CS401',
+      accessToken: null,
+      refreshToken: null,
+      scopes: ['openid', 'profile'],
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    // Reject SRN or email as displayName via PUT /api/profile
+    const badNameRes = await fetch(`${baseUrl}/api/profile`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokA}`,
+      },
+      body: JSON.stringify({
+        displayName: 'PES1UG22CS401',
+        profile: createdA.profile,
+      }),
+    });
+    assert.equal(badNameRes.status, 400);
+
+    // Save a valid custom display name
+    const goodNameRes = await fetch(`${baseUrl}/api/profile`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokA}`,
+      },
+      body: JSON.stringify({
+        displayName: 'Karthik Nair',
+        profile: createdA.profile,
+      }),
+    });
+    assert.equal(goodNameRes.status, 200);
+    const goodNameData = await goodNameRes.json();
+    assert.equal(goodNameData.user.displayName, 'Karthik Nair');
+    assert.equal(goodNameData.user.needsDisplayNameSetup, false);
+
+    // Subsequent OAuth login must NOT overwrite the student's chosen display name
+    const reloginA = await upsertUserAndProfile({
+      uid: uidA,
+      email: `dn_a_${suffix}@pesu.pes.edu`,
+      displayName: 'PES1UG22CS401',
+      verifiedHumanName: false,
+      pesuOidcSub: 'PES1UG22CS401',
+    });
+    assert.equal(reloginA.user.displayName, 'Karthik Nair');
+
+    // Even if a later OAuth claim brings a different name, explicit custom name is preserved
+    const reloginA2 = await upsertUserAndProfile({
+      uid: uidA,
+      email: `dn_a_${suffix}@pesu.pes.edu`,
+      displayName: 'Karthik N.',
+      verifiedHumanName: true,
+      pesuOidcSub: 'PES1UG22CS401',
+    });
+    assert.equal(reloginA2.user.displayName, 'Karthik Nair');
+
+    const storedA = await getUserAndProfileByUid(uidA);
+    assert.equal(storedA?.user.displayName, 'Karthik Nair');
+
+    // Student B logs in and fetches /api/bootstrap — must never see Student A's SRN in pesuOidcSub or displayName
+    await upsertUserAndProfile({
+      uid: uidB,
+      email: `dn_b_${suffix}@pesu.pes.edu`,
+      displayName: 'Meera Iyer',
+      verifiedHumanName: true,
+      pesuOidcSub: 'PES1UG22CS402',
+    });
+    await createOAuthSessionRecord({
+      sessionToken: tokB,
+      uid: uidB,
+      pesuSub: 'PES1UG22CS402',
+      accessToken: null,
+      refreshToken: null,
+      scopes: ['openid', 'profile'],
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    const bootBRes = await fetch(`${baseUrl}/api/bootstrap?scope=initial`, {
+      headers: { Authorization: `Bearer ${tokB}` },
+    });
+    assert.equal(bootBRes.status, 200);
+    const bootB = await bootBRes.json();
+    const seenA = (bootB.users as Array<{ uid: string; displayName: string; pesuOidcSub?: string }>).find(
+      (u) => u.uid === uidA
     );
-    const cbHtml = await cbRes.text();
-    assert.equal(cbRes.status, 400);
-
-    const match = cbHtml.match(/var payload = ({.*?});/);
-    assert.ok(match, 'Callback HTML must contain payload');
-    const payload = JSON.parse(match[1]);
-
-    assert.equal(payload.ok, false);
-    assert.equal(payload.errorCategory, 'MISSING_CONFIG');
-    assert.equal(payload.stages.configuration, 'missing_client_secret');
-    assert.equal(payload.diagnostics.callbackOutcome, 'missing_credentials');
-    assert.equal(tokenEndpointCalled, false, 'Token endpoint must NOT be called when credentials are missing');
+    assert.ok(seenA, 'Student A should be visible in bootstrap users');
+    assert.equal(seenA.displayName, 'Karthik Nair');
+    assert.equal(
+      seenA.pesuOidcSub,
+      'VERIFIED',
+      'Other student SRN/sub must be masked in public bootstrap payload'
+    );
+    assert.ok(
+      !JSON.stringify(seenA).includes('PES1UG22CS401'),
+      'Raw SRN must never leak in another student bootstrap payload'
+    );
   } finally {
-    if (prevSecret !== undefined) {
-      process.env.PESU_OAUTH_CLIENT_SECRET = prevSecret;
-    }
+    await db.delete(oauthSessions).where(inArray(oauthSessions.uid, [uidA, uidB]));
+    await db.delete(profiles).where(inArray(profiles.uid, [uidA, uidB]));
+    await db.delete(users).where(inArray(users.uid, [uidA, uidB]));
   }
 });
 
-test('46. Upstream authorization-code rejection (invalid_grant) returns distinct OAUTH_INVALID_GRANT diagnostic', async () => {
-  resetServerTestOverrides();
-  process.env.PESU_OAUTH_CLIENT_ID = 'test_grant_client';
-  process.env.PESU_OAUTH_CLIENT_SECRET = 'test_grant_secret';
-  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.mock';
-
-  setServerTestOverrides({
-    fetchFn: async (input) => {
-      const url = String(input);
-      if (url.includes('/.well-known/openid-configuration')) {
-        return new Response(
-          JSON.stringify({
-            issuer: 'https://oauth.pesu.mock',
-            authorization_endpoint: 'https://oauth.pesu.mock/authorize',
-            token_endpoint: 'https://oauth.pesu.mock/token',
-            scopes_supported: ['openid', 'profile', 'email'],
-            code_challenge_methods_supported: ['S256'],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url === 'https://oauth.pesu.mock/token') {
-        return new Response(
-          JSON.stringify({
-            error: 'invalid_grant',
-            error_description: 'Authorization code has expired or was already redeemed',
-          }),
-          { status: 400, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      return new Response('Not found', { status: 404 });
-    },
-  });
-
-  const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
-  const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
-  const urlData = await urlRes.json();
-
-  const cbRes = await fetch(
-    `${baseUrl}/auth/pesu/callback?code=expired_code&state=${encodeURIComponent(urlData.state)}`,
-    { headers: { Cookie: sidCookie } }
+test('40. Minimal quick onboarding, skipped preferences without invented defaults, and sparse-profile recommendations', async () => {
+  const { rankPeopleForHackathon } = await import('../src/services/matchingEngine.ts');
+  const { upsertUserAndProfile, createOAuthSessionRecord } = await import(
+    '../src/db/repository.ts'
   );
-  const cbHtml = await cbRes.text();
-  assert.equal(cbRes.status, 502);
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
+  const { inArray } = await import('drizzle-orm');
 
-  const match = cbHtml.match(/var payload = ({.*?});/);
-  assert.ok(match, 'Callback HTML must contain payload');
-  const payload = JSON.parse(match[1]);
+  const suffix = Date.now();
+  const uidQuick = `pesu_quick_${suffix}`;
+  const uidSkip = `pesu_skip_${suffix}`;
+  const uidCand = `pesu_cand_${suffix}`;
+  const tokQuick = `pesu_tok_quick_${suffix}`;
+  const tokSkip = `pesu_tok_skip_${suffix}`;
 
-  assert.equal(payload.ok, false);
-  assert.equal(payload.diagnostics.errorCategory, 'OAUTH_INVALID_GRANT');
-  assert.equal(payload.diagnostics.callbackOutcome, 'rejected_invalid_grant');
+  try {
+    // 1. Fresh user starts with empty profile (zero invented defaults)
+    const freshQuick = await upsertUserAndProfile({
+      uid: uidQuick,
+      email: `quick_${suffix}@pesu.pes.edu`,
+      displayName: 'Quick Setup Student',
+      verifiedHumanName: true,
+    });
+    assert.deepEqual(freshQuick.profile.interestTags, []);
+    assert.deepEqual(freshQuick.profile.skillTags, []);
+    assert.deepEqual(freshQuick.profile.preferredRoles, []);
+    assert.equal(freshQuick.profile.headline, '');
+
+    await createOAuthSessionRecord({
+      sessionToken: tokQuick,
+      uid: uidQuick,
+      pesuSub: `sub_quick_${suffix}`,
+      accessToken: null,
+      refreshToken: null,
+      scopes: ['openid', 'profile'],
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    // 2. Save minimal quick setup (only interests, skills, 1 role — no GitHub/bio/projects)
+    const quickSaveRes = await fetch(`${baseUrl}/api/profile`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokQuick}`,
+      },
+      body: JSON.stringify({
+        profile: {
+          ...freshQuick.profile,
+          interestTags: ['AI/ML', 'Web Development'],
+          skillTags: ['Python', 'React'],
+          preferredRoles: ['Frontend'],
+        },
+        privacyPreferences: {
+          ...freshQuick.user.privacyPreferences,
+          onboardingCompleted: true,
+        },
+      }),
+    });
+    assert.equal(quickSaveRes.status, 200);
+    const quickSaved = await quickSaveRes.json();
+    assert.deepEqual(quickSaved.profile.interestTags, ['AI/ML', 'Web Development']);
+    assert.deepEqual(quickSaved.profile.skillTags, ['Python', 'React']);
+    assert.deepEqual(quickSaved.profile.preferredRoles, ['Frontend']);
+    assert.equal(quickSaved.user.privacyPreferences.onboardingCompleted, true);
+
+    // 3. Skipped onboarding user persists onboardingCompleted=true with empty arrays (no fabricated preferences)
+    const freshSkip = await upsertUserAndProfile({
+      uid: uidSkip,
+      email: `skip_${suffix}@pesu.pes.edu`,
+      displayName: 'Skipped Student',
+      verifiedHumanName: true,
+    });
+    await createOAuthSessionRecord({
+      sessionToken: tokSkip,
+      uid: uidSkip,
+      pesuSub: `sub_skip_${suffix}`,
+      accessToken: null,
+      refreshToken: null,
+      scopes: ['openid', 'profile'],
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    const skipRes = await fetch(`${baseUrl}/api/profile`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokSkip}`,
+      },
+      body: JSON.stringify({
+        profile: freshSkip.profile,
+        privacyPreferences: {
+          ...freshSkip.user.privacyPreferences,
+          onboardingCompleted: true,
+        },
+      }),
+    });
+    assert.equal(skipRes.status, 200);
+    const skipSaved = await skipRes.json();
+    assert.deepEqual(skipSaved.profile.interestTags, []);
+    assert.deepEqual(skipSaved.profile.skillTags, []);
+    assert.deepEqual(skipSaved.profile.preferredRoles, []);
+    assert.equal(skipSaved.user.privacyPreferences.onboardingCompleted, true);
+
+    // 4. Matching engine produces explainable recommendations for both sparse quick-setup and skipped profiles
+    const cand = await upsertUserAndProfile({
+      uid: uidCand,
+      email: `cand_${suffix}@pesu.pes.edu`,
+      displayName: 'Backend ML Builder',
+      verifiedHumanName: true,
+    });
+    const candProfile = {
+      ...cand.profile,
+      interestTags: ['Applied AI/ML'],
+      skillTags: ['FastAPI', 'PostgreSQL', 'PyTorch'],
+      preferredRoles: ['Backend'],
+    };
+
+    const upcomingHackathon = {
+      id: `hack_sparse_${suffix}`,
+      name: 'Sparse Match Test Hack',
+      description: 'Test hackathon',
+      eventType: 'hackathon' as const,
+      matchable: true,
+      themes: ['AI/ML'],
+      venue: { name: 'MRD', campus: 'RR Campus' as const },
+      format: 'onsite' as const,
+      startAt: '2026-12-20T09:00:00+05:30',
+      datePrecision: 'date_only' as const,
+      endAt: '2026-12-21T18:00:00+05:30',
+      timezone: 'Asia/Kolkata',
+      registrationDeadline: '2026-12-18T23:59:59+05:30',
+      registrationStatus: 'OPEN' as const,
+      registrationUrl: 'https://events.pes.edu/test',
+      minTeamSize: 2,
+      maxTeamSize: 4,
+      eligibilityNotes: null,
+      organizer: 'PESU',
+      sourceIds: [],
+      fieldProvenance: {},
+      suggestedByCount: 1,
+      classification: {
+        category: 'hackathon' as const,
+        ruleGatePassed: true,
+        mlConfidenceScore: 1,
+        reason: 'Test',
+      },
+      lastVerifiedAt: new Date().toISOString(),
+      verificationStatus: 'verified' as const,
+      status: 'published' as const,
+      createdBy: 'system',
+    };
+
+    const quickRanked = rankPeopleForHackathon({
+      viewerUid: uidQuick,
+      hackathon: upcomingHackathon,
+      users: [quickSaved.user, cand.user],
+      profiles: { [uidQuick]: quickSaved.profile, [uidCand]: candProfile },
+      participations: [],
+      teams: [],
+      memberships: [],
+      blocks: [],
+      interests: [],
+    });
+    assert.equal(quickRanked.cards.length, 1);
+    assert.equal(quickRanked.cards[0].id, uidCand);
+    assert.ok(
+      quickRanked.cards[0].sharedInterests.length > 0,
+      'Quick setup AI/ML should match canonical Applied AI/ML'
+    );
+    assert.ok(
+      quickRanked.cards[0].compatibilityReasons.length > 0,
+      'Sparse quick profile must still receive explainable reasons'
+    );
+    assert.ok(
+      !quickRanked.cards[0].subtitle.startsWith(' ·'),
+      'Empty headline must fall back cleanly in subtitle'
+    );
+
+    const skipRanked = rankPeopleForHackathon({
+      viewerUid: uidSkip,
+      hackathon: upcomingHackathon,
+      users: [skipSaved.user, cand.user],
+      profiles: { [uidSkip]: skipSaved.profile, [uidCand]: candProfile },
+      participations: [],
+      teams: [],
+      memberships: [],
+      blocks: [],
+      interests: [],
+    });
+    assert.equal(skipRanked.cards.length, 1);
+    assert.equal(skipRanked.cards[0].id, uidCand);
+    assert.equal(skipRanked.cards[0].featureBreakdown.coldStartRedistributed, true);
+    assert.ok((skipRanked.cards[0].featureBreakdown.totalScore ?? 0) >= 50);
+  } finally {
+    await db
+      .delete(oauthSessions)
+      .where(inArray(oauthSessions.uid, [uidQuick, uidSkip, uidCand]));
+    await db
+      .delete(profiles)
+      .where(inArray(profiles.uid, [uidQuick, uidSkip, uidCand]));
+    await db
+      .delete(users)
+      .where(inArray(users.uid, [uidQuick, uidSkip, uidCand]));
+  }
 });
+
+test('41. Closed and ended hackathons cannot start new teammate matching, teams, or swipes while preserving historical records', async () => {
+  const {
+    upsertUserAndProfile,
+    createOAuthSessionRecord,
+    createPublishedHackathonDirect,
+  } = await import('../src/db/repository.ts');
+  const { isHackathonEligibleForMatching } = await import(
+    '../src/services/matchingEngine.ts'
+  );
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions, hackathons } = await import(
+    '../src/db/schema.ts'
+  );
+  const { inArray } = await import('drizzle-orm');
+
+  const suffix = Date.now();
+  const uid1 = `pesu_closed_u1_${suffix}`;
+  const uid2 = `pesu_closed_u2_${suffix}`;
+  const tok1 = `pesu_tok_closed_u1_${suffix}`;
+  const closedSlug = `hack_closed_${suffix}`;
+  const endedSlug = `hack_ended_${suffix}`;
+
+  try {
+    await upsertUserAndProfile({
+      uid: uid1,
+      email: `c1_${suffix}@pesu.pes.edu`,
+      displayName: 'Closed Event Tester One',
+      verifiedHumanName: true,
+    });
+    await upsertUserAndProfile({
+      uid: uid2,
+      email: `c2_${suffix}@pesu.pes.edu`,
+      displayName: 'Closed Event Tester Two',
+      verifiedHumanName: true,
+    });
+    await createOAuthSessionRecord({
+      sessionToken: tok1,
+      uid: uid1,
+      pesuSub: `sub_c1_${suffix}`,
+      accessToken: null,
+      refreshToken: null,
+      scopes: ['openid', 'profile'],
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    const closedHack = await createPublishedHackathonDirect({
+      slug: closedSlug,
+      name: `Closed Registration Hack ${suffix}`,
+      organizer: 'PESU',
+      description: 'Registration is closed.',
+      eventType: 'hackathon',
+      matchable: true,
+      themes: ['AI/ML'],
+      campus: 'RR Campus',
+      venueName: 'RR Campus',
+      format: 'onsite',
+      startAt: '2026-12-28T09:00:00+05:30',
+      endAt: '2026-12-29T18:00:00+05:30',
+      registrationDeadline: '2026-11-01T23:59:59+05:30',
+      minTeamSize: 2,
+      maxTeamSize: 4,
+      registrationUrl: 'https://events.pes.edu/closed',
+      verifiedCanonicalUrl: 'https://events.pes.edu/closed',
+      sourceUrlStatus: 'verified',
+      status: 'registration_closed',
+      createdByUid: uid1,
+    });
+
+    const endedHack = await createPublishedHackathonDirect({
+      slug: endedSlug,
+      name: `Historical Ended Hack ${suffix}`,
+      organizer: 'PESU',
+      description: 'Already ended.',
+      eventType: 'hackathon',
+      matchable: true,
+      themes: ['Systems'],
+      campus: 'EC Campus',
+      venueName: 'EC Campus',
+      format: 'onsite',
+      startAt: '2026-01-10T09:00:00+05:30',
+      endAt: '2026-01-11T18:00:00+05:30',
+      registrationDeadline: '2026-01-05T23:59:59+05:30',
+      minTeamSize: 2,
+      maxTeamSize: 4,
+      registrationUrl: 'https://events.pes.edu/ended',
+      verifiedCanonicalUrl: 'https://events.pes.edu/ended',
+      sourceUrlStatus: 'verified',
+      status: 'completed',
+      createdByUid: uid1,
+    });
+
+    assert.equal(isHackathonEligibleForMatching(closedHack), false);
+    assert.equal(isHackathonEligibleForMatching(endedHack), false);
+
+    // Backend APIs reject swipes, team creation, and discoverable participation for closed & ended events
+    for (const slug of [closedSlug, endedSlug]) {
+      const swipeRes = await fetch(`${baseUrl}/api/swipes`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tok1}`,
+        },
+        body: JSON.stringify({
+          hackathonId: slug,
+          targetType: 'person',
+          targetId: uid2,
+          direction: 'like',
+        }),
+      });
+      assert.equal(swipeRes.status, 400, `Swipe must be rejected for ${slug}`);
+
+      const teamRes = await fetch(`${baseUrl}/api/teams`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tok1}`,
+        },
+        body: JSON.stringify({
+          hackathonId: slug,
+          name: 'Blocked Team',
+          targetSize: 3,
+          openRoles: ['Backend'],
+          description: 'Should be rejected',
+        }),
+      });
+      assert.equal(teamRes.status, 400, `Team creation must be rejected for ${slug}`);
+
+      const partRes = await fetch(`${baseUrl}/api/participations/${slug}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tok1}`,
+        },
+        body: JSON.stringify({
+          intent: 'solo_looking',
+          desiredRoles: ['Backend'],
+          skillsOffered: ['Python'],
+          availabilityWindows: ['Sat'],
+          commitmentLevel: 'casual',
+          workPreferences: [],
+          discoverable: true,
+        }),
+      });
+      assert.equal(
+        partRes.status,
+        400,
+        `Active participation must be rejected for ${slug}`
+      );
+
+      const discRes = await fetch(
+        `${baseUrl}/api/discovery/students?hackathonId=${encodeURIComponent(slug)}`,
+        { headers: { Authorization: `Bearer ${tok1}` } }
+      );
+      assert.equal(discRes.status, 200);
+      const discData = await discRes.json();
+      assert.equal(discData.eventEligible, false);
+      assert.deepEqual(discData.candidates, []);
+    }
+
+    // Historical events are still preserved in PostgreSQL
+    const preservedRows = await db
+      .select()
+      .from(hackathons)
+      .where(inArray(hackathons.slug, [closedSlug, endedSlug]));
+    assert.equal(preservedRows.length, 2);
+  } finally {
+    await db.delete(hackathons).where(inArray(hackathons.slug, [closedSlug, endedSlug]));
+    await db.delete(oauthSessions).where(inArray(oauthSessions.uid, [uid1, uid2]));
+    await db.delete(profiles).where(inArray(profiles.uid, [uid1, uid2]));
+    await db.delete(users).where(inArray(users.uid, [uid1, uid2]));
+  }
+});
+
+test('42. Login latency optimizations: /api/auth/session restoration/expiry/logout, scoped initial bootstrap, OAuth userinfo skip when id_token complete, and OAuth cancellation handling', async () => {
+  const { clearInMemoryOAuthStoresForTest } = await import('../server.ts');
+  const { createOAuthSessionRecord } = await import('../src/db/repository.ts');
+  const { signSessionId } = await import('../src/lib/crypto.ts');
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions, oauthTransactions } = await import(
+    '../src/db/schema.ts'
+  );
+  const { eq } = await import('drizzle-orm');
+
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_fast_login';
+  process.env.PESU_OAUTH_CLIENT_SECRET = 'secret_fast_login_key';
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.fast.mock';
+
+  let userinfoCallCount = 0;
+  const sub = `pesu_fast_student_${Date.now()}`;
+  const expectedUid = `pesu_${sub}`;
+
+  try {
+    clearInMemoryOAuthStoresForTest();
+    setServerTestOverrides({
+      fetchFn: async (input) => {
+        const url = String(input);
+        if (url.includes('/.well-known/openid-configuration')) {
+          return new Response(
+            JSON.stringify({
+              issuer: 'https://oauth.pesu.fast.mock',
+              authorization_endpoint: 'https://oauth.pesu.fast.mock/authorize',
+              token_endpoint: 'https://oauth.pesu.fast.mock/token',
+              userinfo_endpoint: 'https://oauth.pesu.fast.mock/userinfo',
+              scopes_supported: ['openid', 'profile', 'email'],
+              code_challenge_methods_supported: ['S256'],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url === 'https://oauth.pesu.fast.mock/token') {
+          const idToken = createBase64UrlJwt({
+            iss: 'https://oauth.pesu.fast.mock',
+            aud: 'test_pesu_fast_login',
+            sub,
+            name: 'Riya Deshmukh',
+            email: 'riya@pesu.pes.edu',
+            campus: 'RR Campus',
+            exp: Math.floor(Date.now() / 1000) + 3600,
+          });
+          return new Response(
+            JSON.stringify({
+              access_token: 'fast_access_token_never_logged',
+              token_type: 'Bearer',
+              expires_in: 3600,
+              scope: 'openid profile email',
+              id_token: idToken,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url === 'https://oauth.pesu.fast.mock/userinfo') {
+          userinfoCallCount += 1;
+          return new Response(JSON.stringify({ sub, name: 'Riya Deshmukh' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response('Not found', { status: 404 });
+      },
+    });
+
+    // 1. OAuth initiation issues PKCE S256 authorization URL + state
+    const urlRes1 = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+    const sidCookie = (urlRes1.headers.get('set-cookie') ?? '').split(';')[0];
+    const urlData1 = await urlRes1.json();
+    assert.equal(urlRes1.status, 200);
+    assert.ok(urlData1.state);
+    assert.ok(
+      typeof urlData1.authorizationUrl === 'string' &&
+        urlData1.authorizationUrl.includes('code_challenge_method=S256'),
+      'Authorization URL must preserve PKCE S256 security'
+    );
+
+    // 2. OAuth callback with complete id_token skips redundant /userinfo fetch
+    const cbRes = await fetch(
+      `${baseUrl}/auth/pesu/callback?code=fast_code_1&state=${encodeURIComponent(urlData1.state)}`,
+      { headers: { Cookie: sidCookie } }
+    );
+    assert.equal(cbRes.status, 200);
+    assert.equal(
+      userinfoCallCount,
+      0,
+      'Must skip redundant /userinfo fetch when id_token already provides verified name, email, and campus'
+    );
+
+    // 3. Session restoration via /api/auth/session returns canonicalAppOrigin + verified human displayName
+    clearInMemoryOAuthStoresForTest();
+    const sessRes = await fetch(`${baseUrl}/api/auth/session`, {
+      headers: { Cookie: sidCookie },
+    });
+    const sessData = await sessRes.json();
+    assert.equal(sessRes.status, 200);
+    assert.equal(sessData.authenticated, true);
+    assert.equal(sessData.user.displayName, 'Riya Deshmukh');
+    assert.ok(typeof sessData.canonicalAppOrigin === 'string' && sessData.canonicalAppOrigin.length > 0);
+
+    // 4. Scoped initial bootstrap defers conversations/messages/proposals/joinRequests
+    const initBootRes = await fetch(`${baseUrl}/api/bootstrap?scope=initial`, {
+      headers: { Cookie: sidCookie },
+    });
+    const initBoot = await initBootRes.json();
+    assert.equal(initBootRes.status, 200);
+    assert.equal(initBoot.scope, 'initial');
+    assert.deepEqual(initBoot.conversations, []);
+    assert.deepEqual(initBoot.messages, []);
+    assert.deepEqual(initBoot.joinRequests, []);
+    assert.deepEqual(initBoot.teamProposals, []);
+    assert.ok(Array.isArray(initBoot.hackathons));
+    assert.ok(Array.isArray(initBoot.users));
+
+    const fullBootRes = await fetch(`${baseUrl}/api/bootstrap`, {
+      headers: { Cookie: sidCookie },
+    });
+    const fullBoot = await fullBootRes.json();
+    assert.equal(fullBootRes.status, 200);
+    assert.equal(fullBoot.scope, 'full');
+
+    // 5. OAuth cancellation (?error=access_denied) returns error without creating a session
+    const cancelRes = await fetch(
+      `${baseUrl}/auth/pesu/callback?error=access_denied&error_description=User%20cancelled`
+    );
+    const cancelHtml = await cancelRes.text();
+    assert.equal(cancelRes.status, 400);
+    assert.equal(cancelRes.headers.get('set-cookie'), null);
+    assert.ok(cancelHtml.includes('"status":"error"'));
+    assert.ok(cancelHtml.includes('"callbackOutcome":"provider_consent_error"'));
+
+    // 6. Sign-out revokes session so /api/auth/session returns authenticated: false
+    const logoutRes = await fetch(`${baseUrl}/api/auth/logout`, {
+      method: 'POST',
+      headers: { Cookie: sidCookie },
+    });
+    assert.equal(logoutRes.status, 200);
+    const postLogoutSess = await (
+      await fetch(`${baseUrl}/api/auth/session`, { headers: { Cookie: sidCookie } })
+    ).json();
+    assert.equal(postLogoutSess.authenticated, false);
+
+    // 7. Expired session in PostgreSQL is rejected cleanly as unauthenticated
+    const expiredBrowserSid = `expired_browser_sid_${Date.now()}`;
+    await createOAuthSessionRecord({
+      sessionToken: `expired_tok_${Date.now()}`,
+      uid: expectedUid,
+      pesuSub: sub,
+      scopes: ['openid', 'profile'],
+      accessToken: null,
+      refreshToken: null,
+      expiresAt: new Date(Date.now() - 60_000),
+      initiatingSessionId: expiredBrowserSid,
+    });
+    const expiredCookie = `quackathon_sid=${encodeURIComponent(
+      signSessionId(expiredBrowserSid)
+    )}`;
+    const expiredSessRes = await fetch(`${baseUrl}/api/auth/session`, {
+      headers: { Cookie: expiredCookie },
+    });
+    const expiredSessData = await expiredSessRes.json();
+    assert.equal(expiredSessRes.status, 200);
+    assert.equal(expiredSessData.authenticated, false);
+  } finally {
+    resetServerTestOverrides();
+    await db.delete(oauthSessions).where(eq(oauthSessions.uid, expectedUid));
+    await db.delete(profiles).where(eq(profiles.uid, expectedUid));
+    await db.delete(users).where(eq(users.uid, expectedUid));
+    await db.delete(oauthTransactions);
+  }
+});
+
 
