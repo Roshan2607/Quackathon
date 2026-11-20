@@ -2803,8 +2803,10 @@ async function discoverPesuOidcEndpoints(req?: express.Request): Promise<{
         };
       }
 
+      const discoveryTimeoutMs =
+        process.env.QUACKATHON_TEST_MODE === 'true' ? 2500 : 15000;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 6000);
+      const timer = setTimeout(() => controller.abort(), discoveryTimeoutMs);
       let oidcResp: Response;
       try {
         oidcResp = await fetchFn(currentUrl, {
@@ -3153,8 +3155,10 @@ async function checkProviderRedirectUriRegistration(params: {
     );
     probeUrl.searchParams.set('code_challenge_method', 'S256');
 
+    const probeTimeoutMs =
+      process.env.QUACKATHON_TEST_MODE === 'true' ? 2500 : 8000;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2500);
+    const timer = setTimeout(() => controller.abort(), probeTimeoutMs);
     try {
       const resp = await fetch(probeUrl.toString(), {
         method: 'GET',
