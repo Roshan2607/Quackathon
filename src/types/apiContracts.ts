@@ -324,6 +324,7 @@ export type PesuAnnouncementsErrorCode =
   | 'MISSING_ANNOUNCEMENTS_SCOPE'
   | 'DELEGATED_CREDENTIALS_REQUIRED'
   | 'TOKEN_EXPIRED_OR_REVOKED'
+  | 'PROXY_FORBIDDEN_HTML'
   | 'PROVIDER_UNAVAILABLE'
   | 'MALFORMED_PROVIDER_PAYLOAD'
   | 'NETWORK_ERROR';
@@ -345,6 +346,8 @@ export interface PesuAnnouncementsResponse {
   homepageBannersSupported?: boolean;
   homepageBannersNote?: string;
   errorCode?: PesuAnnouncementsErrorCode;
+  upstreamSource?: 'express' | 'preview_proxy' | 'pesu_oauth2' | 'pesu_oauth2_gateway';
+  upstreamHttpStatus?: number;
   requiresOptIn?: boolean;
   requiresScopeGrant?: boolean;
   requiresReauth?: boolean;

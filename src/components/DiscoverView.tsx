@@ -9,9 +9,7 @@ import {
   FolderGit2,
   Heart,
   RotateCcw,
-  Search,
   ShieldAlert,
-  SlidersHorizontal,
   Sparkles,
   Users,
   X,
@@ -29,12 +27,11 @@ import {
   User,
 } from '../types/domain';
 import {
-  computeInterestCircles,
   computeTeamCombinedCapabilities,
   isHackathonEligibleForMatching,
   rankPeopleForHackathon,
 } from '../services/matchingEngine';
-import { AVAILABILITY_WINDOWS, ROLE_TAXONOMY } from '../data/seedData';
+import { StudentAvatar } from './StudentAvatar';
 
 interface DiscoverViewProps {
   currentUser: User;
@@ -85,19 +82,12 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
     memberships,
     interests,
     blocks,
-    onUpdateParticipation,
     onSwipeDecision,
     onResetPassedCards,
     onBlockUser,
     onOpenMyTeam,
     onOpenProfile,
   }) => {
-    const [selectedCircleId, setSelectedCircleId] = useState<string>('ALL');
-    const [roleFilter, setRoleFilter] = useState<string>('ALL');
-    const [onlyFirstTimeHackers, setOnlyFirstTimeHackers] = useState(false);
-    const [searchInput, setSearchInput] = useState('');
-    const [debouncedQuery, setDebouncedQuery] = useState('');
-    const [showFiltersDrawer, setShowFiltersDrawer] = useState(false);
     const [expandedDetails, setExpandedDetails] = useState(false);
     const [showScoreBreakdown, setShowScoreBreakdown] = useState(false);
     const [noteDraft, setNoteDraft] = useState('');
@@ -111,29 +101,10 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
     const [isDragging, setIsDragging] = useState(false);
     const dragStartXRef = useRef<number | null>(null);
 
-    useEffect(() => {
-      const timer = setTimeout(() => {
-        setDebouncedQuery(searchInput);
-      }, 140);
-      return () => clearTimeout(timer);
-    }, [searchInput]);
-
     const selectedHackathon =
       hackathons.find((h) => h.id === selectedHackathonId) ?? hackathons[0];
 
     const viewerProfile = profiles[currentUser.uid];
-
-    const viewerParticipation = useMemo(
-      () =>
-        selectedHackathon
-          ? participations.find(
-              (p) =>
-                p.hackathonId === selectedHackathon.id &&
-                p.uid === currentUser.uid
-            )
-          : undefined,
-      [participations, selectedHackathon, currentUser.uid]
-    );
 
     const teamCapabilities = useMemo(() => {
       if (!selectedHackathon || !viewerProfile) return null;
@@ -162,20 +133,6 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
           teamCapabilities.memberCount >= teamCapabilities.maxCapacity)
     );
 
-    const interestCircles = useMemo(
-      () =>
-        selectedHackathon
-          ? computeInterestCircles(selectedHackathon, participations, profiles)
-          : [],
-      [selectedHackathon, participations, profiles]
-    );
-
-    const activeCircleTags = useMemo(() => {
-      if (selectedCircleId === 'ALL') return undefined;
-      return interestCircles.find((c) => c.id === selectedCircleId)
-        ?.matchingTags;
-    }, [selectedCircleId, interestCircles]);
-
     const studentCards = useMemo(() => {
       if (!selectedHackathon) return [];
       return rankPeopleForHackathon({
@@ -188,10 +145,6 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
         memberships,
         interests,
         blocks,
-        activeCircleTags,
-        roleFilter,
-        onlyFirstTimeHackers,
-        searchQuery: debouncedQuery,
       }).cards;
     }, [
       currentUser.uid,
@@ -203,10 +156,6 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
       memberships,
       interests,
       blocks,
-      activeCircleTags,
-      roleFilter,
-      onlyFirstTimeHackers,
-      debouncedQuery,
     ]);
 
     const topCard = studentCards[0] ?? null;
@@ -335,26 +284,6 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
       (viewerProfileRecord?.interestTags?.length ?? 0) === 0;
     const isEventMatchable = isHackathonEligibleForMatching(selectedHackathon);
 
-    const handleToggleRole = (role: string) => {
-      const currentRoles = viewerParticipation?.desiredRoles ?? ['Backend'];
-      const next = currentRoles.includes(role)
-        ? currentRoles.filter((r) => r !== role)
-        : [...currentRoles, role];
-      if (next.length > 0) {
-        onUpdateParticipation(selectedHackathon.id, { desiredRoles: next });
-      }
-    };
-
-    const handleToggleAvailability = (win: string) => {
-      const currentWins = viewerParticipation?.availabilityWindows ?? [];
-      const next = currentWins.includes(win)
-        ? currentWins.filter((w) => w !== win)
-        : [...currentWins, win];
-      onUpdateParticipation(selectedHackathon.id, {
-        availabilityWindows: next,
-      });
-    };
-
     const maxTeamCapacity = Math.min(
       4,
       selectedHackathon.maxTeamSize && selectedHackathon.maxTeamSize > 0
@@ -401,12 +330,11 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
           </div>
         )}
 
-        {/* Top Student Discovery Header: Hackathon Context + Search & Filters */}
+        {/* Top Student Discovery Header: Hackathon Selector, Student Count & Team Status */}
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-3.5">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-            {/* Left: Hackathon Selector & Student Queue Counter */}
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-900 rounded-lg text-xs font-semibold text-blue-700 dark:text-blue-300">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-3 min-w-0">
+              <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-900 rounded-lg text-xs font-semibold text-blue-700 dark:text-blue-300 shrink-0">
                 <Users className="w-3.5 h-3.5" />
                 <span>Students</span>
                 <span className="font-mono tabular-nums px-1.5 py-0.5 rounded bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200">
@@ -418,7 +346,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
                 aria-label="Select Hackathon"
                 value={selectedHackathon.id}
                 onChange={(e) => onSelectHackathon(e.target.value)}
-                className="text-xs sm:text-sm font-semibold bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-1.5 text-slate-900 dark:text-slate-100 cursor-pointer max-w-xs sm:max-w-md truncate"
+                className="text-xs sm:text-sm font-semibold bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-1.5 text-slate-900 dark:text-slate-100 cursor-pointer max-w-full sm:max-w-md truncate"
               >
                 {hackathons.map((h) => {
                   const eligible = isHackathonEligibleForMatching(h);
@@ -431,48 +359,15 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
               </select>
             </div>
 
-            {/* Right: Search, Role Filter & Preferences Drawer */}
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="relative flex-1 sm:flex-initial">
-                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                <input
-                  type="text"
-                  value={searchInput}
-                  onChange={(e) => setSearchInput(e.target.value)}
-                  placeholder="Search student skills, role, project..."
-                  className="w-full sm:w-52 pl-8 pr-3 py-1.5 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                />
-              </div>
-
-              <select
-                aria-label="Filter by role"
-                value={roleFilter}
-                onChange={(e) => setRoleFilter(e.target.value)}
-                className="px-2.5 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs text-slate-800 dark:text-slate-200 cursor-pointer"
-              >
-                <option value="ALL">All Roles</option>
-                {ROLE_TAXONOMY.map((r) => (
-                  <option key={r} value={r}>
-                    {r}
-                  </option>
-                ))}
-              </select>
-
+            {viewerActiveTeam && onOpenMyTeam && (
               <button
                 type="button"
-                onClick={() => setShowFiltersDrawer(!showFiltersDrawer)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                  showFiltersDrawer ||
-                  selectedCircleId !== 'ALL' ||
-                  onlyFirstTimeHackers
-                    ? 'bg-blue-50 dark:bg-blue-950/40 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300'
-                    : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50'
-                }`}
+                onClick={onOpenMyTeam}
+                className="text-xs text-blue-600 dark:text-blue-400 font-semibold hover:underline cursor-pointer shrink-0"
               >
-                <SlidersHorizontal className="w-3.5 h-3.5" />
-                <span>Filters & Preferences</span>
+                Open My Team →
               </button>
-            </div>
+            )}
           </div>
 
           {/* Active Team & Matching Context Strip */}
@@ -506,142 +401,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
                 </span>
               )}
             </div>
-
-            <div className="flex items-center gap-3">
-              {viewerActiveTeam && onOpenMyTeam && (
-                <button
-                  type="button"
-                  onClick={onOpenMyTeam}
-                  className="text-blue-600 dark:text-blue-400 font-semibold hover:underline cursor-pointer"
-                >
-                  Open My Team →
-                </button>
-              )}
-              {(selectedCircleId !== 'ALL' ||
-                roleFilter !== 'ALL' ||
-                onlyFirstTimeHackers ||
-                debouncedQuery) && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedCircleId('ALL');
-                    setRoleFilter('ALL');
-                    setOnlyFirstTimeHackers(false);
-                    setSearchInput('');
-                  }}
-                  className="text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
-                >
-                  Reset filters
-                </button>
-              )}
-            </div>
           </div>
-
-          {/* Progressive Disclosure: Interest Circles & Availability Preferences */}
-          {showFiltersDrawer && (
-            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-4 text-xs">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-semibold text-slate-700 dark:text-slate-300">
-                    Domain / Theme Filter:
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedCircleId('ALL')}
-                    className={`px-2.5 py-1 rounded-md border cursor-pointer ${
-                      selectedCircleId === 'ALL'
-                        ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
-                        : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                    }`}
-                  >
-                    All Themes
-                  </button>
-                  {interestCircles.map((circle) => (
-                    <button
-                      key={circle.id}
-                      type="button"
-                      onClick={() => setSelectedCircleId(circle.id)}
-                      className={`px-2.5 py-1 rounded-md border cursor-pointer ${
-                        selectedCircleId === circle.id
-                          ? 'bg-blue-600 text-white border-blue-600'
-                          : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                      }`}
-                    >
-                      {circle.label} ·{' '}
-                      <span className="font-mono tabular-nums">
-                        {circle.participantCount}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-
-                <label className="inline-flex items-center gap-2 text-slate-700 dark:text-slate-300 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={onlyFirstTimeHackers}
-                    onChange={(e) => setOnlyFirstTimeHackers(e.target.checked)}
-                  />
-                  <span>First-time hackers only</span>
-                </label>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-slate-100 dark:border-slate-800">
-                <div className="space-y-1.5">
-                  <span className="font-semibold text-slate-700 dark:text-slate-300 block">
-                    Your Preferred Roles for {selectedHackathon.name}:
-                  </span>
-                  <div className="flex flex-wrap gap-1.5">
-                    {ROLE_TAXONOMY.map((role) => {
-                      const active = (
-                        viewerParticipation?.desiredRoles ?? []
-                      ).includes(role);
-                      return (
-                        <button
-                          key={role}
-                          type="button"
-                          onClick={() => handleToggleRole(role)}
-                          className={`px-2.5 py-1 rounded-md border transition-colors cursor-pointer ${
-                            active
-                              ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
-                              : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                          }`}
-                        >
-                          {role}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="space-y-1.5">
-                  <span className="font-semibold text-slate-700 dark:text-slate-300 block">
-                    Your Event Availability:
-                  </span>
-                  <div className="flex flex-wrap gap-1.5">
-                    {AVAILABILITY_WINDOWS.map((win) => {
-                      const active = (
-                        viewerParticipation?.availabilityWindows ?? []
-                      ).includes(win);
-                      return (
-                        <button
-                          key={win}
-                          type="button"
-                          onClick={() => handleToggleAvailability(win)}
-                          className={`px-2.5 py-1 rounded-md border transition-colors cursor-pointer ${
-                            active
-                              ? 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 border-slate-900'
-                              : 'bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-                          }`}
-                        >
-                          {win}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
 
         {/* Non-Matchable Event Notice */}
@@ -698,30 +458,13 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
           <div className="p-10 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-center space-y-3">
             <Users className="w-8 h-8 text-slate-400 mx-auto" />
             <p className="text-base font-bold text-slate-900 dark:text-slate-100">
-              No more unseen students match your current filters
+              No more unseen students right now
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
               You have reviewed all available student profiles for{' '}
-              {selectedHackathon.name}, or your filters narrowed the queue.
+              {selectedHackathon.name}.
             </p>
             <div className="flex items-center justify-center gap-3 pt-1">
-              {(selectedCircleId !== 'ALL' ||
-                roleFilter !== 'ALL' ||
-                onlyFirstTimeHackers ||
-                debouncedQuery) && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedCircleId('ALL');
-                    setRoleFilter('ALL');
-                    setOnlyFirstTimeHackers(false);
-                    setSearchInput('');
-                  }}
-                  className="px-3.5 py-2 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 rounded-lg cursor-pointer"
-                >
-                  Clear Filters
-                </button>
-              )}
               <button
                 type="button"
                 onClick={() => onResetPassedCards(selectedHackathon.id)}
@@ -791,33 +534,41 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
                   </div>
                 )}
 
-                {/* Student Header: Name, Verified Campus & Branch/Year */}
+                {/* Student Header: Avatar, Name, Verified Campus & Branch/Year */}
                 <div className="flex items-start justify-between gap-4">
-                  <div className="space-y-1">
-                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                      <span className="font-medium text-slate-700 dark:text-slate-300">
-                        {topCard.subtitle}
-                      </span>
-                      {topCardUser?.verified && (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 font-medium">
-                          <CheckCircle2 className="w-3 h-3" />
-                          PESU Verified
+                  <div className="flex items-start gap-3 min-w-0">
+                    <StudentAvatar
+                      uid={topCard.id}
+                      name={topCard.title}
+                      size="md"
+                      className="mt-0.5"
+                    />
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                        <span className="font-medium text-slate-700 dark:text-slate-300">
+                          {topCard.subtitle}
                         </span>
-                      )}
-                      {topCard.isFirstTimeHacker && (
-                        <span className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 font-medium">
-                          First-time hacker
-                        </span>
+                        {topCardUser?.verified && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 font-medium">
+                            <CheckCircle2 className="w-3 h-3" />
+                            PESU Verified
+                          </span>
+                        )}
+                        {topCard.isFirstTimeHacker && (
+                          <span className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 font-medium">
+                            First-time hacker
+                          </span>
+                        )}
+                      </div>
+                      <h2 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100 truncate">
+                        {topCard.title}
+                      </h2>
+                      {topCardProfile?.bio && (
+                        <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed pt-0.5">
+                          {topCardProfile.bio}
+                        </p>
                       )}
                     </div>
-                    <h2 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100">
-                      {topCard.title}
-                    </h2>
-                    {topCardProfile?.bio && (
-                      <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed pt-0.5">
-                        {topCardProfile.bio}
-                      </p>
-                    )}
                   </div>
 
                   <div className="text-right shrink-0">

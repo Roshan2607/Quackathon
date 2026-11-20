@@ -33,6 +33,7 @@ import {
   runLiveGitHubAndGeminiEnrichment,
 } from '../services/adapters';
 import { Modal } from './Modal';
+import { StudentAvatar } from './StudentAvatar';
 
 interface OnboardingAndProfileModalProps {
   currentUser: User;
@@ -423,11 +424,18 @@ export const OnboardingAndProfileModal: React.FC<
     <div className="space-y-6">
       {/* Core Essentials */}
       <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-6">
-        <div>
-          <h2 className="text-lg font-bold text-slate-900">Your Profile</h2>
-          <p className="text-sm text-slate-600 mt-0.5">
-            Keep your name, interests, skills, and role up to date for better teammate recommendations.
-          </p>
+        <div className="flex items-center gap-3.5">
+          <StudentAvatar
+            uid={currentUser.uid}
+            name={displayName || currentUser.displayName}
+            size="lg"
+          />
+          <div>
+            <h2 className="text-lg font-bold text-slate-900">Your Profile</h2>
+            <p className="text-sm text-slate-600 mt-0.5">
+              Keep your name, interests, skills, and role up to date for better teammate recommendations.
+            </p>
+          </div>
         </div>
 
         {/* Display Name */}

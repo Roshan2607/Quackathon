@@ -292,7 +292,7 @@ export const IntegrationTestingView: React.FC<IntegrationTestingViewProps> = ({
   ]);
 
   // 4. PESU OAuth2 (`pesu-dev/oauth2`) End-to-End State
-  const [oauthScopes, setOauthScopes] = useState<string>('openid profile email');
+  const [oauthScopes, setOauthScopes] = useState<string>('openid name profile email');
   const [oauthStages, setOauthStages] = useState<PesuOAuthStageStatuses>(DEFAULT_OAUTH_STAGES);
   const [supportedScopes, setSupportedScopes] = useState<string[]>([
     'openid',

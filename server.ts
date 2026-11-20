@@ -2269,6 +2269,7 @@ const OAUTH_SESSION_COOKIE = 'quackathon_oauth_token';
 
 const DEFAULT_SUPPORTED_SCOPES = [
   'openid',
+  'name',
   'profile',
   'email',
   'announcements:read',
@@ -3184,13 +3185,130 @@ async function checkProviderRedirectUriRegistration(params: {
   }
 }
 
+function normalizeEnvCredential(raw: string | undefined): string {
+  if (!raw) return '';
+  let value = raw.trim();
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    value = value.slice(1, -1).trim();
+  }
+  return value;
+}
+
+type OAuthTokenAuthMethod =
+  | 'client_secret_basic'
+  | 'client_secret_post'
+  | 'client_secret_basic_encoded'
+  | 'none';
+
+async function executeOAuthTokenExchange(params: {
+  fetchFn: typeof fetch;
+  tokenEndpoint: string;
+  code: string;
+  redirectUri: string;
+  codeVerifier: string;
+  clientId: string;
+  clientSecret: string;
+  allowMethodFallback: boolean;
+}): Promise<{
+  tokenResp: Response;
+  tokenData: Record<string, unknown>;
+  authMethodUsed: OAuthTokenAuthMethod;
+}> {
+  const attempt = async (method: OAuthTokenAuthMethod) => {
+    const tokenParams = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: params.code,
+      redirect_uri: params.redirectUri,
+      code_verifier: params.codeVerifier,
+    });
+    const tokenHeaders: Record<string, string> = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+    };
+
+    if (method === 'client_secret_basic') {
+      // RFC 6749 §2.3: send credentials ONLY in Authorization: Basic header (never duplicate in body)
+      const basic = Buffer.from(
+        `${params.clientId}:${params.clientSecret}`,
+        'utf8'
+      ).toString('base64');
+      tokenHeaders.Authorization = `Basic ${basic}`;
+    } else if (method === 'client_secret_basic_encoded') {
+      // RFC 6749 §2.3.1 percent-encoded Basic credentials (never duplicate in body)
+      const basic = Buffer.from(
+        `${encodeURIComponent(params.clientId)}:${encodeURIComponent(params.clientSecret)}`,
+        'utf8'
+      ).toString('base64');
+      tokenHeaders.Authorization = `Basic ${basic}`;
+    } else if (method === 'client_secret_post') {
+      // RFC 6749 §2.3.1 form-body credentials (no Authorization header)
+      tokenParams.set('client_id', params.clientId);
+      tokenParams.set('client_secret', params.clientSecret);
+    } else {
+      // Public PKCE client (no secret)
+      tokenParams.set('client_id', params.clientId);
+    }
+
+    const tokenResp = await params.fetchFn(params.tokenEndpoint, {
+      method: 'POST',
+      headers: tokenHeaders,
+      body: tokenParams.toString(),
+    });
+    const tokenData = (await tokenResp.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
+    return { tokenResp, tokenData, authMethodUsed: method };
+  };
+
+  if (!params.clientSecret) {
+    return attempt('none');
+  }
+
+  // Primary attempt: RFC 6749 client_secret_basic (raw id:secret, no body secret duplication)
+  let result = await attempt('client_secret_basic');
+  const isInvalidClient = (r: typeof result) =>
+    !r.tokenResp.ok &&
+    (r.tokenResp.status === 401 || r.tokenData.error === 'invalid_client');
+
+  if (!params.allowMethodFallback || !isInvalidClient(result)) {
+    return result;
+  }
+
+  // Fallback 1: client_secret_post (immune to Basic header encoding differences; 401 invalid_client never consumes the auth code)
+  const postResult = await attempt('client_secret_post');
+  if (!isInvalidClient(postResult)) {
+    return postResult;
+  }
+  result = postResult;
+
+  // Fallback 2: RFC 6749 §2.3.1 percent-encoded Basic (only if id or secret contains URL-encodable characters)
+  if (
+    encodeURIComponent(params.clientId) !== params.clientId ||
+    encodeURIComponent(params.clientSecret) !== params.clientSecret
+  ) {
+    const encResult = await attempt('client_secret_basic_encoded');
+    if (!isInvalidClient(encResult)) {
+      return encResult;
+    }
+    result = encResult;
+  }
+
+  return result;
+}
+
 app.get('/api/pesu-oauth/discovery', async (req, res) => {
   const startTime = Date.now();
   const session = getOrCreateSession(req, res);
   const { expectedRedirectUri, allowedRedirectUris } = getAllowedRedirectUris(req);
-  const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
+  const clientId = normalizeEnvCredential(process.env.PESU_OAUTH_CLIENT_ID);
+  const clientSecret = normalizeEnvCredential(process.env.PESU_OAUTH_CLIENT_SECRET);
   const hasClientId = Boolean(clientId);
-  const hasClientSecret = Boolean(process.env.PESU_OAUTH_CLIENT_SECRET?.trim());
+  const hasClientSecret = Boolean(clientSecret);
 
   const disc = await discoverPesuOidcEndpoints(req);
   const providerRedirectUriRegistered = await checkProviderRedirectUriRegistration({
@@ -3270,7 +3388,59 @@ app.get('/api/pesu-oauth/discovery', async (req, res) => {
     diagnostics: diag,
   };
 
-  res.status(statusToReturn).json(response);
+  let clientAuthProbe:
+    | {
+        clientAuthValid: boolean;
+        workingAuthMethod: string | null;
+        providerStatus: number;
+        providerError: string | null;
+      }
+    | undefined;
+
+  if (
+    req.query.verifyClient === 'true' &&
+    disc.tokenEndpoint &&
+    clientId &&
+    process.env.QUACKATHON_TEST_MODE !== 'true'
+  ) {
+    try {
+      const probe = await executeOAuthTokenExchange({
+        fetchFn: getFetch(),
+        tokenEndpoint: disc.tokenEndpoint,
+        code: 'probe_client_auth_check',
+        redirectUri: expectedRedirectUri,
+        codeVerifier: 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM',
+        clientId,
+        clientSecret,
+        allowMethodFallback: true,
+      });
+      const providerErr =
+        typeof probe.tokenData.error === 'string' ? probe.tokenData.error : null;
+      const clientAuthValid =
+        probe.tokenResp.status !== 401 && providerErr !== 'invalid_client';
+      clientAuthProbe = {
+        clientAuthValid,
+        workingAuthMethod: clientAuthValid ? probe.authMethodUsed : null,
+        providerStatus: probe.tokenResp.status,
+        providerError:
+          typeof probe.tokenData.error_description === 'string'
+            ? probe.tokenData.error_description
+            : providerErr,
+      };
+    } catch {
+      clientAuthProbe = {
+        clientAuthValid: false,
+        workingAuthMethod: null,
+        providerStatus: 0,
+        providerError: 'probe_network_error',
+      };
+    }
+  }
+
+  res.status(statusToReturn).json({
+    ...response,
+    ...(clientAuthProbe ? { clientAuthProbe } : {}),
+  });
 });
 
 app.get('/api/pesu-oauth/session', async (req, res) => {
@@ -3492,7 +3662,7 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       ? req.query.scope
       : typeof req.query.scopes === 'string'
       ? req.query.scopes
-      : 'openid profile';
+      : 'openid name profile email';
 
   const requestedScopes = rawScopeParam
     .split(/[\s,]+/)
@@ -3500,7 +3670,7 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
     .filter(Boolean);
 
   if (requestedScopes.length === 0) {
-    requestedScopes.push('openid', 'profile');
+    requestedScopes.push('openid', 'name', 'profile', 'email');
   }
 
   // Discover endpoints & supported scopes from real OIDC metadata
@@ -3802,7 +3972,14 @@ function renderOAuthCallbackHtml(
           : 'PESU OAuth2 Authorization Notice'
       }</h3>
       <p style="font-size: 14px; color: #475569;">${postMessagePayload.userMessage}</p>
-      <p style="font-size: 12px; color: #94a3b8;">Returning to Quackathon...</p>
+      <p style="font-size: 12px; color: #94a3b8; margin-bottom: 14px;">${
+        postMessagePayload.ok
+          ? 'Returning to Quackathon...'
+          : 'This sign-in attempt cannot be retried directly. Start a fresh sign-in from Quackathon.'
+      }</p>
+      <a href="${redirectFallbackUrl.replace(/"/g, '&quot;')}" style="display: inline-block; font-size: 13px; font-weight: 600; color: #4f46e5; text-decoration: none;">${
+        postMessagePayload.ok ? 'Return to Quackathon' : 'Start Fresh Sign-In'
+      }</a>
     </div>
     <script>
       (function() {
@@ -4362,43 +4539,27 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
   targetSession.stages.authorizationRedirect = 'callback_received';
   targetSession.stages.tokenExchange = 'exchanging';
 
-  const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim() ?? '';
-  const clientSecret = process.env.PESU_OAUTH_CLIENT_SECRET?.trim() ?? '';
+  const clientId = normalizeEnvCredential(process.env.PESU_OAUTH_CLIENT_ID);
+  const clientSecret = normalizeEnvCredential(process.env.PESU_OAUTH_CLIENT_SECRET);
 
   // Case 5: Perform genuine server-side Authorization Code + PKCE S256 token exchange
   const fetchFn = getFetch();
+  const allowMethodFallback =
+    process.env.QUACKATHON_TEST_MODE !== 'true' &&
+    !testOverrides.fetchFn &&
+    !testOverrides.fetchImpl;
   try {
-    const tokenParams = new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: tx.redirectUri,
-      client_id: clientId,
-      code_verifier: tx.codeVerifier,
-    });
-
-    const tokenHeaders: Record<string, string> = {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Accept: 'application/json',
-    };
-
-    if (clientSecret) {
-      const basicCredentials = Buffer.from(
-        `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`
-      ).toString('base64');
-      tokenHeaders.Authorization = `Basic ${basicCredentials}`;
-      tokenParams.set('client_secret', clientSecret);
-    }
-
-    const tokenResp = await fetchFn(tx.tokenEndpoint, {
-      method: 'POST',
-      headers: tokenHeaders,
-      body: tokenParams.toString(),
-    });
-
-    const tokenData = (await tokenResp.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >;
+    const { tokenResp, tokenData, authMethodUsed } =
+      await executeOAuthTokenExchange({
+        fetchFn,
+        tokenEndpoint: tx.tokenEndpoint,
+        code,
+        redirectUri: tx.redirectUri,
+        codeVerifier: tx.codeVerifier,
+        clientId,
+        clientSecret,
+        allowMethodFallback,
+      });
 
     if (!tokenResp.ok || (!tokenData.access_token && !tokenData.id_token)) {
       targetSession.stages.tokenExchange = 'failed';
@@ -4409,9 +4570,10 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
           : typeof tokenData.error === 'string'
           ? tokenData.error
           : `HTTP ${tokenResp.status}`;
-      const isInvalidClient = tokenData.error === 'invalid_client';
+      const isInvalidClient =
+        tokenData.error === 'invalid_client' || tokenResp.status === 401;
       const userMsg = isInvalidClient
-        ? `Token exchange with PESU OAuth2 failed (${upstreamErr}). Verify that PESU_OAUTH_CLIENT_SECRET matches client "${clientId}" in the PESU OAuth2 Developer Portal.`
+        ? `Token exchange with PESU OAuth2 failed (${upstreamErr}). Update PESU_OAUTH_CLIENT_SECRET in environment secrets to match client "${clientId}" in the PESU OAuth2 Developer Portal.`
         : `Token exchange with PESU OAuth2 failed (${upstreamErr}).`;
       targetSession.lastError = userMsg;
 
@@ -4441,6 +4603,8 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         callbackCookieStatus,
         sessionBindingMatched: true,
         handledByDifferentInstance,
+        authMethodUsed,
+        note: upstreamErr,
       };
       targetSession.lastDiagnostics = diag;
 
@@ -4458,7 +4622,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
         callbackCookieStatus,
         sessionBindingMatched: true,
         handledByDifferentInstance,
-        note: upstreamErr,
+        note: `${upstreamErr} (authMethod=${authMethodUsed})`,
       });
 
       const payload: PesuOAuthCallbackPostMessage = {
@@ -4533,6 +4697,7 @@ const pesuCallbackHandler: express.RequestHandler = async (req, res) => {
           headers: {
             Authorization: `Bearer ${accessToken}`,
             Accept: 'application/json',
+            'User-Agent': 'Quackathon/1.0 (+https://pesu.pes.edu)',
           },
         });
         if (uiResp.ok) {
@@ -5058,6 +5223,7 @@ app.get(
               headers: {
                 Authorization: `Bearer ${oauthSess.accessToken}`,
                 Accept: 'application/json',
+                'User-Agent': 'Quackathon/1.0 (+https://pesu.pes.edu)',
               },
               signal: controller.signal,
             });
@@ -5216,11 +5382,13 @@ app.get(
                 payload: {
                   ok: false,
                   errorCode: 'PROVIDER_UNAVAILABLE',
+                  upstreamSource: 'pesu_oauth2_gateway',
+                  upstreamHttpStatus: 403,
                   grantedScopes: oauthSess.scopes,
                   homepageBannersSupported: false,
                   homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,
                   userMessage:
-                    'The upstream PESU Academy provider returned an HTML 403 error page (gateway/proxy block). Your announcements:read permission is intact — please retry shortly or use Public PESU Events / Submit Event Link.',
+                    'The upstream PESU OAuth2 gateway blocked the request with an HTML HTTP 403 page. Your announcements:read permission is intact — please retry shortly or use Public Hackathons / Suggest Hackathon.',
                   error: 'UPSTREAM_HTML_403',
                   diagnostics: {
                     serviceName: 'pesu_oauth2',
@@ -5240,6 +5408,8 @@ app.get(
               payload: {
                 ok: false,
                 errorCode: 'PROVIDER_UNAVAILABLE',
+                upstreamSource: 'pesu_oauth2',
+                upstreamHttpStatus: upstreamResp.status,
                 grantedScopes: oauthSess.scopes,
                 homepageBannersSupported: false,
                 homepageBannersNote: PESU_HOMEPAGE_BANNERS_NOTE,

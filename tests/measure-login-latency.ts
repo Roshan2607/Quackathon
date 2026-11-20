@@ -37,7 +37,7 @@ async function run() {
             authorization_endpoint: 'https://oauth.pesu.mock/authorize',
             token_endpoint: 'https://oauth.pesu.mock/token',
             userinfo_endpoint: 'https://oauth.pesu.mock/userinfo',
-            scopes_supported: ['openid', 'profile', 'email'],
+            scopes_supported: ['openid', 'name', 'profile', 'email'],
             code_challenge_methods_supported: ['S256'],
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } }
@@ -50,6 +50,7 @@ async function run() {
           sub: 'perf_student_123',
           name: 'Latency Baseline Tester',
           email: 'perf@pesu.pes.edu',
+          campus: 'RR Campus',
           exp: Math.floor(Date.now() / 1000) + 3600,
         });
         return new Response(
@@ -58,7 +59,7 @@ async function run() {
             refresh_token: 'perf_refresh_token_def',
             token_type: 'Bearer',
             expires_in: 3600,
-            scope: 'openid profile email',
+            scope: 'openid name profile email',
             id_token: idToken,
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } }
@@ -84,16 +85,22 @@ async function run() {
     oauthInitiation: [] as number[],
     oauthCallbackTokenExchange: [] as number[],
     sessionRestoration: [] as number[],
-    bootstrapLoading: [] as number[],
-    endToEndLoginTotal: [] as number[],
+    initialBootstrapLoading: [] as number[],
+    fullBootstrapLoading: [] as number[],
+    initialBootstrapBytes: [] as number[],
+    fullBootstrapBytes: [] as number[],
+    endToEndInitialTotal: [] as number[],
+    endToEndFullTotal: [] as number[],
   };
 
-  console.log(`Starting ${runs} benchmark runs on baseline implementation...`);
+  console.log(`Starting ${runs} benchmark runs...`);
 
   for (let i = 0; i < runs; i++) {
     // 1. OAuth Initiation
     const t0 = performance.now();
-    const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url?scope=openid%20profile%20email`);
+    const urlRes = await fetch(
+      `${baseUrl}/api/pesu-oauth/url?scope=openid%20name%20profile%20email`
+    );
     const t1 = performance.now();
     metrics.oauthInitiation.push(t1 - t0);
 
@@ -112,7 +119,10 @@ async function run() {
     metrics.oauthCallbackTokenExchange.push(t3 - t2);
 
     const cbCookieHeader = cbRes.headers.get('set-cookie') ?? '';
-    const cbCookiePairs = cbCookieHeader.split(',').map(c => c.split(';')[0].trim()).join('; ');
+    const cbCookiePairs = cbCookieHeader
+      .split(',')
+      .map((c) => c.split(';')[0].trim())
+      .join('; ');
     const combinedCookie = `${cookiePair}; ${cbCookiePairs}`;
 
     // 3. Session Restoration
@@ -124,34 +134,75 @@ async function run() {
     const t5 = performance.now();
     metrics.sessionRestoration.push(t5 - t4);
 
-    // 4. Initial Bootstrap Loading
+    // 4a. Optimized Initial Bootstrap Loading (/api/bootstrap?scope=initial)
     const t6 = performance.now();
-    const bootRes = await fetch(`${baseUrl}/api/bootstrap`, {
+    const initBootRes = await fetch(`${baseUrl}/api/bootstrap?scope=initial`, {
       headers: { Cookie: combinedCookie },
     });
-    await bootRes.json();
+    const initBootText = await initBootRes.text();
     const t7 = performance.now();
-    metrics.bootstrapLoading.push(t7 - t6);
+    metrics.initialBootstrapLoading.push(t7 - t6);
+    metrics.initialBootstrapBytes.push(Buffer.byteLength(initBootText, 'utf8'));
 
-    // Total end to end (Initiation + Callback + Session Restoration + Bootstrap)
-    metrics.endToEndLoginTotal.push((t1 - t0) + (t3 - t2) + (t5 - t4) + (t7 - t6));
+    // 4b. Full Bootstrap Loading (/api/bootstrap)
+    const t8 = performance.now();
+    const fullBootRes = await fetch(`${baseUrl}/api/bootstrap`, {
+      headers: { Cookie: combinedCookie },
+    });
+    const fullBootText = await fullBootRes.text();
+    const t9 = performance.now();
+    metrics.fullBootstrapLoading.push(t9 - t8);
+    metrics.fullBootstrapBytes.push(Buffer.byteLength(fullBootText, 'utf8'));
+
+    // Total end-to-end (Initiation + Callback + Session Restoration + Bootstrap)
+    metrics.endToEndInitialTotal.push(
+      t1 - t0 + (t3 - t2) + (t5 - t4) + (t7 - t6)
+    );
+    metrics.endToEndFullTotal.push(
+      t1 - t0 + (t3 - t2) + (t5 - t4) + (t9 - t8)
+    );
   }
 
-  const avg = (arr: number[]) => (arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2);
+  const avg = (arr: number[]) =>
+    (arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2);
   const min = (arr: number[]) => Math.min(...arr).toFixed(2);
   const max = (arr: number[]) => Math.max(...arr).toFixed(2);
 
-  console.log('\n================ BASELINE LATENCY RESULTS ================');
-  console.log(`OAuth Initiation (/api/pesu-oauth/url): avg ${avg(metrics.oauthInitiation)}ms (min ${min(metrics.oauthInitiation)}ms, max ${max(metrics.oauthInitiation)}ms)`);
-  console.log(`OAuth Callback & Exchange (/auth/pesu/callback): avg ${avg(metrics.oauthCallbackTokenExchange)}ms (min ${min(metrics.oauthCallbackTokenExchange)}ms, max ${max(metrics.oauthCallbackTokenExchange)}ms)`);
-  console.log(`Session Restoration (/api/auth/session): avg ${avg(metrics.sessionRestoration)}ms (min ${min(metrics.sessionRestoration)}ms, max ${max(metrics.sessionRestoration)}ms)`);
-  console.log(`Full Bootstrap Loading (/api/bootstrap): avg ${avg(metrics.bootstrapLoading)}ms (min ${min(metrics.bootstrapLoading)}ms, max ${max(metrics.bootstrapLoading)}ms)`);
-  console.log(`Total End-to-End Sequence: avg ${avg(metrics.endToEndLoginTotal)}ms (min ${min(metrics.endToEndLoginTotal)}ms, max ${max(metrics.endToEndLoginTotal)}ms)`);
-  console.log('==========================================================\n');
+  console.log('\n================ LOGIN LATENCY RESULTS ================');
+  console.log(
+    `OAuth Initiation (/api/pesu-oauth/url): avg ${avg(metrics.oauthInitiation)}ms (min ${min(metrics.oauthInitiation)}ms, max ${max(metrics.oauthInitiation)}ms)`
+  );
+  console.log(
+    `OAuth Callback & Exchange (/auth/pesu/callback): avg ${avg(metrics.oauthCallbackTokenExchange)}ms (min ${min(metrics.oauthCallbackTokenExchange)}ms, max ${max(metrics.oauthCallbackTokenExchange)}ms)`
+  );
+  console.log(
+    `Session Restoration (/api/auth/session): avg ${avg(metrics.sessionRestoration)}ms (min ${min(metrics.sessionRestoration)}ms, max ${max(metrics.sessionRestoration)}ms)`
+  );
+  console.log(
+    `Initial Bootstrap (/api/bootstrap?scope=initial): avg ${avg(metrics.initialBootstrapLoading)}ms (min ${min(metrics.initialBootstrapLoading)}ms, max ${max(metrics.initialBootstrapLoading)}ms) · ${avg(metrics.initialBootstrapBytes)} bytes`
+  );
+  console.log(
+    `Full Bootstrap (/api/bootstrap): avg ${avg(metrics.fullBootstrapLoading)}ms (min ${min(metrics.fullBootstrapLoading)}ms, max ${max(metrics.fullBootstrapLoading)}ms) · ${avg(metrics.fullBootstrapBytes)} bytes`
+  );
+  console.log(
+    `End-to-End (Optimized Initial): avg ${avg(metrics.endToEndInitialTotal)}ms`
+  );
+  console.log(
+    `End-to-End (Legacy Full): avg ${avg(metrics.endToEndFullTotal)}ms`
+  );
+  console.log('=======================================================\n');
 
   resetServerTestOverrides();
   serverInstance.close();
-  const { pool } = await import('../src/db/index.ts');
+  const { db, pool } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions, oauthTransactions } = await import(
+    '../src/db/schema.ts'
+  );
+  const { eq } = await import('drizzle-orm');
+  await db.delete(oauthSessions).where(eq(oauthSessions.uid, 'pesu_perf_student_123'));
+  await db.delete(profiles).where(eq(profiles.uid, 'pesu_perf_student_123'));
+  await db.delete(users).where(eq(users.uid, 'pesu_perf_student_123'));
+  await db.delete(oauthTransactions);
   await pool.end();
 }
 

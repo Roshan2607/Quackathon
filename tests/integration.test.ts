@@ -6115,4 +6115,408 @@ test('42. Login latency optimizations: /api/auth/session restoration/expiry/logo
   }
 });
 
+test('43. P0 OAuth regression: default name scope, strict single client-auth method (no dual Basic+body), /userinfo name fetch when id_token omits name, and fresh-login recovery on consumed code', async () => {
+  const { clearInMemoryOAuthStoresForTest } = await import('../server.ts');
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions, oauthTransactions } = await import(
+    '../src/db/schema.ts'
+  );
+  const { eq } = await import('drizzle-orm');
+
+  process.env.PESU_OAUTH_CLIENT_ID = 'test_pesu_p0_client';
+  process.env.PESU_OAUTH_CLIENT_SECRET = 'test_pesu_p0_secret';
+  process.env.PESU_OAUTH_ISSUER_URL = 'https://oauth.pesu.p0.mock';
+
+  const sub = `PES1UG23CS901_${Date.now()}`;
+  const expectedUid = `pesu_${sub}`;
+  const captured = {
+    tokenAuthHeader: '',
+    tokenBody: '',
+    userinfoUserAgent: '',
+  };
+
+  try {
+    clearInMemoryOAuthStoresForTest();
+    setServerTestOverrides({
+      fetchFn: async (input, init) => {
+        const url = String(input);
+        if (url.includes('/.well-known/openid-configuration')) {
+          return new Response(
+            JSON.stringify({
+              issuer: 'https://oauth.pesu.p0.mock',
+              authorization_endpoint: 'https://oauth.pesu.p0.mock/authorize',
+              token_endpoint: 'https://oauth.pesu.p0.mock/token',
+              userinfo_endpoint: 'https://oauth.pesu.p0.mock/userinfo',
+              scopes_supported: ['openid', 'name', 'profile', 'email', 'announcements:read'],
+              code_challenge_methods_supported: ['S256'],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url === 'https://oauth.pesu.p0.mock/token') {
+          const hdrs = new Headers(init?.headers as HeadersInit | undefined);
+          captured.tokenAuthHeader = hdrs.get('authorization') ?? '';
+          captured.tokenBody = String(init?.body ?? '');
+
+          // id_token intentionally omits human name (only SRN/PRN + email + campus)
+          const idToken = createBase64UrlJwt({
+            iss: 'https://oauth.pesu.p0.mock',
+            aud: 'test_pesu_p0_client',
+            sub,
+            preferred_username: 'PES1UG23CS901',
+            srn: 'PES1UG23CS901',
+            email: 'ananya@pesu.pes.edu',
+            campus: 'RR Campus',
+            exp: Math.floor(Date.now() / 1000) + 3600,
+          });
+          return new Response(
+            JSON.stringify({
+              access_token: 'p0_access_token_redacted',
+              token_type: 'Bearer',
+              expires_in: 3600,
+              scope: 'openid name profile email',
+              id_token: idToken,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url === 'https://oauth.pesu.p0.mock/userinfo') {
+          const hdrs = new Headers(init?.headers as HeadersInit | undefined);
+          captured.userinfoUserAgent = hdrs.get('user-agent') ?? '';
+          return new Response(
+            JSON.stringify({
+              sub,
+              name: 'Ananya Kulkarni',
+              email: 'ananya@pesu.pes.edu',
+              srn: 'PES1UG23CS901',
+              campus: 'RR Campus',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response('Not found', { status: 404 });
+      },
+    });
+
+    // 1. Default /api/pesu-oauth/url requests `openid name profile email` (and NEVER announcements:read)
+    const urlRes = await fetch(`${baseUrl}/api/pesu-oauth/url`);
+    const sidCookie = (urlRes.headers.get('set-cookie') ?? '').split(';')[0];
+    const urlData = await urlRes.json();
+    assert.equal(urlRes.status, 200);
+    assert.deepEqual(urlData.scopes, ['openid', 'name', 'profile', 'email']);
+    assert.ok(
+      urlData.authorizationUrl.includes('scope=openid+name+profile+email') ||
+        urlData.authorizationUrl.includes('scope=openid%20name%20profile%20email'),
+      'Authorization URL must include the name scope by default'
+    );
+    assert.equal(
+      urlData.scopes.includes('announcements:read'),
+      false,
+      'Normal login must NOT request announcements:read'
+    );
+
+    // 2. Callback exchanges token with strictly ONE client-auth method (Basic header, NO client_secret in body)
+    const cbRes = await fetch(
+      `${baseUrl}/auth/pesu/callback?code=p0_code_1&state=${encodeURIComponent(urlData.state)}`,
+      { headers: { Cookie: sidCookie } }
+    );
+    assert.equal(cbRes.status, 200);
+    assert.ok(
+      captured.tokenAuthHeader.startsWith('Basic '),
+      'Token exchange must authenticate via HTTP Basic'
+    );
+    const bodyParams = new URLSearchParams(captured.tokenBody);
+    assert.equal(
+      bodyParams.has('client_secret'),
+      false,
+      'RFC 6749 §2.3: must NOT send client_secret in request body when Authorization Basic header is sent'
+    );
+    assert.ok(
+      captured.userinfoUserAgent.includes('Quackathon'),
+      'Userinfo fetch must include a standard Quackathon User-Agent header'
+    );
+
+    // 3. Session resolves verified full name from /userinfo and never uses SRN as displayName
+    const sessRes = await fetch(`${baseUrl}/api/auth/session`, {
+      headers: { Cookie: sidCookie },
+    });
+    const sessData = await sessRes.json();
+    assert.equal(sessData.authenticated, true);
+    assert.equal(sessData.user.displayName, 'Ananya Kulkarni');
+    assert.notEqual(sessData.user.displayName, 'PES1UG23CS901');
+
+    // 4. Replaying a consumed callback state redirects cleanly to a fresh sign-in link
+    const replayRes = await fetch(
+      `${baseUrl}/auth/pesu/callback?code=p0_code_1&state=${encodeURIComponent(urlData.state)}`,
+      { headers: { Cookie: sidCookie } }
+    );
+    const replayHtml = await replayRes.text();
+    assert.equal(replayRes.status, 200);
+    assert.ok(replayHtml.includes('Return to Quackathon') || replayHtml.includes('Start Fresh Sign-In'));
+  } finally {
+    resetServerTestOverrides();
+    await db.delete(oauthSessions).where(eq(oauthSessions.uid, expectedUid));
+    await db.delete(profiles).where(eq(profiles.uid, expectedUid));
+    await db.delete(users).where(eq(users.uid, expectedUid));
+    await db.delete(oauthTransactions);
+  }
+});
+
+test('44. P2 Academy Announcements regression: structured JSON for opt-in, missing scope, delegated consent, expired token, and upstream HTML 403 with User-Agent', async () => {
+  const { createOAuthSessionRecord, upsertUserAndProfile } = await import(
+    '../src/db/repository.ts'
+  );
+  const { db } = await import('../src/db/index.ts');
+  const { users, profiles, oauthSessions } = await import('../src/db/schema.ts');
+  const { eq } = await import('drizzle-orm');
+
+  const suffix = `p2_ann_${Date.now()}`;
+  const uid = `pesu_${suffix}`;
+  const tokNoScope = `tok_noscope_${suffix}`;
+  const tokWithScope = `tok_withscope_${suffix}`;
+
+  try {
+    await upsertUserAndProfile({
+      uid,
+      displayName: 'Vikram Rao',
+      email: `${suffix}@pesu.pes.edu`,
+      campus: 'EC Campus',
+      program: 'CSE',
+      verified: true,
+      pesuOidcSub: suffix,
+    });
+
+    // Session without announcements:read scope
+    await createOAuthSessionRecord({
+      sessionToken: tokNoScope,
+      uid,
+      pesuSub: suffix,
+      scopes: ['openid', 'name', 'profile', 'email'],
+      accessToken: 'acc_noscope',
+      refreshToken: null,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    // 1. Without opt-in -> structured JSON 403 OPT_IN_REQUIRED
+    const optRes = await fetch(`${baseUrl}/api/pesu/announcements?refresh=true`, {
+      headers: { Cookie: `quackathon_oauth_token=${tokNoScope}` },
+    });
+    assert.equal(optRes.status, 403);
+    assert.ok((optRes.headers.get('content-type') ?? '').includes('application/json'));
+    const optData = await optRes.json();
+    assert.equal(optData.errorCode, 'OPT_IN_REQUIRED');
+
+    // Enable opt-in via profile update
+    await db
+      .update(users)
+      .set({
+        privacyPreferencesJson: JSON.stringify({
+          profileVisible: true,
+          githubConsent: false,
+          aiEnrichmentConsent: false,
+          academyAnnouncementsOptIn: true,
+          onboardingCompleted: true,
+        }),
+      })
+      .where(eq(users.uid, uid));
+
+    // 2. Opt-in enabled but missing announcements:read scope -> structured JSON 403 MISSING_ANNOUNCEMENTS_SCOPE
+    const scopeRes = await fetch(`${baseUrl}/api/pesu/announcements?refresh=true`, {
+      headers: { Cookie: `quackathon_oauth_token=${tokNoScope}` },
+    });
+    assert.equal(scopeRes.status, 403);
+    const scopeData = await scopeRes.json();
+    assert.equal(scopeData.errorCode, 'MISSING_ANNOUNCEMENTS_SCOPE');
+    assert.equal(scopeData.requiresScopeGrant, true);
+
+    // Session WITH announcements:read scope
+    await createOAuthSessionRecord({
+      sessionToken: tokWithScope,
+      uid,
+      pesuSub: suffix,
+      scopes: ['openid', 'name', 'profile', 'email', 'announcements:read'],
+      accessToken: 'acc_withscope',
+      refreshToken: null,
+      expiresAt: new Date(Date.now() + 3600_000),
+    });
+
+    // 3. Upstream consent_required -> 403 DELEGATED_CREDENTIALS_REQUIRED
+    const annCaptured = { userAgent: '' };
+    setServerTestOverrides({
+      fetchFn: async (_input, init) => {
+        const hdrs = new Headers(init?.headers as HeadersInit | undefined);
+        annCaptured.userAgent = hdrs.get('user-agent') ?? '';
+        return new Response(
+          JSON.stringify({
+            error: 'consent_required',
+            error_description: 'Delegated credentials required',
+          }),
+          { status: 403, headers: { 'Content-Type': 'application/json' } }
+        );
+      },
+    });
+    const consentRes = await fetch(`${baseUrl}/api/pesu/announcements?refresh=true`, {
+      headers: { Cookie: `quackathon_oauth_token=${tokWithScope}` },
+    });
+    assert.equal(consentRes.status, 403);
+    const consentData = await consentRes.json();
+    assert.equal(consentData.errorCode, 'DELEGATED_CREDENTIALS_REQUIRED');
+    assert.ok(annCaptured.userAgent.includes('Quackathon'));
+
+    // 4. Upstream 401 invalid_token -> 401 TOKEN_EXPIRED_OR_REVOKED
+    setServerTestOverrides({
+      fetchFn: async () =>
+        new Response(JSON.stringify({ error: 'invalid_token' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    });
+    const expRes = await fetch(`${baseUrl}/api/pesu/announcements?refresh=true`, {
+      headers: { Cookie: `quackathon_oauth_token=${tokWithScope}` },
+    });
+    assert.equal(expRes.status, 401);
+    const expData = await expRes.json();
+    assert.equal(expData.errorCode, 'TOKEN_EXPIRED_OR_REVOKED');
+
+    // 5. Upstream Cloudflare/Gateway HTML 403 -> structured JSON 502 with upstreamSource=pesu_oauth2_gateway
+    setServerTestOverrides({
+      fetchFn: async () =>
+        new Response('<!doctype html><html><body>403 Forbidden</body></html>', {
+          status: 403,
+          headers: { 'Content-Type': 'text/html' },
+        }),
+    });
+    const html403Res = await fetch(`${baseUrl}/api/pesu/announcements?refresh=true`, {
+      headers: { Cookie: `quackathon_oauth_token=${tokWithScope}` },
+    });
+    assert.equal(html403Res.status, 502);
+    assert.ok((html403Res.headers.get('content-type') ?? '').includes('application/json'));
+    const html403Data = await html403Res.json();
+    assert.equal(html403Data.errorCode, 'PROVIDER_UNAVAILABLE');
+    assert.equal(html403Data.upstreamSource, 'pesu_oauth2_gateway');
+    assert.equal(html403Data.upstreamHttpStatus, 403);
+    assert.equal(html403Data.error, 'UPSTREAM_HTML_403');
+  } finally {
+    resetServerTestOverrides();
+    await db.delete(oauthSessions).where(eq(oauthSessions.uid, uid));
+    await db.delete(profiles).where(eq(profiles.uid, uid));
+    await db.delete(users).where(eq(users.uid, uid));
+  }
+});
+
+test('45. P3 Discover UI filter removal & P4 strict team hackathon catalog eligibility regression', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { isEligibleTeamHackathonCatalogEvent } = await import(
+    '../src/lib/eventsAndAnnouncements.ts'
+  );
+  const { isHackathonEligibleForMatching } = await import(
+    '../src/services/matchingEngine.ts'
+  );
+
+  // P4: Verified team hackathons/buildathons/ideathons/CTFs pass
+  assert.equal(
+    isEligibleTeamHackathonCatalogEvent({
+      name: 'PESU National AI Hackathon 2026',
+      description: '24-hour team hackathon for teams of 2 to 4 students.',
+      eventType: 'hackathon',
+      matchable: true,
+      minTeamSize: 2,
+      maxTeamSize: 4,
+      status: 'upcoming',
+    }),
+    true
+  );
+  assert.equal(
+    isEligibleTeamHackathonCatalogEvent({
+      name: 'CyberSec Capture The Flag CTF 2026',
+      description: 'Team CTF security competition.',
+      eventType: 'ctf',
+      matchable: true,
+      minTeamSize: 2,
+      maxTeamSize: 4,
+      status: 'upcoming',
+    }),
+    true
+  );
+
+  // P4: Talks, workshops, conferences, summits, cultural events, and solo-only competitions are excluded
+  for (const excluded of [
+    { name: 'Guest Lecture: Careers in Cloud', description: 'Industry tech talk and Q&A session.', eventType: 'tech_talk' },
+    { name: 'Hands-on Docker Workshop', description: '2-hour hands-on workshop for beginners.', eventType: 'workshop' },
+    { name: 'Annual Research Conference & Summit 2026', description: 'Keynote conference and panel summit.', eventType: 'conference' },
+    { name: 'Aatmatrisha Cultural Music Night', description: 'Annual cultural fest dance and concert.', eventType: 'other' },
+    { name: 'Solo Competitive Coding Sprint', description: 'Individual competition only.', eventType: 'team_competition', maxTeamSize: 1 },
+  ]) {
+    assert.equal(
+      isEligibleTeamHackathonCatalogEvent({
+        ...excluded,
+        status: 'upcoming',
+      }),
+      false,
+      `Event "${excluded.name}" must be excluded from hackathon discovery`
+    );
+  }
+
+  // P4: Matching eligibility rejects solo events (maxTeamSize = 1)
+  assert.equal(
+    isHackathonEligibleForMatching({
+      id: 'solo_event',
+      name: 'Solo Coding Contest',
+      organizer: 'PESU',
+      description: 'Solo only',
+      eventType: 'team_competition',
+      matchable: true,
+      themes: ['Algorithms'],
+      venue: { name: 'RR Campus', campus: 'RR Campus' },
+      format: 'onsite',
+      startAt: '2026-12-01T09:00:00+05:30',
+      datePrecision: 'exact_instant',
+      endAt: '2026-12-01T18:00:00+05:30',
+      timezone: 'Asia/Kolkata',
+      registrationDeadline: '2026-11-28T23:59:59+05:30',
+      minTeamSize: 1,
+      maxTeamSize: 1,
+      eligibilityNotes: null,
+      registrationUrl: 'https://events.pes.edu/solo',
+      sourceIds: ['events_pes_edu'],
+      fieldProvenance: {},
+      suggestedByCount: 0,
+      classification: {
+        category: 'team_competition',
+        ruleGatePassed: true,
+        mlConfidenceScore: 0.9,
+        reason: 'test',
+      },
+      lastVerifiedAt: '2026-11-01T00:00:00.000Z',
+      verificationStatus: 'verified',
+      status: 'published',
+      createdBy: 'test_admin',
+    }),
+    false
+  );
+
+  // P3: DiscoverView must not contain removed Filters & Preferences panel or filter controls
+  const discoverSource = fs.readFileSync(
+    path.resolve(process.cwd(), 'src/components/DiscoverView.tsx'),
+    'utf8'
+  );
+  for (const forbidden of [
+    'Filters & Preferences',
+    'Domain / Theme Filter',
+    'First-time hackers only',
+    'Your Event Availability',
+    'Filter by role',
+    'showFiltersDrawer',
+    'onlyFirstTimeHackers',
+  ]) {
+    assert.equal(
+      discoverSource.includes(forbidden),
+      false,
+      `DiscoverView.tsx must not contain removed filter UI token: ${forbidden}`
+    );
+  }
+});
+
+
 

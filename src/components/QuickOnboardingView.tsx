@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { ArrowRight, Check, Loader2, Plus, Sparkles, X } from 'lucide-react';
 import { Profile, User } from '../types/domain';
 import { normalizeHumanDisplayName } from '../lib/displayName';
+import { StudentAvatar } from './StudentAvatar';
 
 export const QUICK_INTEREST_OPTIONS = [
   'AI/ML',
@@ -161,8 +162,13 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
     <div className="min-h-screen bg-slate-50 py-10 px-4 sm:px-6">
       <div className="max-w-2xl mx-auto">
         <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 sm:p-8">
-          <div className="flex items-center justify-between gap-4 pb-6 border-b border-slate-100">
+          <div className="flex items-start justify-between gap-4 pb-6 border-b border-slate-100">
             <div>
+              <img
+                src="/assets/aistudio/long1_66ed7bae.png"
+                alt="Quackathon"
+                className="h-7 w-auto object-contain mb-3"
+              />
               <p className="text-xs font-semibold uppercase tracking-wider text-indigo-600">
                 Quick Setup
               </p>
@@ -175,6 +181,12 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
                 Pick a few interests, skills, and a preferred role so we can suggest compatible teammates right away.
               </p>
             </div>
+            <StudentAvatar
+              uid={currentUser.uid}
+              name={currentUser.displayName}
+              size="lg"
+              className="hidden sm:inline-flex"
+            />
           </div>
 
           <div className="mt-6 space-y-7">

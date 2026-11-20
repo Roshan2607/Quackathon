@@ -63,6 +63,7 @@ import { AdminReviewQueueView } from './components/AdminReviewQueueView';
 import { IntegrationTestingView } from './components/IntegrationTestingView';
 import { LoginPage } from './components/LoginPage';
 import { QuickOnboardingView } from './components/QuickOnboardingView';
+import { StudentAvatar } from './components/StudentAvatar';
 
 type NavTab =
   | 'discover'
@@ -422,8 +423,8 @@ export function App() {
 
       if (shouldAutoRedirect && (!restoredUser || wantAnnouncementsScope)) {
         const scopesToRequest = wantAnnouncementsScope
-          ? ['openid', 'profile', 'email', 'announcements:read']
-          : ['openid', 'profile', 'email'];
+          ? ['openid', 'name', 'profile', 'email', 'announcements:read']
+          : ['openid', 'name', 'profile', 'email'];
         const startRes = await startPesuOAuthSignIn(
           scopesToRequest,
           'redirect'
@@ -484,7 +485,16 @@ export function App() {
           }
         });
       } else {
-        setAuthError(queryMessage || 'PESU sign-in did not complete. Please try again.');
+        activeOAuthStateRef.current = null;
+        try {
+          sessionStorage.removeItem('quackathon_oauth_state');
+        } catch {
+          // ignore storage errors
+        }
+        setAuthError(
+          queryMessage ||
+            'PESU sign-in did not complete. Click Continue with PESU to start a fresh sign-in.'
+        );
       }
     }
 
@@ -652,7 +662,7 @@ export function App() {
   const handleSignInWithPesu = useCallback(
     async (
       mode: 'popup' | 'redirect' = isEmbeddedPreview ? 'popup' : 'redirect',
-      requestedScopes: string[] = ['openid', 'profile', 'email']
+      requestedScopes: string[] = ['openid', 'name', 'profile', 'email']
     ) => {
       setAuthError(null);
 
@@ -1628,9 +1638,11 @@ export function App() {
     return (
       <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col items-center justify-center px-4">
         <div className="flex flex-col items-center gap-3 text-center">
-          <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-lg">
-            Q
-          </div>
+          <img
+            src="/assets/aistudio/mini_7f313967.png"
+            alt="Quackathon"
+            className="w-12 h-12 rounded-xl object-contain"
+          />
           <div className="inline-flex items-center gap-2 text-sm font-medium text-slate-600">
             <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
             <span>Loading Quackathon...</span>
@@ -1707,14 +1719,19 @@ export function App() {
           <button
             type="button"
             onClick={() => navigateToTab('discover')}
-            className="flex items-center gap-2.5 text-left cursor-pointer shrink-0"
+            aria-label="Quackathon Home"
+            className="flex items-center gap-2 text-left cursor-pointer shrink-0"
           >
-            <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-sm shrink-0">
-              Q
-            </div>
-            <span className="font-bold text-base tracking-tight text-slate-900 whitespace-nowrap">
-              Quackathon
-            </span>
+            <img
+              src="/assets/aistudio/mini_7f313967.png"
+              alt="Quackathon"
+              className="h-8 w-8 rounded-lg object-contain sm:hidden"
+            />
+            <img
+              src="/assets/aistudio/long1_66ed7bae.png"
+              alt="Quackathon"
+              className="hidden sm:block h-8 w-auto object-contain"
+            />
           </button>
 
           {/* Zone 2: Concise 5-Item Desktop Navigation */}
@@ -1751,9 +1768,13 @@ export function App() {
               onClick={() => setShowAccountMenu((prev) => !prev)}
               aria-expanded={showAccountMenu}
               aria-haspopup="menu"
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-sm font-medium text-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer max-w-[200px]"
+              className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-sm font-medium text-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer max-w-[210px]"
             >
-              <UserCircle className="w-4 h-4 text-slate-500 shrink-0" />
+              <StudentAvatar
+                uid={currentUser.uid}
+                name={currentUser.displayName}
+                size="xs"
+              />
               <span className="truncate">{currentUser.displayName}</span>
               <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
             </button>
@@ -1977,6 +1998,7 @@ export function App() {
               onConnectPesuAcademy={(mode) =>
                 void handleSignInWithPesu(mode, [
                   'openid',
+                  'name',
                   'profile',
                   'email',
                   'announcements:read',

@@ -23,6 +23,7 @@ import {
   TeamProposal,
   User,
 } from '../types/domain';
+import { StudentAvatar } from './StudentAvatar';
 
 interface MatchesAndChatViewProps {
   currentUser: User;
@@ -407,17 +408,25 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                           className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 space-y-2.5 text-xs"
                         >
                           <div className="flex items-start justify-between gap-2">
-                            <div>
-                              <span className="text-[11px] text-blue-600 dark:text-blue-400 font-medium">
-                                {hack?.name ?? item.hackathonId}
-                              </span>
-                              <h4 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                                {item.user?.displayName ?? item.uid}
-                              </h4>
-                              <p className="text-slate-500">
-                                {item.profile?.preferredRoles.join(' · ') ||
-                                  'Student Builder'}
-                              </p>
+                            <div className="flex items-start gap-2.5 min-w-0">
+                              <StudentAvatar
+                                uid={item.uid}
+                                name={item.user?.displayName ?? item.uid}
+                                size="sm"
+                                className="mt-0.5"
+                              />
+                              <div className="min-w-0">
+                                <span className="text-[11px] text-blue-600 dark:text-blue-400 font-medium block truncate">
+                                  {hack?.name ?? item.hackathonId}
+                                </span>
+                                <h4 className="text-sm font-bold text-slate-900 dark:text-slate-100 truncate">
+                                  {item.user?.displayName ?? item.uid}
+                                </h4>
+                                <p className="text-slate-500 truncate">
+                                  {item.profile?.preferredRoles.join(' · ') ||
+                                    'Student Builder'}
+                                </p>
+                              </div>
                             </div>
 
                             {item.team ? (
@@ -501,16 +510,23 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                           key={item.key}
                           className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 flex items-center justify-between gap-3 text-xs"
                         >
-                          <div>
-                            <span className="text-[11px] text-slate-500">
-                              {hack?.name ?? item.hackathonId}
-                            </span>
-                            <div className="font-bold text-sm text-slate-900 dark:text-slate-100">
-                              {item.user?.displayName ?? item.uid}
-                            </div>
-                            <div className="text-slate-500">
-                              {item.profile?.preferredRoles.join(' · ') ||
-                                'Student'}
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <StudentAvatar
+                              uid={item.uid}
+                              name={item.user?.displayName ?? item.uid}
+                              size="sm"
+                            />
+                            <div className="min-w-0">
+                              <span className="text-[11px] text-slate-500 block truncate">
+                                {hack?.name ?? item.hackathonId}
+                              </span>
+                              <div className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate">
+                                {item.user?.displayName ?? item.uid}
+                              </div>
+                              <div className="text-slate-500 truncate">
+                                {item.profile?.preferredRoles.join(' · ') ||
+                                  'Student'}
+                              </div>
                             </div>
                           </div>
 
@@ -551,16 +567,24 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                           className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 space-y-2.5 text-xs"
                         >
                           <div className="flex items-start justify-between gap-2">
-                            <div>
-                              <span className="text-[11px] text-blue-600 dark:text-blue-400">
-                                {hack?.name ?? item.hackathonId}
-                              </span>
-                              <div className="font-bold text-sm text-slate-900 dark:text-slate-100">
-                                {item.user?.displayName ?? item.uid}
-                              </div>
-                              <div className="text-slate-500">
-                                {item.profile?.preferredRoles.join(' · ') ||
-                                  'Student'}
+                            <div className="flex items-start gap-2.5 min-w-0">
+                              <StudentAvatar
+                                uid={item.uid}
+                                name={item.user?.displayName ?? item.uid}
+                                size="sm"
+                                className="mt-0.5"
+                              />
+                              <div className="min-w-0">
+                                <span className="text-[11px] text-blue-600 dark:text-blue-400 block truncate">
+                                  {hack?.name ?? item.hackathonId}
+                                </span>
+                                <div className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate">
+                                  {item.user?.displayName ?? item.uid}
+                                </div>
+                                <div className="text-slate-500 truncate">
+                                  {item.profile?.preferredRoles.join(' · ') ||
+                                    'Student'}
+                                </div>
                               </div>
                             </div>
 
@@ -625,26 +649,37 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                   );
                   const isSelected = activeConv?.id === conv.id;
 
+                  const otherUid = conv.participantUids.find(
+                    (uid) => uid !== currentUser.uid
+                  );
+
                   return (
                     <button
                       key={conv.id}
                       type="button"
                       onClick={() => setSelectedConvId(conv.id)}
-                      className={`w-full text-left p-3.5 transition-colors flex flex-col gap-0.5 cursor-pointer ${
+                      className={`w-full text-left p-3.5 transition-colors flex items-center gap-2.5 cursor-pointer ${
                         isSelected
                           ? 'bg-slate-900 dark:bg-slate-800 text-white'
                           : 'hover:bg-slate-50 dark:hover:bg-slate-800/40'
                       }`}
                     >
-                      <div className="font-bold text-xs sm:text-sm truncate">
-                        {conv.title}
-                      </div>
-                      <div
-                        className={`text-xs truncate ${
-                          isSelected ? 'text-slate-300' : 'text-slate-500'
-                        }`}
-                      >
-                        {hack?.name ?? conv.hackathonId}
+                      <StudentAvatar
+                        uid={otherUid ?? conv.id}
+                        name={conv.title}
+                        size="sm"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="font-bold text-xs sm:text-sm truncate">
+                          {conv.title}
+                        </div>
+                        <div
+                          className={`text-xs truncate ${
+                            isSelected ? 'text-slate-300' : 'text-slate-500'
+                          }`}
+                        >
+                          {hack?.name ?? conv.hackathonId}
+                        </div>
                       </div>
                     </button>
                   );
@@ -657,13 +692,20 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
               {activeConv ? (
                 <>
                   <div className="p-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-                    <div className="min-w-0">
-                      <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm truncate">
-                        {activeConv.title}
-                      </h4>
-                      <p className="text-xs text-slate-500 truncate">
-                        {activeHackathon?.name ?? activeConv.hackathonId}
-                      </p>
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <StudentAvatar
+                        uid={partnerUid ?? activeConv.id}
+                        name={activeConv.title}
+                        size="sm"
+                      />
+                      <div className="min-w-0">
+                        <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm truncate">
+                          {activeConv.title}
+                        </h4>
+                        <p className="text-xs text-slate-500 truncate">
+                          {activeHackathon?.name ?? activeConv.hackathonId}
+                        </p>
+                      </div>
                     </div>
 
                     <button

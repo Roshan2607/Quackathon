@@ -20,20 +20,14 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         <div className="w-full max-w-md">
           <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-8 sm:p-10">
             {/* Quackathon Brand */}
-            <div className="flex items-center gap-3 mb-8">
-              <div
-                className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-lg tracking-tight shrink-0"
-                aria-hidden="true"
-              >
-                Q
-              </div>
-              <div>
-                <div className="text-lg font-bold tracking-tight text-slate-900 leading-none">
-                  Quackathon
-                </div>
-                <div className="text-xs text-slate-500 mt-1">
-                  PES University
-                </div>
+            <div className="mb-8 space-y-1.5">
+              <img
+                src="/assets/aistudio/long1_66ed7bae.png"
+                alt="Quackathon"
+                className="h-10 w-auto object-contain"
+              />
+              <div className="text-xs font-medium text-slate-500">
+                PES University Hackathon Teammate Matching
               </div>
             </div>
 

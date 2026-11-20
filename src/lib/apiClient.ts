@@ -20,6 +20,7 @@ export interface ApiClientResult<T> {
   ok: boolean;
   status: number;
   contentType: string;
+  isHtmlResponse?: boolean;
   data?: T;
   errorMessage?: string;
   diagnosticSnippet?: string;
@@ -135,7 +136,8 @@ export async function apiFetch<T = Record<string, unknown>>(
         ok: false,
         status,
         contentType: contentType || 'text/html',
-        errorMessage: `Server returned an unexpected HTML response (HTTP ${status}) for ${path} instead of JSON. Verify the backend Express server is running.`,
+        isHtmlResponse: true,
+        errorMessage: `Received an HTML HTTP ${status} response for ${path} instead of JSON from the API backend. Ensure the request targets the active Quackathon Express origin.`,
         diagnosticSnippet: snippet,
       };
     }

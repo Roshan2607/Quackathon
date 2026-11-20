@@ -399,6 +399,9 @@ function normalizeRoleBucket(role: string): string {
 }
 
 export function isHackathonEligibleForMatching(hackathon: Hackathon): boolean {
+  if (typeof hackathon.maxTeamSize === 'number' && hackathon.maxTeamSize < 2) {
+    return false;
+  }
   return Boolean(
     hackathon.matchable &&
       hackathon.findTeammatesEligible !== false &&

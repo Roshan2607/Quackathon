@@ -31,6 +31,7 @@ import {
   User,
 } from '../types/domain';
 import { computeTeamCombinedCapabilities } from '../services/matchingEngine';
+import { StudentAvatar } from './StudentAvatar';
 
 interface TeamsAndRequestsViewProps {
   currentUser: User;
@@ -722,19 +723,26 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> =
                             className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800 space-y-1 text-xs"
                           >
                             <div className="flex items-center justify-between gap-2">
-                              <span className="font-bold text-slate-900 dark:text-slate-100 truncate">
-                                {(u?.displayName ?? m.uid).replace(
-                                  ' (Synthetic Demo)',
-                                  ''
-                                )}
-                              </span>
+                              <div className="flex items-center gap-2 min-w-0">
+                                <StudentAvatar
+                                  uid={m.uid}
+                                  name={u?.displayName ?? m.uid}
+                                  size="xs"
+                                />
+                                <span className="font-bold text-slate-900 dark:text-slate-100 truncate">
+                                  {(u?.displayName ?? m.uid).replace(
+                                    ' (Synthetic Demo)',
+                                    ''
+                                  )}
+                                </span>
+                              </div>
                               {selectedTeam.leaderId === m.uid && (
-                                <span className="px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-950/60 text-[10px] font-semibold text-blue-700 dark:text-blue-300">
+                                <span className="px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-950/60 text-[10px] font-semibold text-blue-700 dark:text-blue-300 shrink-0">
                                   Lead
                                 </span>
                               )}
                             </div>
-                            <div className="text-slate-500">
+                            <div className="text-slate-500 pl-8">
                               {m.role}
                               {u?.campus ? ` · ${u.campus}` : ''}
                             </div>

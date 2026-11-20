@@ -327,18 +327,22 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
           });
         } else {
           setAcademyAnnouncements([]);
+          const isProxyHtml403 = Boolean(res.isHtmlResponse && res.status === 403);
           setAnnouncementsResponseState({
             loaded: true,
             ok: false,
-            errorCode: data?.errorCode || 'PROVIDER_UNAVAILABLE',
+            errorCode: isProxyHtml403
+              ? 'PROXY_FORBIDDEN_HTML'
+              : data?.errorCode || 'PROVIDER_UNAVAILABLE',
             requiresOptIn: data?.requiresOptIn,
             requiresScopeGrant: data?.requiresScopeGrant,
             requiresReauth: data?.requiresReauth,
             grantedScopes: data?.grantedScopes,
-            userMessage:
-              data?.userMessage ||
-              res.errorMessage ||
-              'Could not retrieve PESU Academy announcements.',
+            userMessage: isProxyHtml403
+              ? 'This request received an HTML HTTP 403 from the host proxy before reaching the Quackathon API. Open Quackathon directly on its active backend origin or retry shortly.'
+              : data?.userMessage ||
+                res.errorMessage ||
+                'Could not retrieve PESU Academy announcements.',
           });
         }
       } catch {
@@ -358,10 +362,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   );
 
   useEffect(() => {
-    if (
-      sourceFilter === 'MY_ACADEMY' ||
-      currentUser.privacyPreferences.academyAnnouncementsOptIn
-    ) {
+    if (sourceFilter === 'MY_ACADEMY') {
       void fetchAcademyAnnouncements(false);
     }
   }, [
@@ -944,6 +945,9 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
     if (regStatus.status === 'closed' || regStatus.status === 'ended') {
       return false;
     }
+    if (typeof h.maxTeamSize === 'number' && h.maxTeamSize < 2) {
+      return false;
+    }
     if (
       !h.matchable ||
       h.findTeammatesEligible === false ||
@@ -1132,7 +1136,7 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
 
             <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
               <strong>How PESU-Dev Delegated Access Works:</strong> Standard PESU Sign-In (
-              <code className="font-mono text-[11px]">openid profile email</code>) only verifies your student identity and never stores your PESU Academy password. Optional announcement access (
+              <code className="font-mono text-[11px]">openid name profile email</code>) only verifies your student identity and never stores your PESU Academy password. Optional announcement access (
               <code className="font-mono text-[11px]">announcements:read</code>) uses the PESU OAuth2 provider&apos;s{' '}
               <strong>delegated mode</strong>, which requires the provider (
               <code className="font-mono text-[11px]">pesu-oauth2.onrender.com</code>) to seal your PESU Academy credentials in an encrypted vault to fetch announcements on your behalf. Quackathon never receives your password, never exposes your Academy access token to the browser, and never publishes your private announcements automatically.
@@ -1196,16 +1200,20 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
                       {announcementsResponseState.errorCode ===
-                        'MISSING_ANNOUNCEMENTS_SCOPE' ||
-                      announcementsResponseState.errorCode ===
-                        'DELEGATED_CREDENTIALS_REQUIRED'
-                        ? 'Additional PESU OAuth2 Permission Required (announcements:read)'
+                        'MISSING_ANNOUNCEMENTS_SCOPE'
+                        ? 'Additional PESU OAuth2 Scope Required (announcements:read)'
                         : announcementsResponseState.errorCode ===
-                              'TOKEN_EXPIRED_OR_REVOKED' ||
-                            announcementsResponseState.errorCode ===
-                              'AUTH_REQUIRED'
-                          ? 'PESU OAuth2 Session Required or Expired'
-                          : 'PESU Academy Announcements Currently Unavailable'}
+                            'DELEGATED_CREDENTIALS_REQUIRED'
+                          ? 'Delegated PESU Academy Consent Required'
+                          : announcementsResponseState.errorCode ===
+                                'TOKEN_EXPIRED_OR_REVOKED' ||
+                              announcementsResponseState.errorCode ===
+                                'AUTH_REQUIRED'
+                            ? 'PESU OAuth2 Session Required or Expired'
+                            : announcementsResponseState.errorCode ===
+                                'PROXY_FORBIDDEN_HTML'
+                              ? 'Request Blocked by Host Proxy (HTTP 403)'
+                              : 'PESU Academy Announcements Currently Unavailable'}
                     </h3>
                     {announcementsResponseState.errorCode && (
                       <span className="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 font-mono text-[10px] font-semibold">
