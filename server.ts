@@ -3366,20 +3366,30 @@ function refreshPesuOAuthEnvFromDisk(): void {
 app.get('/api/pesu-oauth/url', async (req, res) => {
   const startTime = Date.now();
   const requestId = createRequestId('oauth_url');
-  const { session, initiationCookieStatus } = getOrCreateSessionWithDiagnostics(
-    req,
-    res
-  );
-  refreshPesuOAuthEnvFromDisk();
-  const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
-  const {
-    expectedRedirectUri,
-    allowedRedirectUris,
-    configuredCallbackOrigin,
-    canonicalAppOrigin,
-  } = getAllowedRedirectUris(req);
-  const initiatingOrigin = resolveInitiatingClientOrigin(req);
-  const sessionFp = createSafeFingerprint(session.sessionId);
+  let currentSessionFp: string | null = null;
+  let currentInitiatingOrigin: string | null = null;
+  let currentCallbackOrigin: string | null = null;
+  let currentCookieStatus: 'new' | 'existing' | null = null;
+
+  try {
+    const { session, initiationCookieStatus } = getOrCreateSessionWithDiagnostics(
+      req,
+      res
+    );
+    currentCookieStatus = initiationCookieStatus;
+    refreshPesuOAuthEnvFromDisk();
+    const clientId = process.env.PESU_OAUTH_CLIENT_ID?.trim();
+    const {
+      expectedRedirectUri,
+      allowedRedirectUris,
+      configuredCallbackOrigin,
+      canonicalAppOrigin,
+    } = getAllowedRedirectUris(req);
+    const initiatingOrigin = resolveInitiatingClientOrigin(req);
+    currentInitiatingOrigin = initiatingOrigin;
+    currentCallbackOrigin = configuredCallbackOrigin;
+    const sessionFp = createSafeFingerprint(session.sessionId);
+    currentSessionFp = sessionFp;
 
   const requestedRedirectUri =
     typeof req.query.redirect_uri === 'string' && req.query.redirect_uri.trim()
@@ -3758,6 +3768,51 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
   };
 
   res.json(resp);
+  } catch (err: any) {
+    console.error('Error generating PESU OAuth URL:', err);
+    const durationMs = Date.now() - startTime;
+    const diag: DeveloperDiagnosticTelemetry = {
+      serviceName: 'pesu_oauth2',
+      httpStatus: 503,
+      errorCategory: 'TRANSIENT_UNAVAILABLE',
+      retryAttempts: 0,
+      durationMs,
+      requestId,
+      timestamp: new Date().toISOString(),
+      sessionFingerprint: currentSessionFp,
+      initiatingOrigin: currentInitiatingOrigin,
+      configuredCallbackOrigin: currentCallbackOrigin,
+      initiationCookieStatus: currentCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
+      note: err?.message || 'Failed to generate OAuth authorization URL',
+    };
+    logOAuthStructuredEvent({
+      requestId,
+      event: 'oauth_url_rejected_network_or_internal_error',
+      stateFingerprint: null,
+      sessionFingerprint: currentSessionFp,
+      transactionStatus: 'failed',
+      callbackOutcome: 'internal_error',
+      httpStatus: 503,
+      durationMs,
+      initiatingOrigin: currentInitiatingOrigin,
+      configuredCallbackOrigin: currentCallbackOrigin,
+      initiationCookieStatus: currentCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
+      note: err?.message || 'Database or internal error',
+    });
+    res.status(503).json({
+      ok: false,
+      live: true,
+      userMessage:
+        'A temporary service or connection error occurred while preparing sign-in. Please try again.',
+      error: err?.message || 'Service temporarily unavailable',
+      errorCategory: 'TRANSIENT_UNAVAILABLE',
+      diagnostics: diag,
+    });
+  }
 });
 
 function decodeJwtPayload(jwtToken: string): Record<string, unknown> | null {
