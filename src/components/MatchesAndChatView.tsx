@@ -295,40 +295,40 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
     };
 
     return (
-      <div className="space-y-5">
-        {/* Top Bar: Shortlist vs. Direct & Team Messages Switcher */}
-        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <div className="space-y-6 max-w-5xl mx-auto">
+        {/* Top Context & Mode Switcher */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-[#f1ede6]">
           <div>
-            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-              <Heart className="w-4 h-4 text-blue-600" />
-              <span>Matches, Shortlist & Conversations</span>
-            </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Track everyone you expressed interest in, students interested in
-              you, and your mutual matches.
-            </p>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="w-2 h-2 rounded-full bg-[#fdaa40]" />
+              <span className="text-xs font-medium text-[#746e65]">
+                {activeHackathon?.name || 'PESU Chapter'}
+              </span>
+            </div>
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[#1c1b1b]">
+              Matches &amp; Shortlist
+            </h1>
           </div>
 
-          <div className="flex items-center gap-1.5 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg self-start sm:self-auto">
+          <div className="flex items-center p-1 bg-[#f6f3f2] rounded-xl border border-[#e9e5dd] self-start sm:self-auto">
             <button
               type="button"
               onClick={() => setActiveSection('shortlist')}
-              className={`px-3.5 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+              className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
                 activeSection === 'shortlist'
-                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400'
+                  ? 'bg-white text-[#1c1b1b] shadow-xs'
+                  : 'text-[#746e65] hover:text-[#1c1b1b]'
               }`}
             >
-              Shortlist ({mutualMatchesList.length} Mutual ·{' '}
-              {interestedList.length} Outgoing · {incomingList.length} Incoming)
+              Shortlist ({mutualMatchesList.length + interestedList.length + incomingList.length})
             </button>
             <button
               type="button"
               onClick={() => setActiveSection('chat')}
-              className={`px-3.5 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+              className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
                 activeSection === 'chat'
-                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400'
+                  ? 'bg-white text-[#1c1b1b] shadow-xs'
+                  : 'text-[#746e65] hover:text-[#1c1b1b]'
               }`}
             >
               Messages ({myConversations.length})
@@ -337,63 +337,74 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
         </div>
 
         {activeSection === 'shortlist' ? (
-          /* 3-Section Shortlist Workspace (Part D.1) */
-          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-            <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 dark:border-slate-800 pb-3">
+          /* 3-Section Shortlist Workspace (Stitch matches_and_shortlist) */
+          <div className="space-y-4">
+            <div className="flex items-center gap-2 border-b border-[#e9e5dd] pb-3 overflow-x-auto">
               <button
                 type="button"
                 data-testid="shortlist-tab-mutual"
                 onClick={() => setShortlistTab('mutual')}
-                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
+                className={`px-4 py-2 rounded-full text-xs transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
                   shortlistTab === 'mutual'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                    ? 'bg-[#ffd84d] text-[#292210] font-bold shadow-xs'
+                    : 'bg-white text-[#746e65] hover:bg-[#f6f3eb] border border-[#e9e5dd] font-medium'
                 }`}
               >
-                <UserCheck className="w-3.5 h-3.5" />
-                <span>Mutual Matches ({mutualMatchesList.length})</span>
-              </button>
-
-              <button
-                type="button"
-                data-testid="shortlist-tab-interested"
-                onClick={() => setShortlistTab('interested')}
-                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
-                  shortlistTab === 'interested'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
-                }`}
-              >
-                <Heart className="w-3.5 h-3.5" />
-                <span>Interested ({interestedList.length})</span>
+                <span>Mutual Matches</span>
+                <span className={`px-1.5 py-0.5 rounded-full text-[10px] ${
+                  shortlistTab === 'mutual' ? 'bg-[#ffeaa0]' : 'bg-[#f1eee8]'
+                }`}>
+                  {mutualMatchesList.length}
+                </span>
               </button>
 
               <button
                 type="button"
                 data-testid="shortlist-tab-incoming"
                 onClick={() => setShortlistTab('incoming')}
-                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
+                className={`px-4 py-2 rounded-full text-xs transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
                   shortlistTab === 'incoming'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                    ? 'bg-[#ffd84d] text-[#292210] font-bold shadow-xs'
+                    : 'bg-white text-[#746e65] hover:bg-[#f6f3eb] border border-[#e9e5dd] font-medium'
                 }`}
               >
-                <UserPlus className="w-3.5 h-3.5" />
-                <span>Interested in You ({incomingList.length})</span>
+                <span>Interested in You</span>
+                <span className={`px-1.5 py-0.5 rounded-full text-[10px] ${
+                  shortlistTab === 'incoming' ? 'bg-[#ffeaa0]' : 'bg-[#f1eee8]'
+                }`}>
+                  {incomingList.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="shortlist-tab-interested"
+                onClick={() => setShortlistTab('interested')}
+                className={`px-4 py-2 rounded-full text-xs transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+                  shortlistTab === 'interested'
+                    ? 'bg-[#ffd84d] text-[#292210] font-bold shadow-xs'
+                    : 'bg-white text-[#746e65] hover:bg-[#f6f3eb] border border-[#e9e5dd] font-medium'
+                }`}
+              >
+                <span>Interested</span>
+                <span className={`px-1.5 py-0.5 rounded-full text-[10px] ${
+                  shortlistTab === 'interested' ? 'bg-[#ffeaa0]' : 'bg-[#f1eee8]'
+                }`}>
+                  {interestedList.length}
+                </span>
               </button>
             </div>
 
             {shortlistTab === 'mutual' && (
               <div className="space-y-3">
                 {mutualMatchesList.length === 0 ? (
-                  <div className="py-8 text-center text-xs text-slate-500 space-y-1">
-                    <Users className="w-7 h-7 text-slate-400 mx-auto mb-1" />
-                    <p className="font-semibold text-slate-700 dark:text-slate-300">
+                  <div className="py-12 text-center text-xs text-[#746e65] bg-white rounded-2xl border border-[#e9e5dd] p-8 space-y-2">
+                    <Users className="w-8 h-8 text-[#746e65]/50 mx-auto" />
+                    <h3 className="font-bold text-sm text-[#1c1b1b]">
                       No mutual matches yet
-                    </p>
-                    <p>
-                      When you and another student both swipe right on each
-                      other, your mutual match and automatic team appear here.
+                    </h3>
+                    <p className="max-w-md mx-auto">
+                      When you and another student both swipe right on each other, your mutual match appears here.
                     </p>
                   </div>
                 ) : (
@@ -405,24 +416,24 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                       return (
                         <div
                           key={item.key}
-                          className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 space-y-2.5 text-xs"
+                          className="p-4 rounded-xl border border-[#e9e5dd] bg-white shadow-xs space-y-3 text-xs"
                         >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="flex items-start gap-2.5 min-w-0">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex items-start gap-3 min-w-0">
                               <StudentAvatar
                                 uid={item.uid}
                                 name={item.user?.displayName ?? item.uid}
-                                size="sm"
+                                size="md"
                                 className="mt-0.5"
                               />
                               <div className="min-w-0">
-                                <span className="text-[11px] text-blue-600 dark:text-blue-400 font-medium block truncate">
+                                <span className="text-[11px] text-[#725c00] font-semibold block truncate">
                                   {hack?.name ?? item.hackathonId}
                                 </span>
-                                <h4 className="text-sm font-bold text-slate-900 dark:text-slate-100 truncate">
+                                <h4 className="text-sm font-bold text-[#1c1b1b] truncate">
                                   {item.user?.displayName ?? item.uid}
                                 </h4>
-                                <p className="text-slate-500 truncate">
+                                <p className="text-[#746e65] truncate">
                                   {item.profile?.preferredRoles.join(' · ') ||
                                     'Student Builder'}
                                 </p>
@@ -430,131 +441,73 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                             </div>
 
                             {item.team ? (
-                              <span className="px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 font-semibold text-[11px]">
-                                Teammates ({item.team.memberCount}/
-                                {item.team.targetSize})
+                              <span className="px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 font-semibold text-[11px]">
+                                Teammates ({item.team.memberCount}/{item.team.targetSize})
                               </span>
                             ) : item.proposal ? (
-                              <span className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300 font-semibold text-[11px]">
-                                Proposal:{' '}
-                                {item.proposal.status.replace(/_/g, ' ')}
+                              <span className="px-2.5 py-1 rounded-full bg-[#fff3c9] border border-[#ffd84d]/60 text-[#725c00] font-semibold text-[11px]">
+                                Proposal: {item.proposal.status.replace(/_/g, ' ')}
                               </span>
                             ) : (
-                              <span className="px-2 py-0.5 rounded bg-blue-50 text-blue-700 font-semibold text-[11px]">
+                              <span className="px-2.5 py-1 rounded-full bg-[#fff3c9] border border-[#ffd84d]/60 text-[#725c00] font-semibold text-[11px]">
                                 Mutual Match
                               </span>
                             )}
                           </div>
 
-                          {item.profile &&
-                            item.profile.skillTags.length > 0 && (
-                              <div className="flex flex-wrap gap-1">
-                                {item.profile.skillTags
-                                  .slice(0, 5)
-                                  .map((sk) => (
-                                    <span
-                                      key={sk}
-                                      className="px-2 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[11px]"
-                                    >
-                                      {sk}
-                                    </span>
-                                  ))}
-                              </div>
-                            )}
-
-                          <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200/70 dark:border-slate-800">
-                            {item.conversationId && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setSelectedConvId(item.conversationId!);
-                                  setActiveSection('chat');
-                                }}
-                                className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 cursor-pointer"
-                              >
-                                Message
-                              </button>
-                            )}
-                            {onOpenMyTeam && (
-                              <button
-                                type="button"
-                                onClick={onOpenMyTeam}
-                                className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer"
-                              >
-                                View in My Team
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {shortlistTab === 'interested' && (
-              <div className="space-y-3">
-                {interestedList.length === 0 ? (
-                  <p className="py-8 text-center text-xs text-slate-500">
-                    You haven&apos;t swiped right on any students yet.
-                  </p>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {interestedList.map((item) => {
-                      const hack = hackathons.find(
-                        (h) => h.id === item.hackathonId
-                      );
-                      return (
-                        <div
-                          key={item.key}
-                          className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 flex items-center justify-between gap-3 text-xs"
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <StudentAvatar
-                              uid={item.uid}
-                              name={item.user?.displayName ?? item.uid}
-                              size="sm"
-                            />
-                            <div className="min-w-0">
-                              <span className="text-[11px] text-slate-500 block truncate">
-                                {hack?.name ?? item.hackathonId}
-                              </span>
-                              <div className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate">
-                                {item.user?.displayName ?? item.uid}
-                              </div>
-                              <div className="text-slate-500 truncate">
-                                {item.profile?.preferredRoles.join(' · ') ||
-                                  'Student'}
-                              </div>
+                          {item.profile && item.profile.skillTags.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 pt-1">
+                              {item.profile.skillTags.slice(0, 4).map((s) => (
+                                <span
+                                  key={s}
+                                  className="inline-flex bg-[#f6f3f2] text-[#4d4634] rounded-full px-2.5 py-0.5 text-[11px]"
+                                >
+                                  {s}
+                                </span>
+                              ))}
                             </div>
-                          </div>
+                          )}
 
-                          <span
-                            className={`px-2.5 py-1 rounded-lg font-semibold text-[11px] ${
-                              item.isMutual
-                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-300'
-                                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
-                            }`}
-                          >
-                            {item.isMutual
-                              ? 'Mutual Match'
-                              : 'Awaiting Response'}
-                          </span>
+                          <div className="pt-2 border-t border-[#f1ede6] flex items-center justify-between">
+                            <span className="text-[11px] text-[#746e65]">
+                              Matched {new Date(item.swipedAt).toLocaleDateString()}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveSection('chat');
+                                if (item.conversationId) {
+                                  setSelectedConvId(item.conversationId);
+                                }
+                              }}
+                              className="px-3.5 py-1.5 rounded-lg bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] text-xs font-bold transition-all shadow-xs cursor-pointer"
+                            >
+                              Chat
+                            </button>
+                          </div>
                         </div>
                       );
                     })}
                   </div>
                 )}
+                <p className="text-center text-xs text-[#746e65] pt-2">
+                  Matches are separate from team invitations and approvals.
+                </p>
               </div>
             )}
 
             {shortlistTab === 'incoming' && (
               <div className="space-y-3">
                 {incomingList.length === 0 ? (
-                  <p className="py-8 text-center text-xs text-slate-500">
-                    No incoming student interests yet.
-                  </p>
+                  <div className="py-12 text-center text-xs text-[#746e65] bg-white rounded-2xl border border-[#e9e5dd] p-8 space-y-2">
+                    <UserPlus className="w-8 h-8 text-[#746e65]/50 mx-auto" />
+                    <h3 className="font-bold text-sm text-[#1c1b1b]">
+                      No incoming student interests yet
+                    </h3>
+                    <p className="max-w-md mx-auto">
+                      Students who express interest in teaming with you will appear here.
+                    </p>
+                  </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     {incomingList.map((item) => {
@@ -564,33 +517,33 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                       return (
                         <div
                           key={item.key}
-                          className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 space-y-2.5 text-xs"
+                          className="p-4 rounded-xl border border-[#e9e5dd] bg-white shadow-xs space-y-3 text-xs"
                         >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="flex items-start gap-2.5 min-w-0">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex items-start gap-3 min-w-0">
                               <StudentAvatar
                                 uid={item.uid}
                                 name={item.user?.displayName ?? item.uid}
-                                size="sm"
+                                size="md"
                                 className="mt-0.5"
                               />
                               <div className="min-w-0">
-                                <span className="text-[11px] text-blue-600 dark:text-blue-400 block truncate">
+                                <span className="text-[11px] text-[#725c00] font-semibold block truncate">
                                   {hack?.name ?? item.hackathonId}
                                 </span>
-                                <div className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate">
+                                <h4 className="font-bold text-sm text-[#1c1b1b] truncate">
                                   {item.user?.displayName ?? item.uid}
-                                </div>
-                                <div className="text-slate-500 truncate">
+                                </h4>
+                                <p className="text-[#746e65] truncate">
                                   {item.profile?.preferredRoles.join(' · ') ||
                                     'Student'}
-                                </div>
+                                </p>
                               </div>
                             </div>
 
                             {item.isMutual ? (
-                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 font-semibold text-[11px]">
-                                <CheckCircle2 className="w-3.5 h-3.5" />
+                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-800 font-semibold text-[11px]">
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                                 Matched
                               </span>
                             ) : onSwipeBack ? (
@@ -600,16 +553,29 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                                 onClick={() =>
                                   void onSwipeBack(item.uid, item.hackathonId)
                                 }
-                                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer"
+                                className="px-3.5 py-1.5 rounded-lg bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs shadow-xs inline-flex items-center gap-1 cursor-pointer"
                               >
-                                <Heart className="w-3.5 h-3.5" />
-                                <span>Match Back</span>
+                                <Heart className="w-3.5 h-3.5 fill-current" />
+                                <span>Review Interest</span>
                               </button>
                             ) : null}
                           </div>
 
+                          {item.profile && item.profile.skillTags.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 pt-1">
+                              {item.profile.skillTags.slice(0, 4).map((s) => (
+                                <span
+                                  key={s}
+                                  className="inline-flex bg-[#f6f3f2] text-[#4d4634] rounded-full px-2.5 py-0.5 text-[11px]"
+                                >
+                                  {s}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+
                           {item.note && (
-                            <p className="text-slate-600 dark:text-slate-300 italic">
+                            <p className="text-[#4d4634] italic bg-[#f6f3f2] p-2.5 rounded-lg">
                               &ldquo;{item.note}&rdquo;
                             </p>
                           )}
@@ -618,37 +584,117 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                     })}
                   </div>
                 )}
+                <p className="text-center text-xs text-[#746e65] pt-2">
+                  Mutual interest doesn't automatically add someone to an existing team.
+                </p>
+              </div>
+            )}
+
+            {shortlistTab === 'interested' && (
+              <div className="space-y-3">
+                {interestedList.length === 0 ? (
+                  <div className="py-12 text-center text-xs text-[#746e65] bg-white rounded-2xl border border-[#e9e5dd] p-8 space-y-2">
+                    <Heart className="w-8 h-8 text-[#746e65]/50 mx-auto" />
+                    <h3 className="font-bold text-sm text-[#1c1b1b]">
+                      No outgoing interests yet
+                    </h3>
+                    <p className="max-w-md mx-auto">
+                      Profiles you swipe right on in Discover will be saved here.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {interestedList.map((item) => {
+                      const hack = hackathons.find(
+                        (h) => h.id === item.hackathonId
+                      );
+                      return (
+                        <div
+                          key={item.key}
+                          className="p-4 rounded-xl border border-[#e9e5dd] bg-white shadow-xs space-y-3 text-xs"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex items-start gap-3 min-w-0">
+                              <StudentAvatar
+                                uid={item.uid}
+                                name={item.user?.displayName ?? item.uid}
+                                size="md"
+                                className="mt-0.5"
+                              />
+                              <div className="min-w-0">
+                                <span className="text-[11px] text-[#725c00] font-semibold block truncate">
+                                  {hack?.name ?? item.hackathonId}
+                                </span>
+                                <h4 className="font-bold text-sm text-[#1c1b1b] truncate">
+                                  {item.user?.displayName ?? item.uid}
+                                </h4>
+                                <p className="text-[#746e65] truncate">
+                                  {item.profile?.preferredRoles.join(' · ') ||
+                                    'Student'}
+                                </p>
+                              </div>
+                            </div>
+
+                            <span className="px-2.5 py-1 rounded-full bg-[#f6f3f2] text-[#4d4634] font-semibold text-[11px]">
+                              {item.isMutual ? 'Mutual Match' : 'Awaiting Response'}
+                            </span>
+                          </div>
+
+                          {item.profile && item.profile.skillTags.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 pt-1">
+                              {item.profile.skillTags.slice(0, 4).map((s) => (
+                                <span
+                                  key={s}
+                                  className="inline-flex bg-[#f6f3f2] text-[#4d4634] rounded-full px-2.5 py-0.5 text-[11px]"
+                                >
+                                  {s}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <p className="text-center text-xs text-[#746e65] pt-2">
+                  People you've shown interest in.
+                </p>
               </div>
             )}
           </div>
-        ) : /* Direct & Team Conversations Workspace */
+        ) : /* Direct & Team Conversations Workspace (Stitch chat_direct_team_conversations) */
         myConversations.length === 0 ? (
-          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-10 text-center space-y-2">
-            <MessageSquare className="w-8 h-8 text-slate-400 mx-auto" />
-            <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
+          <div className="bg-white rounded-2xl border border-[#e9e5dd] p-12 text-center space-y-2 shadow-xs">
+            <MessageSquare className="w-8 h-8 text-[#746e65]/50 mx-auto" />
+            <h3 className="text-base font-bold text-[#1c1b1b]">
               No conversations yet
             </h3>
-            <p className="text-xs text-slate-500 max-w-sm mx-auto">
-              Mutual connections with students and formed team rosters appear
-              here automatically.
+            <p className="text-xs text-[#746e65] max-w-sm mx-auto">
+              Mutual connections with students and formed team rosters appear here automatically.
             </p>
           </div>
         ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {/* Left Sidebar: Conversations */}
-            <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden">
-              <div className="px-4 py-3 border-b border-slate-100 dark:border-slate-800">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                  Matches & Channels ({myConversations.length})
-                </h3>
+          <div className="grid grid-cols-12 gap-4 h-[calc(100vh-210px)] min-h-[560px]">
+            {/* Left Column: Conversations Pane */}
+            <aside className="col-span-12 lg:col-span-5 flex flex-col bg-white rounded-2xl border border-[#e9e5dd] shadow-xs overflow-hidden">
+              <div className="p-4 border-b border-[#f1ede6] flex items-center justify-between">
+                <div className="flex items-baseline gap-2">
+                  <h3 className="font-bold text-sm text-[#1c1b1b]">
+                    Messages
+                  </h3>
+                  <span className="text-xs text-[#746e65]">
+                    {myConversations.length} channels
+                  </span>
+                </div>
               </div>
-              <div className="divide-y divide-slate-100 dark:divide-slate-800">
+
+              <div className="flex-1 overflow-y-auto p-2 space-y-1">
                 {myConversations.map((conv) => {
                   const hack = hackathons.find(
                     (h) => h.id === conv.hackathonId
                   );
                   const isSelected = activeConv?.id === conv.id;
-
                   const otherUid = conv.participantUids.find(
                     (uid) => uid !== currentUser.uid
                   );
@@ -658,26 +704,28 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                       key={conv.id}
                       type="button"
                       onClick={() => setSelectedConvId(conv.id)}
-                      className={`w-full text-left p-3.5 transition-colors flex items-center gap-2.5 cursor-pointer ${
+                      className={`w-full text-left p-3 rounded-xl transition-all flex items-start gap-3 cursor-pointer ${
                         isSelected
-                          ? 'bg-slate-900 dark:bg-slate-800 text-white'
-                          : 'hover:bg-slate-50 dark:hover:bg-slate-800/40'
+                          ? 'bg-[#ffd84d]/20 border border-[#fdaa40]/40'
+                          : 'hover:bg-[#f6f3eb] border border-transparent'
                       }`}
                     >
                       <StudentAvatar
                         uid={otherUid ?? conv.id}
                         name={conv.title}
-                        size="sm"
+                        size="md"
+                        className="mt-0.5"
                       />
                       <div className="min-w-0 flex-1">
-                        <div className="font-bold text-xs sm:text-sm truncate">
-                          {conv.title}
+                        <div className="flex items-center justify-between mb-0.5">
+                          <span className="font-bold text-xs sm:text-sm text-[#1c1b1b] truncate">
+                            {conv.title}
+                          </span>
+                          <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full bg-[#ffd84d] text-[#1a1a1a]">
+                            Channel
+                          </span>
                         </div>
-                        <div
-                          className={`text-xs truncate ${
-                            isSelected ? 'text-slate-300' : 'text-slate-500'
-                          }`}
-                        >
+                        <div className="text-xs text-[#746e65] truncate">
                           {hack?.name ?? conv.hackathonId}
                         </div>
                       </div>
@@ -685,24 +733,24 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                   );
                 })}
               </div>
-            </div>
+            </aside>
 
-            {/* Right 2 Columns: Active Chat Thread */}
-            <div className="lg:col-span-2 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 flex flex-col h-[520px]">
+            {/* Right Column: Active Conversation Thread */}
+            <div className="col-span-12 lg:col-span-7 bg-white rounded-2xl border border-[#e9e5dd] shadow-xs flex flex-col overflow-hidden">
               {activeConv ? (
                 <>
-                  <div className="p-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="p-3.5 border-b border-[#f1ede6] flex items-center justify-between gap-3 bg-[#faf8f2]">
+                    <div className="flex items-center gap-3 min-w-0">
                       <StudentAvatar
                         uid={partnerUid ?? activeConv.id}
                         name={activeConv.title}
                         size="sm"
                       />
                       <div className="min-w-0">
-                        <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm truncate">
+                        <h4 className="font-bold text-[#1c1b1b] text-sm truncate">
                           {activeConv.title}
                         </h4>
-                        <p className="text-xs text-slate-500 truncate">
+                        <p className="text-xs text-[#746e65] truncate">
                           {activeHackathon?.name ?? activeConv.hackathonId}
                         </p>
                       </div>
@@ -718,106 +766,86 @@ export const MatchesAndChatView: React.FC<MatchesAndChatViewProps> = React.memo(
                           reason: 'Reported conversation from Matches',
                         })
                       }
-                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs text-slate-500 hover:text-red-600 cursor-pointer shrink-0"
-                      title="Report conversation"
+                      className="p-1.5 rounded-lg text-[#746e65] hover:text-rose-600 transition-colors"
+                      title="Report Conversation"
                     >
-                      <Flag className="w-3.5 h-3.5" />
-                      <span className="hidden sm:inline">Report</span>
+                      <Flag className="w-4 h-4" />
                     </button>
                   </div>
 
-                  <div className="flex-1 p-4 overflow-y-auto space-y-2.5 bg-slate-50/40 dark:bg-slate-950/30">
-                    {threadMessages.map((msg) => {
-                      const isMe = msg.senderUid === currentUser.uid;
-                      const sender = users.find(
-                        (u) => u.uid === msg.senderUid
-                      );
-                      return (
-                        <div
-                          key={msg.id}
-                          className={`flex flex-col ${
-                            isMe ? 'items-end' : 'items-start'
-                          }`}
-                        >
+                  {/* Messages Scrollable Stream */}
+                  <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-white">
+                    {threadMessages.length === 0 ? (
+                      <div className="py-12 text-center text-xs text-[#746e65] space-y-1">
+                        <p className="font-semibold text-[#1c1b1b]">
+                          Start the conversation
+                        </p>
+                        <p>Say hi and discuss what you'd like to build together!</p>
+                      </div>
+                    ) : (
+                      threadMessages.map((msg) => {
+                        const isMe = msg.senderUid === currentUser.uid;
+                        return (
                           <div
-                            className={`max-w-[80%] rounded-xl px-3.5 py-2 text-xs leading-relaxed ${
-                              isMe
-                                ? 'bg-blue-600 text-white'
-                                : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-200'
-                            }`}
+                            key={msg.id}
+                            className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}
                           >
-                            {msg.body}
+                            <div
+                              className={`max-w-[78%] rounded-2xl px-4 py-2 text-xs leading-relaxed ${
+                                isMe
+                                  ? 'bg-[#ffd84d] text-[#1a1a1a] rounded-br-xs font-medium shadow-xs'
+                                  : 'bg-[#f6f3f2] text-[#1c1b1b] rounded-bl-xs border border-[#e9e5dd]'
+                              }`}
+                            >
+                              <p>{msg.body}</p>
+                              <span
+                                className={`block text-[9px] mt-1 ${
+                                  isMe ? 'text-[#725c00]' : 'text-[#746e65]'
+                                }`}
+                              >
+                                {new Date(msg.createdAt).toLocaleTimeString([], {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}
+                              </span>
+                            </div>
                           </div>
-                          <span className="text-[10px] text-slate-400 mt-0.5 px-1">
-                            {sender?.displayName ?? msg.senderUid}
-                          </span>
-                        </div>
-                      );
-                    })}
+                        );
+                      })
+                    )}
                   </div>
 
-                  {showIcebreakers && (
-                    <div className="px-3.5 py-2 bg-slate-50 dark:bg-slate-800/50 border-t border-slate-200 dark:border-slate-800 flex flex-wrap gap-1.5">
-                      {(partnerProfile?.icebreakerPrompt
-                        ? [
-                            partnerProfile.icebreakerPrompt,
-                            ...DEFAULT_ICEBREAKERS.slice(0, 2),
-                          ]
-                        : DEFAULT_ICEBREAKERS
-                      ).map((prompt, idx) => (
-                        <button
-                          key={idx}
-                          type="button"
-                          onClick={() => {
-                            onSendMessage(activeConv.id, prompt);
-                            setShowIcebreakers(false);
-                          }}
-                          className="text-left text-[11px] bg-white dark:bg-slate-900 hover:bg-blue-50 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 px-2.5 py-1 rounded-lg transition-colors cursor-pointer"
-                        >
-                          &ldquo;{prompt}&rdquo;
-                        </button>
-                      ))}
-                    </div>
-                  )}
-
+                  {/* Message Input Bar */}
                   <form
                     onSubmit={handleSend}
-                    className="p-3 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center gap-2"
+                    className="p-3 border-t border-[#f1ede6] bg-[#faf8f2] flex items-center gap-2"
                   >
-                    <button
-                      type="button"
-                      onClick={() => setShowIcebreakers(!showIcebreakers)}
-                      title="Suggested Icebreakers"
-                      className={`px-2.5 py-2 rounded-lg border text-xs font-medium inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer ${
-                        showIcebreakers
-                          ? 'bg-blue-50 border-blue-300 text-blue-800'
-                          : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-50'
-                      }`}
-                    >
-                      <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-                      <span className="hidden sm:inline">Icebreakers</span>
-                    </button>
                     <input
                       type="text"
                       value={draftText}
                       onChange={(e) => setDraftText(e.target.value)}
-                      placeholder="Write a message..."
-                      className="flex-1 px-3.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs"
+                      placeholder="Type a message..."
+                      className="flex-1 bg-white border border-[#e9e5dd] rounded-xl px-4 py-2 text-xs text-[#1c1b1b] placeholder:text-[#746e65] focus:outline-none focus:ring-1 focus:ring-[#725c00]"
                     />
                     <button
                       type="submit"
-                      className="px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                      disabled={!draftText.trim()}
+                      className="px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs shadow-xs transition-colors cursor-pointer disabled:opacity-40"
                     >
                       <Send className="w-3.5 h-3.5" />
-                      Send
                     </button>
                   </form>
                 </>
-              ) : null}
+              ) : (
+                <div className="flex-1 flex items-center justify-center text-xs text-[#746e65]">
+                  Select a channel to view messages
+                </div>
+              )}
             </div>
           </div>
         )}
       </div>
     );
+
   }
 );

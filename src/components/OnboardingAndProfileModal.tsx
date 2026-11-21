@@ -423,18 +423,90 @@ export const OnboardingAndProfileModal: React.FC<
   const formContent = (
     <div className="space-y-6">
       {/* Core Essentials */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-6">
-        <div className="flex items-center gap-3.5">
-          <StudentAvatar
-            uid={currentUser.uid}
-            name={displayName || currentUser.displayName}
-            size="lg"
-          />
-          <div>
-            <h2 className="text-lg font-bold text-slate-900">Your Profile</h2>
-            <p className="text-sm text-slate-600 mt-0.5">
-              Keep your name, interests, skills, and role up to date for better teammate recommendations.
-            </p>
+      <div className="bg-white border border-[#e9e5dd] rounded-2xl p-6 space-y-6">
+        {/* Profile Header / Avatar Section (Stitch Style) */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-xl bg-[#f6f3f2] border border-[#e9e5dd]">
+          <div className="flex items-center gap-4">
+            <StudentAvatar
+              uid={currentUser.uid}
+              name={displayName || currentUser.displayName}
+              size="lg"
+            />
+            <div className="flex flex-col min-w-0">
+              <div className="flex items-baseline gap-2">
+                <span className="text-base font-bold text-[#1c1b1b] truncate">
+                  {(displayName || currentUser.displayName).replace(' (Synthetic Demo)', '')}
+                </span>
+                <span className="text-xs text-[#746e65]">· {currentUser.personaLabel || 'Student'}</span>
+              </div>
+              <span className="text-xs text-[#4d4634] font-medium mt-0.5">
+                {currentUser.pesuOidcSub}
+              </span>
+              <div className="flex items-center gap-1.5 mt-1 text-[#746e65] text-xs">
+                <span>PES University · {currentUser.campus === 'EC Campus' ? 'Electronic City' : 'Ring Road'} Campus</span>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 self-start sm:self-center shrink-0">
+            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#e7e2d7] text-xs font-medium text-[#1d1c15]">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-600" />
+              Profile Active
+            </span>
+          </div>
+        </div>
+
+        {/* Academic Credentials Section */}
+        <div className="flex flex-col gap-2.5 pt-2 border-t border-[#f1ede6]">
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-bold text-[#1c1b1b] uppercase tracking-wider">
+              Academic Credentials
+            </label>
+            <span className="text-xs text-[#746e65] flex items-center gap-1 font-medium">
+              <Shield className="w-3.5 h-3.5 text-[#725c00]" />
+              Verified via PESU Student Portal
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {/* Primary Campus */}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs text-[#746e65] font-medium">Primary Campus</span>
+              <div className="flex items-center p-1 rounded-xl bg-[#f6f3f2] border border-[#e9e5dd]">
+                <div
+                  className={`flex-1 py-1 px-2.5 rounded-lg text-xs font-semibold text-center ${
+                    currentUser.campus !== 'EC Campus'
+                      ? 'bg-white text-[#1c1b1b] shadow-2xs border border-[#e9e5dd]'
+                      : 'text-[#746e65]'
+                  }`}
+                >
+                  RR Campus
+                </div>
+                <div
+                  className={`flex-1 py-1 px-2.5 rounded-lg text-xs font-semibold text-center ${
+                    currentUser.campus === 'EC Campus'
+                      ? 'bg-white text-[#1c1b1b] shadow-2xs border border-[#e9e5dd]'
+                      : 'text-[#746e65]'
+                  }`}
+                >
+                  EC Campus
+                </div>
+              </div>
+            </div>
+
+            {/* Graduating Year */}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs text-[#746e65] font-medium">Graduating Term</span>
+              <div className="w-full bg-[#f6f3f2] border border-[#e9e5dd] text-[#1c1b1b] text-xs font-medium rounded-xl px-3 py-2 flex items-center justify-between">
+                <span>{currentUser.graduationYear ? `Class of ${currentUser.graduationYear}` : '3rd Year (Junior)'}</span>
+              </div>
+            </div>
+
+            {/* Program / Department */}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs text-[#746e65] font-medium">Program</span>
+              <div className="w-full bg-[#f6f3f2] border border-[#e9e5dd] text-[#1c1b1b] text-xs font-medium rounded-xl px-3 py-2 truncate">
+                <span>{currentUser.program || 'Computer Science & Engg'}</span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -442,11 +514,11 @@ export const OnboardingAndProfileModal: React.FC<
         <div>
           <label
             htmlFor="profile-display-name"
-            className="block text-sm font-semibold text-slate-900"
+            className="block text-sm font-semibold text-[#1c1b1b]"
           >
             Display Name
           </label>
-          <p className="text-xs text-slate-500 mt-0.5">
+          <p className="text-xs text-[#746e65] mt-0.5">
             Shown on your profile, teammate cards, and messages. Your PESU SRN is never shown publicly.
           </p>
           <input
@@ -459,7 +531,7 @@ export const OnboardingAndProfileModal: React.FC<
             }}
             placeholder="Your full name"
             maxLength={60}
-            className="mt-2 w-full max-w-md rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            className="mt-2 w-full max-w-md rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
           />
           {nameError && (
             <p className="mt-1.5 text-xs text-rose-600">{nameError}</p>
@@ -469,10 +541,10 @@ export const OnboardingAndProfileModal: React.FC<
         {/* A. Interests */}
         <div>
           <div className="flex items-baseline justify-between gap-2">
-            <label className="text-sm font-semibold text-slate-900">
+            <label className="text-sm font-semibold text-[#1c1b1b]">
               Interests
             </label>
-            <span className="text-xs text-slate-500">
+            <span className="text-xs text-[#746e65]">
               Up to 3 ({interestTags.length}/3)
             </span>
           </div>
@@ -488,10 +560,10 @@ export const OnboardingAndProfileModal: React.FC<
                   onClick={() => toggleInterest(interest)}
                   className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
                     active
-                      ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                      ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
                       : disabled
-                      ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed'
-                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      ? 'border-[#e9e5dd] bg-slate-50 text-[#a8a29e] cursor-not-allowed'
+                      : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
                   }`}
                 >
                   {active && <Check className="w-3.5 h-3.5" />}
@@ -504,7 +576,7 @@ export const OnboardingAndProfileModal: React.FC<
 
         {/* B. Skills */}
         <div>
-          <label className="block text-sm font-semibold text-slate-900">
+          <label className="block text-sm font-semibold text-[#1c1b1b]">
             Skills
           </label>
           <div className="mt-2.5 flex flex-wrap gap-2">
@@ -517,8 +589,8 @@ export const OnboardingAndProfileModal: React.FC<
                   onClick={() => toggleSkill(sk)}
                   className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
                     active
-                      ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
-                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
+                      : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
                   }`}
                 >
                   {active && <Check className="w-3.5 h-3.5" />}
@@ -529,14 +601,14 @@ export const OnboardingAndProfileModal: React.FC<
             {customSkillsOnly.map((sk) => (
               <span
                 key={sk}
-                className="inline-flex items-center gap-1 rounded-lg border border-indigo-600 bg-indigo-50 px-3 py-1.5 text-sm font-medium text-indigo-700"
+                className="inline-flex items-center gap-1 rounded-lg border border-indigo-600 bg-[#fff3c9] px-3 py-1.5 text-sm font-medium text-[#725c00]"
               >
                 <span>{sk}</span>
                 <button
                   type="button"
                   onClick={() => toggleSkill(sk)}
                   aria-label={`Remove ${sk}`}
-                  className="text-indigo-500 hover:text-indigo-800 cursor-pointer"
+                  className="text-[#725c00] hover:text-[#1a1a1a] cursor-pointer"
                 >
                   <X className="w-3.5 h-3.5" />
                 </button>
@@ -555,13 +627,13 @@ export const OnboardingAndProfileModal: React.FC<
                 }
               }}
               placeholder="Add custom skill (e.g. Go, Tailwind, ROS2)"
-              className="flex-1 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+              className="flex-1 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
             />
             <button
               type="button"
               onClick={handleAddCustomSkill}
               disabled={!customSkillInput.trim()}
-              className="inline-flex items-center gap-1 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+              className="inline-flex items-center gap-1 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm font-medium text-[#4d4634] hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
             >
               <Plus className="w-4 h-4" />
               <span>Add</span>
@@ -571,7 +643,7 @@ export const OnboardingAndProfileModal: React.FC<
 
         {/* C. Preferred Role */}
         <div>
-          <label className="block text-sm font-semibold text-slate-900">
+          <label className="block text-sm font-semibold text-[#1c1b1b]">
             Preferred Role
           </label>
           <div className="mt-2.5 flex flex-wrap gap-2">
@@ -584,8 +656,8 @@ export const OnboardingAndProfileModal: React.FC<
                   onClick={() => toggleRole(role)}
                   className={`rounded-lg border px-3.5 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
                     active
-                      ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
-                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
+                      : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
                   }`}
                 >
                   {role}
@@ -597,33 +669,33 @@ export const OnboardingAndProfileModal: React.FC<
       </div>
 
       {/* Collapsible More Details (Progressive Disclosure) */}
-      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+      <div className="bg-white border border-[#e9e5dd] rounded-2xl overflow-hidden">
         <button
           type="button"
           onClick={() => setShowMoreDetails((v) => !v)}
           className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-slate-50 transition-colors cursor-pointer"
         >
           <div>
-            <div className="text-sm font-semibold text-slate-900">
+            <div className="text-sm font-semibold text-[#1c1b1b]">
               More Details (Optional)
             </div>
-            <div className="text-xs text-slate-500 mt-0.5">
+            <div className="text-xs text-[#746e65] mt-0.5">
               Headline, bio, GitHub featured projects (up to 3), portfolio, collaboration style
             </div>
           </div>
           {showMoreDetails ? (
-            <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" />
+            <ChevronUp className="w-4 h-4 text-[#746e65] shrink-0" />
           ) : (
-            <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />
+            <ChevronDown className="w-4 h-4 text-[#746e65] shrink-0" />
           )}
         </button>
 
         {showMoreDetails && (
-          <div className="px-6 pb-6 pt-2 border-t border-slate-100 space-y-6">
+          <div className="px-6 pb-6 pt-2 border-t border-[#f1ede6] space-y-6">
             {/* Headline & Bio */}
             <div className="grid grid-cols-1 gap-4">
               <div>
-                <label className="block text-sm font-medium text-slate-800">
+                <label className="block text-sm font-medium text-[#1c1b1b]">
                   Headline
                 </label>
                 <input
@@ -632,40 +704,43 @@ export const OnboardingAndProfileModal: React.FC<
                   onChange={(e) => setHeadline(e.target.value)}
                   placeholder="e.g. Full-stack & ML student building fast prototypes"
                   maxLength={120}
-                  className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                  className="mt-1.5 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-800">
-                  About Me
-                </label>
-                <textarea
+                <div className="flex items-center justify-between">
+                  <label className="block text-sm font-medium text-[#1c1b1b]">
+                    About Me
+                  </label>
+                  <span className="text-xs text-[#746e65] font-mono">{about.length} / 160</span>
+                </div>
+                <textarea maxLength={160}
                   rows={3}
                   value={about}
                   onChange={(e) => setAbout(e.target.value)}
                   placeholder="What do you like building during hackathons?"
-                  className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                  className="mt-1.5 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
                 />
               </div>
-              <label className="inline-flex items-center gap-2.5 text-sm text-slate-700 cursor-pointer">
+              <label className="inline-flex items-center gap-2.5 text-sm text-[#4d4634] cursor-pointer">
                 <input
                   type="checkbox"
                   checked={isFirstTimeHacker}
                   onChange={(e) => setIsFirstTimeHacker(e.target.checked)}
-                  className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                  className="rounded border-[#e9e5dd] text-[#725c00] focus:ring-[#ffd84d]"
                 />
                 <span>This is my first hackathon</span>
               </label>
             </div>
 
             {/* GitHub & Featured Projects (max 3) */}
-            <div className="pt-4 border-t border-slate-100 space-y-4">
+            <div className="pt-4 border-t border-[#f1ede6] space-y-4">
               <div>
-                <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
-                  <Github className="w-4 h-4 text-slate-600" />
+                <h3 className="text-sm font-semibold text-[#1c1b1b] flex items-center gap-2">
+                  <Github className="w-4 h-4 text-[#746e65]" />
                   <span>Featured Projects (Up to {MAX_FEATURED_PROJECTS})</span>
                 </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
+                <p className="text-xs text-[#746e65] mt-0.5">
                   Optionally link GitHub to pick up to {MAX_FEATURED_PROJECTS} repositories, or add a project manually. Repositories are never added automatically.
                 </p>
               </div>
@@ -676,13 +751,13 @@ export const OnboardingAndProfileModal: React.FC<
                   value={githubUsername}
                   onChange={(e) => setGithubUsername(e.target.value)}
                   placeholder="GitHub username (optional)"
-                  className="flex-1 min-w-[200px] rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                  className="flex-1 min-w-[200px] rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
                 />
                 <button
                   type="button"
                   onClick={handleFetchGithubRepos}
                   disabled={githubLoading || !githubUsername.trim()}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm font-medium text-[#4d4634] hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
                 >
                   {githubLoading ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -698,9 +773,9 @@ export const OnboardingAndProfileModal: React.FC<
               )}
 
               {githubRepos.length > 0 && (
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 space-y-3">
+                <div className="rounded-xl border border-[#e9e5dd] bg-slate-50 p-3.5 space-y-3">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-medium text-slate-700">
+                    <span className="text-xs font-medium text-[#4d4634]">
                       Select up to {MAX_FEATURED_PROJECTS} to feature ({featuredProjects.length}/{MAX_FEATURED_PROJECTS} selected)
                     </span>
                     <input
@@ -708,10 +783,10 @@ export const OnboardingAndProfileModal: React.FC<
                       value={repoSearch}
                       onChange={(e) => setRepoSearch(e.target.value)}
                       placeholder="Filter repos..."
-                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-800"
+                      className="rounded-lg border border-[#e9e5dd] bg-white px-2.5 py-1 text-xs text-[#1c1b1b]"
                     />
                   </div>
-                  <div className="max-h-52 overflow-y-auto divide-y divide-slate-200/70 rounded-lg border border-slate-200 bg-white">
+                  <div className="max-h-52 overflow-y-auto divide-y divide-slate-200/70 rounded-lg border border-[#e9e5dd] bg-white">
                     {filteredGithubRepos.slice(0, 20).map((repo) => {
                       const selected = isRepoFeatured(repo);
                       return (
@@ -720,11 +795,11 @@ export const OnboardingAndProfileModal: React.FC<
                           className="flex items-center justify-between gap-3 px-3 py-2.5 text-sm"
                         >
                           <div className="min-w-0">
-                            <div className="font-medium text-slate-900 truncate">
+                            <div className="font-medium text-[#1c1b1b] truncate">
                               {repo.name}
                             </div>
                             {repo.description && (
-                              <div className="text-xs text-slate-500 truncate">
+                              <div className="text-xs text-[#746e65] truncate">
                                 {repo.description}
                               </div>
                             )}
@@ -734,8 +809,8 @@ export const OnboardingAndProfileModal: React.FC<
                             onClick={() => toggleRepoFeatured(repo)}
                             className={`shrink-0 rounded-lg border px-2.5 py-1 text-xs font-medium cursor-pointer ${
                               selected
-                                ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
-                                : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                                ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
+                                : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
                             }`}
                           >
                             {selected ? 'Selected' : 'Select'}
@@ -753,11 +828,11 @@ export const OnboardingAndProfileModal: React.FC<
                   {featuredProjects.map((proj) => (
                     <div
                       key={proj.id}
-                      className="flex items-start justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50/70 px-3.5 py-2.5"
+                      className="flex items-start justify-between gap-3 rounded-xl border border-[#e9e5dd] bg-slate-50/70 px-3.5 py-2.5"
                     >
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-semibold text-slate-900">
+                          <span className="text-sm font-semibold text-[#1c1b1b]">
                             {proj.title}
                           </span>
                           {proj.sourceUrl && (
@@ -765,7 +840,7 @@ export const OnboardingAndProfileModal: React.FC<
                               href={proj.sourceUrl}
                               target="_blank"
                               rel="noopener noreferrer"
-                              className="text-xs text-indigo-600 hover:underline inline-flex items-center gap-0.5"
+                              className="text-xs text-[#725c00] hover:underline inline-flex items-center gap-0.5"
                             >
                               <span>Link</span>
                               <ExternalLink className="w-3 h-3" />
@@ -773,7 +848,7 @@ export const OnboardingAndProfileModal: React.FC<
                           )}
                         </div>
                         {proj.description && (
-                          <p className="text-xs text-slate-600 mt-0.5">
+                          <p className="text-xs text-[#746e65] mt-0.5">
                             {proj.description}
                           </p>
                         )}
@@ -786,7 +861,7 @@ export const OnboardingAndProfileModal: React.FC<
                           )
                         }
                         aria-label={`Remove ${proj.title}`}
-                        className="text-slate-400 hover:text-rose-600 p-1 cursor-pointer"
+                        className="text-[#a8a29e] hover:text-rose-600 p-1 cursor-pointer"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
@@ -803,14 +878,14 @@ export const OnboardingAndProfileModal: React.FC<
                     value={newProjTitle}
                     onChange={(e) => setNewProjTitle(e.target.value)}
                     placeholder="Project title"
-                    className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                    className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
                   />
                   <input
                     type="text"
                     value={newProjDesc}
                     onChange={(e) => setNewProjDesc(e.target.value)}
                     placeholder="Short description"
-                    className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                    className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
                   />
                   <div className="flex gap-2">
                     <input
@@ -818,13 +893,13 @@ export const OnboardingAndProfileModal: React.FC<
                       value={newProjUrl}
                       onChange={(e) => setNewProjUrl(e.target.value)}
                       placeholder="URL (optional)"
-                      className="flex-1 min-w-0 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                      className="flex-1 min-w-0 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
                     />
                     <button
                       type="button"
                       onClick={handleAddManualProject}
                       disabled={!newProjTitle.trim()}
-                      className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer shrink-0"
+                      className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm font-medium text-[#4d4634] hover:bg-slate-50 disabled:opacity-50 cursor-pointer shrink-0"
                     >
                       Add
                     </button>
@@ -834,13 +909,13 @@ export const OnboardingAndProfileModal: React.FC<
 
               {/* Optional AI Enrichment (strictly opt-in with explicit review) */}
               {executionMode === 'live' && githubUsername.trim() && (
-                <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 space-y-3">
-                  <label className="flex items-start gap-2.5 text-xs text-slate-700 cursor-pointer">
+                <div className="rounded-xl border border-[#e9e5dd] bg-slate-50/70 p-4 space-y-3">
+                  <label className="flex items-start gap-2.5 text-xs text-[#4d4634] cursor-pointer">
                     <input
                       type="checkbox"
                       checked={aiConsentChecked}
                       onChange={(e) => setAiConsentChecked(e.target.checked)}
-                      className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                      className="mt-0.5 rounded border-[#e9e5dd] text-[#725c00] focus:ring-[#ffd84d]"
                     />
                     <span>
                       Allow optional AI summary drafting from my public GitHub profile (you will review before anything is applied).
@@ -850,7 +925,7 @@ export const OnboardingAndProfileModal: React.FC<
                     type="button"
                     disabled={!aiConsentChecked || aiLoading}
                     onClick={handleRunOptionalAiEnrichment}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[#e9e5dd] bg-[#faf8f2] px-3 py-1.5 text-xs font-medium text-[#4d4634] hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
                   >
                     {aiLoading ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -864,23 +939,23 @@ export const OnboardingAndProfileModal: React.FC<
                   )}
                   {aiDraft && (
                     <div className="rounded-lg border border-indigo-200 bg-white p-3 space-y-2 text-xs">
-                      <div className="font-semibold text-slate-900">
+                      <div className="font-semibold text-[#1c1b1b]">
                         Review Draft Suggestions
                       </div>
                       {aiDraft.suggestedBio && (
-                        <p className="text-slate-700">
+                        <p className="text-[#4d4634]">
                           <span className="font-medium">About:</span>{' '}
                           {aiDraft.suggestedBio}
                         </p>
                       )}
                       {aiDraft.suggestedIcebreaker && (
-                        <p className="text-slate-700">
+                        <p className="text-[#4d4634]">
                           <span className="font-medium">Icebreaker:</span>{' '}
                           {aiDraft.suggestedIcebreaker}
                         </p>
                       )}
                       {aiDraft.draft.suggestedSkills.length > 0 && (
-                        <p className="text-slate-700">
+                        <p className="text-[#4d4634]">
                           <span className="font-medium">Skills:</span>{' '}
                           {aiDraft.draft.suggestedSkills
                             .map((s) => s.name)
@@ -891,14 +966,14 @@ export const OnboardingAndProfileModal: React.FC<
                         <button
                           type="button"
                           onClick={handleApplyAiDraft}
-                          className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 cursor-pointer"
+                          className="rounded-lg bg-[#ffd84d] text-[#1a1a1a] px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 cursor-pointer"
                         >
                           Apply Draft
                         </button>
                         <button
                           type="button"
                           onClick={() => setAiDraft(null)}
-                          className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 cursor-pointer"
+                          className="rounded-lg border border-[#e9e5dd] px-3 py-1.5 text-xs font-medium text-[#746e65] hover:bg-slate-50 cursor-pointer"
                         >
                           Discard
                         </button>
@@ -910,8 +985,8 @@ export const OnboardingAndProfileModal: React.FC<
             </div>
 
             {/* Portfolio Links */}
-            <div className="pt-4 border-t border-slate-100 space-y-3">
-              <label className="block text-sm font-semibold text-slate-900">
+            <div className="pt-4 border-t border-[#f1ede6] space-y-3">
+              <label className="block text-sm font-semibold text-[#1c1b1b]">
                 Portfolio Links
               </label>
               {portfolioLinks.length > 0 && (
@@ -919,13 +994,13 @@ export const OnboardingAndProfileModal: React.FC<
                   {portfolioLinks.map((link, idx) => (
                     <div
                       key={`${link.url}-${idx}`}
-                      className="flex items-center justify-between gap-2 text-sm text-slate-700"
+                      className="flex items-center justify-between gap-2 text-sm text-[#4d4634]"
                     >
                       <a
                         href={link.url}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-indigo-600 hover:underline truncate"
+                        className="text-[#725c00] hover:underline truncate"
                       >
                         {link.label}
                       </a>
@@ -936,7 +1011,7 @@ export const OnboardingAndProfileModal: React.FC<
                             prev.filter((_, i) => i !== idx)
                           )
                         }
-                        className="text-slate-400 hover:text-rose-600 cursor-pointer"
+                        className="text-[#a8a29e] hover:text-rose-600 cursor-pointer"
                       >
                         <X className="w-4 h-4" />
                       </button>
@@ -950,20 +1025,20 @@ export const OnboardingAndProfileModal: React.FC<
                   value={newLinkLabel}
                   onChange={(e) => setNewLinkLabel(e.target.value)}
                   placeholder="Label (e.g. Portfolio, LinkedIn)"
-                  className="w-44 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                  className="w-44 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
                 />
                 <input
                   type="url"
                   value={newLinkUrl}
                   onChange={(e) => setNewLinkUrl(e.target.value)}
                   placeholder="https://..."
-                  className="flex-1 min-w-[180px] rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+                  className="flex-1 min-w-[180px] rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
                 />
                 <button
                   type="button"
                   onClick={handleAddPortfolioLink}
                   disabled={!newLinkUrl.trim()}
-                  className="rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                  className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm font-medium text-[#4d4634] hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
                 >
                   Add
                 </button>
@@ -971,9 +1046,9 @@ export const OnboardingAndProfileModal: React.FC<
             </div>
 
             {/* Collaboration Style & Icebreaker */}
-            <div className="pt-4 border-t border-slate-100 space-y-4">
+            <div className="pt-4 border-t border-[#f1ede6] space-y-4">
               <div>
-                <label className="block text-sm font-semibold text-slate-900">
+                <label className="block text-sm font-semibold text-[#1c1b1b]">
                   Collaboration Style
                 </label>
                 <div className="mt-2 flex flex-wrap gap-2">
@@ -986,8 +1061,8 @@ export const OnboardingAndProfileModal: React.FC<
                         onClick={() => toggleWorkStyle(style)}
                         className={`rounded-lg border px-3 py-1.5 text-xs font-medium cursor-pointer ${
                           active
-                            ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
-                            : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                            ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
+                            : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
                         }`}
                       >
                         {style}
@@ -998,7 +1073,7 @@ export const OnboardingAndProfileModal: React.FC<
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-800">
+                <label className="block text-sm font-medium text-[#1c1b1b]">
                   Roles to Explore
                 </label>
                 <div className="mt-2 flex flex-wrap gap-2">
@@ -1017,8 +1092,8 @@ export const OnboardingAndProfileModal: React.FC<
                         }
                         className={`rounded-lg border px-3 py-1.5 text-xs font-medium cursor-pointer ${
                           active
-                            ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
-                            : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                            ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
+                            : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
                         }`}
                       >
                         {role}
@@ -1029,7 +1104,7 @@ export const OnboardingAndProfileModal: React.FC<
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-800">
+                <label className="block text-sm font-medium text-[#1c1b1b]">
                   Conversation Starter / Icebreaker
                 </label>
                 <input
@@ -1037,7 +1112,7 @@ export const OnboardingAndProfileModal: React.FC<
                   value={icebreakerPrompt}
                   onChange={(e) => setIcebreakerPrompt(e.target.value)}
                   placeholder="e.g. Ask me about shipping real-time web apps in 24 hours"
-                  className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900"
+                  className="mt-1.5 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b]"
                 />
               </div>
             </div>
@@ -1046,61 +1121,61 @@ export const OnboardingAndProfileModal: React.FC<
       </div>
 
       {/* Collapsible Privacy & Account Settings */}
-      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+      <div className="bg-white border border-[#e9e5dd] rounded-2xl overflow-hidden">
         <button
           type="button"
           onClick={() => setShowPrivacySettings((v) => !v)}
           className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-slate-50 transition-colors cursor-pointer"
         >
           <div className="flex items-center gap-2.5">
-            <Shield className="w-4 h-4 text-slate-500 shrink-0" />
+            <Shield className="w-4 h-4 text-[#746e65] shrink-0" />
             <div>
-              <div className="text-sm font-semibold text-slate-900">
+              <div className="text-sm font-semibold text-[#1c1b1b]">
                 Privacy &amp; Account Settings
               </div>
-              <div className="text-xs text-slate-500 mt-0.5">
+              <div className="text-xs text-[#746e65] mt-0.5">
                 Control profile visibility and optional PESU Academy features
               </div>
             </div>
           </div>
           {showPrivacySettings ? (
-            <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" />
+            <ChevronUp className="w-4 h-4 text-[#746e65] shrink-0" />
           ) : (
-            <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />
+            <ChevronDown className="w-4 h-4 text-[#746e65] shrink-0" />
           )}
         </button>
 
         {showPrivacySettings && (
-          <div className="px-6 pb-6 pt-3 border-t border-slate-100 space-y-4">
-            <label className="flex items-start gap-3 text-sm text-slate-700 cursor-pointer">
+          <div className="px-6 pb-6 pt-3 border-t border-[#f1ede6] space-y-4">
+            <label className="flex items-start gap-3 text-sm text-[#4d4634] cursor-pointer">
               <input
                 type="checkbox"
                 checked={profileVisible}
                 onChange={(e) => setProfileVisible(e.target.checked)}
-                className="mt-1 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                className="mt-1 rounded border-[#e9e5dd] text-[#725c00] focus:ring-[#ffd84d]"
               />
               <span>
-                <span className="font-medium text-slate-900 block">
+                <span className="font-medium text-[#1c1b1b] block">
                   Visible in teammate discovery
                 </span>
-                <span className="text-xs text-slate-500">
+                <span className="text-xs text-[#746e65]">
                   Allow other verified PESU students to see your profile card in Discover. Your SRN is always hidden.
                 </span>
               </span>
             </label>
 
-            <label className="flex items-start gap-3 text-sm text-slate-700 cursor-pointer">
+            <label className="flex items-start gap-3 text-sm text-[#4d4634] cursor-pointer">
               <input
                 type="checkbox"
                 checked={academyOptIn}
                 onChange={(e) => setAcademyOptIn(e.target.checked)}
-                className="mt-1 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                className="mt-1 rounded border-[#e9e5dd] text-[#725c00] focus:ring-[#ffd84d]"
               />
               <span>
-                <span className="font-medium text-slate-900 block">
+                <span className="font-medium text-[#1c1b1b] block">
                   Enable private PESU Academy announcements section
                 </span>
-                <span className="text-xs text-slate-500">
+                <span className="text-xs text-[#746e65]">
                   Opt in to view your own private PESU Academy notices inside the Hackathons tab.
                 </span>
               </span>
@@ -1115,7 +1190,7 @@ export const OnboardingAndProfileModal: React.FC<
           <button
             type="button"
             onClick={onClose}
-            className="rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+            className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-4 py-2.5 text-sm font-medium text-[#4d4634] hover:bg-slate-50 cursor-pointer"
           >
             Cancel
           </button>
@@ -1123,9 +1198,9 @@ export const OnboardingAndProfileModal: React.FC<
         <button
           type="button"
           onClick={handleSave}
-          className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-6 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 focus-visible:ring-offset-2 transition-colors cursor-pointer"
+          className="inline-flex items-center gap-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] text-xs font-bold px-6 py-2 rounded-xl shadow-xs active:scale-95 transition-all cursor-pointer"
         >
-          <span>Save Profile</span>
+          <Check className="w-4 h-4 text-[#725c00]" /><span>Save Changes</span>
         </button>
       </div>
     </div>
@@ -1136,7 +1211,7 @@ export const OnboardingAndProfileModal: React.FC<
   }
 
   return (
-    <Modal onClose={onClose} title="Edit Profile">
+    <Modal onClose={onClose} title="Edit Student Profile">
       {formContent}
     </Modal>
   );

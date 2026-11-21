@@ -2677,9 +2677,12 @@ function getAllowedRedirectUris(req: express.Request): {
   if (configuredRedirect && isValidHttpUrl(configuredRedirect)) {
     const normalizedRedirect = configuredRedirect.replace(/\/+$/, '');
     const callbackOrigin = new URL(normalizedRedirect).origin;
+    const localHostVariant = normalizedRedirect.includes('127.0.0.1')
+      ? normalizedRedirect.replace('127.0.0.1', 'localhost')
+      : normalizedRedirect.replace('localhost', '127.0.0.1');
     return {
       expectedRedirectUri: normalizedRedirect,
-      allowedRedirectUris: [normalizedRedirect],
+      allowedRedirectUris: [normalizedRedirect, localHostVariant],
       configuredCallbackOrigin: callbackOrigin,
       canonicalAppOrigin: callbackOrigin,
     };
@@ -3563,7 +3566,11 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
       : expectedRedirectUri;
 
   // 1. Prevent OAuth initiation from one preview origin and callback completion on another
-  if (initiatingOrigin.toLowerCase() !== configuredCallbackOrigin.toLowerCase()) {
+  const isLoopbackMatch =
+    (initiatingOrigin === 'http://localhost:3100' && configuredCallbackOrigin === 'http://127.0.0.1:3100') ||
+    (initiatingOrigin === 'http://127.0.0.1:3100' && configuredCallbackOrigin === 'http://localhost:3100');
+
+  if (initiatingOrigin.toLowerCase() !== configuredCallbackOrigin.toLowerCase() && !isLoopbackMatch) {
     session.stages.redirectUriValidation = 'mismatch';
     const durationMs = Date.now() - startTime;
     const diag: DeveloperDiagnosticTelemetry = {
@@ -3825,19 +3832,55 @@ app.get('/api/pesu-oauth/url', async (req, res) => {
 
   // Persist OAuth authorization transaction in PostgreSQL so it survives server
   // restarts and callbacks handled by any backend instance.
-  await createOAuthTransactionRecord({
-    state,
-    sessionId: session.sessionId,
-    codeVerifier,
-    redirectUri: requestedRedirectUri,
-    clientOrigin: initiatingOrigin,
-    scopes: requestedScopes,
-    issuer: disc.issuer,
-    authorizationEndpoint: disc.authorizationEndpoint,
-    tokenEndpoint: disc.tokenEndpoint,
-    userinfoEndpoint: disc.userinfoEndpoint,
-    expiresAt: new Date(Date.now() + OAUTH_TX_TTL_MS),
-  });
+  try {
+    await createOAuthTransactionRecord({
+      state,
+      sessionId: session.sessionId,
+      codeVerifier,
+      redirectUri: requestedRedirectUri,
+      clientOrigin: initiatingOrigin,
+      scopes: requestedScopes,
+      issuer: disc.issuer,
+      authorizationEndpoint: disc.authorizationEndpoint,
+      tokenEndpoint: disc.tokenEndpoint,
+      userinfoEndpoint: disc.userinfoEndpoint,
+      expiresAt: new Date(Date.now() + OAUTH_TX_TTL_MS),
+    });
+  } catch (dbError) {
+    console.error('Database error in createOAuthTransactionRecord:', dbError);
+    const diag: DeveloperDiagnosticTelemetry = {
+      serviceName: 'pesu_oauth2',
+      httpStatus: 503,
+      errorCategory: 'TRANSIENT_UNAVAILABLE',
+      retryAttempts: 0,
+      durationMs: Date.now() - startTime,
+      requestId,
+      timestamp: new Date().toISOString(),
+      sessionFingerprint: sessionFp,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      sessionBindingMatched: null,
+      handledByDifferentInstance: false,
+    };
+    session.lastDiagnostics = diag;
+    res.status(503).json({
+      ok: false,
+      live: true,
+      redirectUri: requestedRedirectUri,
+      canonicalAppOrigin,
+      initiatingOrigin,
+      configuredCallbackOrigin,
+      initiationCookieStatus,
+      scopes: requestedScopes,
+      scope: requestedScopes.join(' '),
+      stages: session.stages,
+      userMessage: `PostgreSQL error: ${dbError instanceof Error ? dbError.message : 'Database connection failed'}. Please check PostgreSQL on port ${process.env.SQL_PORT || 5432}.`,
+      errorCategory: 'TRANSIENT_UNAVAILABLE',
+      diagnostics: diag,
+    });
+    return;
+  }
 
   session.stages.authorizationRedirect = 'awaiting_user_consent';
   session.stages.tokenExchange = 'idle';

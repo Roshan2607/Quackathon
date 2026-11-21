@@ -1,28 +1,62 @@
 @import "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
 
+@theme {
+  --color-quack-yellow: #ffd84d;
+  --color-quack-yellow-soft: #fff3c9;
+  --color-quack-canvas: #faf8f2;
+  --color-quack-paper: #ffffff;
+  --color-quack-ink: #24211c;
+  --color-quack-muted: #746e65;
+  --color-quack-line: #e9e5dd;
+  --color-quack-hover: #f6f3eb;
+
+  --color-primary-container: #ffd84d;
+  --color-inverse-primary: #e9c339;
+  --color-primary: #725c00;
+  --color-on-primary-container: #735e00;
+  --color-surface: #fcf9f8;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #f6f3f2;
+  --color-surface-container: #f0eded;
+  --color-surface-container-high: #eae7e7;
+  --color-surface-container-highest: #e5e2e1;
+  --color-on-surface: #1c1b1b;
+  --color-on-surface-variant: #4d4634;
+  --color-tertiary: #615e56;
+  --color-tertiary-fixed: #e7e2d7;
+  --color-tertiary-fixed-dim: #cbc6bc;
+  --color-outline-variant: #d0c6ae;
+  --color-outline: #7e7662;
+  --color-secondary: #875200;
+  --color-secondary-container: #fdaa40;
+  --color-secondary-fixed: #ffddba;
+  --color-secondary-fixed-dim: #ffb866;
+}
+
+:root {
+  --quack-sidebar-width: 256px;
+  --quack-canvas: #faf8f2;
+  --quack-paper: #ffffff;
+  --quack-ink: #24211c;
+  --quack-muted: #746e65;
+  --quack-line: #e9e5dd;
+  --quack-yellow: #ffd84d;
+  --quack-yellow-soft: #fff3c9;
+  --quack-hover: #f6f3eb;
+  --quack-content-max: 1080px;
+  --quack-gutter: 36px;
+  color-scheme: light;
+}
+
 @layer base {
-  :root {
-    --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-    --font-sans: 'Public Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
-  }
-
-  body {
-    font-family: var(--font-sans);
-    background-color: #F8FAFC;
-    color: #0F172A;
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background-color: var(--quack-canvas);
+    color: var(--quack-ink);
+    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     -webkit-font-smoothing: antialiased;
-  }
-
-  h1, h2, h3, h4, .font-display {
-    font-family: var(--font-display);
-    text-wrap: balance;
-  }
-
-  .font-mono, .tabular-nums {
-    font-family: var(--font-mono);
-    font-variant-numeric: tabular-nums;
   }
 
   button:focus-visible,
@@ -30,9 +64,278 @@
   input:focus-visible,
   select:focus-visible,
   textarea:focus-visible {
-    outline: 2px solid #2563EB;
+    outline: 2px solid #bd920c;
     outline-offset: 2px;
   }
+}
+
+/* Canary Minimal Unified Sidebar Styles */
+.quack-sidebar {
+  position: fixed !important;
+  inset: 0 auto 0 0 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  justify-content: space-between !important;
+  width: var(--quack-sidebar-width) !important;
+  height: 100dvh !important;
+  padding: 24px 20px 18px !important;
+  z-index: 45 !important;
+  overflow-y: auto !important;
+  background: var(--quack-paper) !important;
+  border-right: 1px solid var(--quack-line) !important;
+  box-shadow: none !important;
+  color: var(--quack-ink) !important;
+}
+
+.quack-sidebar-top {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  min-width: 0;
+}
+
+.quack-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 36px;
+  padding: 0 6px;
+  color: var(--quack-ink) !important;
+  text-decoration: none !important;
+  white-space: nowrap;
+}
+
+.quack-brand-mark {
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--quack-yellow);
+}
+
+.quack-brand-mark svg {
+  width: 26px;
+  height: 26px;
+}
+
+.quack-brand-name {
+  font-size: 19px;
+  font-weight: 750;
+  letter-spacing: -0.65px;
+  line-height: 1.2;
+  text-transform: lowercase;
+}
+
+.quack-side-nav {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 4px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  min-width: 0;
+}
+
+.quack-nav-link {
+  display: flex !important;
+  align-items: center !important;
+  gap: 12px !important;
+  min-height: 42px !important;
+  padding: 10px 12px !important;
+  background: transparent !important;
+  border-radius: 10px !important;
+  color: #514b43 !important;
+  font-size: 13.5px !important;
+  font-weight: 550 !important;
+  line-height: 1.35 !important;
+  text-decoration: none !important;
+  white-space: nowrap;
+  transition: background 0.16s ease, color 0.16s ease, transform 0.16s ease !important;
+  cursor: pointer;
+  border: 0;
+  width: 100%;
+  text-align: left;
+}
+
+.quack-nav-link svg {
+  width: 19px;
+  min-width: 19px;
+  height: 19px;
+  color: #625b4b;
+}
+
+.quack-nav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.quack-nav-link:hover {
+  background: var(--quack-hover) !important;
+  color: var(--quack-ink) !important;
+  transform: translateX(2px);
+}
+
+.quack-nav-link.is-active,
+.quack-nav-link[aria-current="page"] {
+  background: var(--quack-yellow-soft) !important;
+  color: #272015 !important;
+  font-weight: 700 !important;
+}
+
+.quack-nav-link.is-active svg,
+.quack-nav-link[aria-current="page"] svg {
+  color: #725500 !important;
+}
+
+.quack-sidebar-footer {
+  margin-top: auto;
+  border-top: 1px solid #f1ede6;
+  padding-top: 14px;
+  position: relative;
+}
+
+.quack-account-chip {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 54px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: #f7f5f1;
+  color: var(--quack-ink);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.quack-account-chip:hover {
+  background: #f1eee7;
+  border-color: var(--quack-line);
+}
+
+.quack-account-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--quack-yellow);
+  flex: 0 0 36px;
+  overflow: hidden;
+}
+
+.quack-user-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.quack-user-name {
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+.quack-user-sub {
+  font-size: 11px;
+  color: var(--quack-muted);
+  white-space: nowrap;
+}
+
+.quack-account-chevron {
+  font-size: 14px;
+  color: #7e776d;
+  margin-right: 2px;
+}
+
+.quack-page-shell {
+  display: block !important;
+  width: calc(100% - var(--quack-sidebar-width)) !important;
+  margin-left: var(--quack-sidebar-width) !important;
+  min-width: 0 !important;
+  min-height: 100dvh !important;
+  background: var(--quack-canvas) !important;
+}
+
+main.quack-page-main {
+  display: block;
+  width: 100% !important;
+  max-width: var(--quack-content-max) !important;
+  min-width: 0 !important;
+  margin: 0 auto !important;
+  padding: 28px var(--quack-gutter) 40px !important;
+  background: transparent !important;
+  min-height: 100dvh;
+}
+
+@media (max-width: 900px) {
+  :root {
+    --quack-sidebar-width: 216px;
+    --quack-gutter: 24px;
+  }
+}
+
+@media (max-width: 650px) {
+  :root {
+    --quack-sidebar-width: 72px;
+    --quack-gutter: 16px;
+  }
+  .quack-sidebar {
+    padding: 16px 8px 14px !important;
+    align-items: center !important;
+  }
+  .quack-brand-name,
+  .quack-nav-label,
+  .quack-user-info,
+  .quack-account-chevron {
+    display: none !important;
+  }
+  .quack-nav-link {
+    width: 52px;
+    min-height: 44px !important;
+    justify-content: center !important;
+    padding: 10px !important;
+    border-radius: 10px !important;
+  }
+  .quack-account-chip {
+    width: 52px;
+    min-height: 48px;
+    padding: 6px;
+    justify-content: center;
+  }
+}
+
+/* Animations */
+@keyframes quack-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes quack-card-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.quack-card-in {
+  animation: quack-card-in 0.27s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.modal-enter {
+  animation: modalPop 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes modalPop {
+  0% { opacity: 0; transform: scale(0.97) translateY(8px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -45,4 +348,3 @@
     scroll-behavior: auto !important;
   }
 }
-

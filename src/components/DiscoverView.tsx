@@ -330,77 +330,48 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
           </div>
         )}
 
-        {/* Top Student Discovery Header: Hackathon Selector, Student Count & Team Status */}
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-3.5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-3 min-w-0">
-              <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-900 rounded-lg text-xs font-semibold text-blue-700 dark:text-blue-300 shrink-0">
-                <Users className="w-3.5 h-3.5" />
-                <span>Students</span>
-                <span className="font-mono tabular-nums px-1.5 py-0.5 rounded bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200">
-                  {studentCards.length}
-                </span>
-              </div>
-
+        {/* Discovery Sub-header: Single clean contextual strip */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl sm:text-3xl font-bold text-[#1c1b1b] tracking-tight">
+              Discover
+            </h1>
+            <div className="relative inline-flex items-center">
               <select
                 aria-label="Select Hackathon"
                 value={selectedHackathon.id}
                 onChange={(e) => onSelectHackathon(e.target.value)}
-                className="text-xs sm:text-sm font-semibold bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-1.5 text-slate-900 dark:text-slate-100 cursor-pointer max-w-full sm:max-w-md truncate"
+                className="text-xs font-semibold bg-white border border-[#e9e5dd] rounded-full px-3.5 py-1.5 text-[#1c1b1b] shadow-xs cursor-pointer appearance-none pr-7 focus:outline-none focus:ring-1 focus:ring-[#725c00]"
               >
                 {hackathons.map((h) => {
                   const eligible = isHackathonEligibleForMatching(h);
                   return (
                     <option key={h.id} value={h.id}>
-                      {h.name} {!eligible ? '(Closed / Ended)' : ''}
+                      {h.name} {!eligible ? '(Closed)' : ''}
                     </option>
                   );
                 })}
               </select>
+              <ChevronDown className="w-3.5 h-3.5 text-[#746e65] absolute right-2.5 pointer-events-none" />
             </div>
-
-            {viewerActiveTeam && onOpenMyTeam && (
-              <button
-                type="button"
-                onClick={onOpenMyTeam}
-                className="text-xs text-blue-600 dark:text-blue-400 font-semibold hover:underline cursor-pointer shrink-0"
-              >
-                Open My Team →
-              </button>
-            )}
           </div>
 
-          {/* Active Team & Matching Context Strip */}
-          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600 dark:text-slate-400 pt-2 border-t border-slate-100 dark:border-slate-800">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-mono tabular-nums text-slate-500">
-                Team size: {minTeamCapacity}–{maxTeamCapacity} students
-              </span>
-              <span aria-hidden="true">·</span>
-              {viewerActiveTeam && teamCapabilities ? (
-                <span className="inline-flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400 font-medium">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>
-                    Swiping for your team:{' '}
-                    <strong>{viewerActiveTeam.name.split(' (')[0]}</strong> (
-                    {teamCapabilities.memberCount}/{maxTeamCapacity} members)
-                  </span>
-                  {teamCapabilities.missingRoles.length > 0 && (
-                    <span className="text-slate-500 dark:text-slate-400 font-normal">
-                      · Complements needed:{' '}
-                      {teamCapabilities.missingRoles.slice(0, 3).join(', ')}
-                    </span>
-                  )}
-                </span>
-              ) : (
-                <span>
-                  Mutual right-swipes automatically form a 2-student team for{' '}
-                  <strong className="text-slate-800 dark:text-slate-200">
-                    {selectedHackathon.name}
-                  </strong>
-                </span>
-              )}
-            </div>
+          <div className="flex items-center gap-2 text-xs text-[#746e65]">
+            <span className="font-medium">
+              Candidate {studentCards.length > 0 ? 1 : 0} of {studentCards.length}
+            </span>
+            {viewerActiveTeam && onOpenMyTeam && (
+              <>
+                <span>·</span>
+                <button
+                  type="button"
+                  onClick={onOpenMyTeam}
+                  className="font-semibold text-[#725c00] hover:underline cursor-pointer"
+                >
+                  My Team ({teamCapabilities?.memberCount ?? viewerActiveTeam.memberCount}/{maxTeamCapacity}) →
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -454,422 +425,351 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
             )}
           </div>
         ) : !topCard ? (
-          /* Empty State */
-          <div className="p-10 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-center space-y-3">
-            <Users className="w-8 h-8 text-slate-400 mx-auto" />
-            <p className="text-base font-bold text-slate-900 dark:text-slate-100">
-              No more unseen students right now
+          /* All-Caught-Up State with Peaceful Vector Duck Mascot */
+          <div className="w-full bg-white rounded-3xl p-8 sm:p-12 flex flex-col items-center text-center relative overflow-hidden shadow-sm border border-[#e9e5dd]">
+            <div className="relative w-32 h-32 mb-4 flex items-center justify-center">
+              <div className="absolute inset-0 rounded-full bg-[#f6f3f2] scale-95 transition-transform duration-500 hover:scale-100" />
+              {/* Minimalist Vector Resting Duck */}
+              <svg className="relative w-28 h-28 drop-shadow-sm" fill="none" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+                <path d="M18 92C32 90 44 94 60 92C76 90 88 94 102 92" stroke="#E5E2E1" strokeLinecap="round" strokeWidth="3" />
+                <path d="M30 100C42 98 52 101 64 100C76 99 86 101 94 100" stroke="#F0EDED" strokeLinecap="round" strokeWidth="2.5" />
+                <path d="M28 72C28 58 40 48 54 48H78C90 48 98 58 98 70C98 82 86 88 70 88H44C34 88 28 81 28 72Z" fill="#FFD84D" />
+                <path d="M28 66C22 62 20 54 22 48C25 54 30 58 35 60L28 66Z" fill="#E9C339" />
+                <path d="M46 64C46 59 52 55 62 55C72 55 78 61 78 67C78 74 70 77 60 77C50 77 46 71 46 64Z" fill="#F5CE40" />
+                <circle cx="78" cy="40" fill="#FFD84D" r="18" />
+                <path d="M92 40C98 40 105 42 107 45C104 48 97 49 92 48V40Z" fill="#FDAA40" />
+                <path d="M81 38C81 35 85 35 85 38" stroke="#1C1B1B" strokeLinecap="round" strokeWidth="2" />
+                <circle cx="76" cy="46" fill="#F7A53B" fillOpacity="0.5" r="3" />
+                <path className="opacity-80" d="M96 24H101L96 30H101" stroke="#875200" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
+              </svg>
+            </div>
+
+            <h2 className="text-xl sm:text-2xl font-bold text-[#1c1b1b] tracking-tight">
+              You're all caught up for {selectedHackathon.name}
+            </h2>
+            <p className="text-xs sm:text-sm text-[#746e65] mt-2 max-w-md leading-relaxed">
+              You have reviewed all student profiles currently available for this hackathon. New student builders join daily.
             </p>
-            <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
-              You have reviewed all available student profiles for{' '}
-              {selectedHackathon.name}.
-            </p>
-            <div className="flex items-center justify-center gap-3 pt-1">
+
+            <div className="mt-6 flex flex-col sm:flex-row items-center gap-3 w-full sm:w-auto">
               <button
                 type="button"
                 onClick={() => onResetPassedCards(selectedHackathon.id)}
-                className="px-3.5 py-2 text-xs font-semibold bg-blue-600 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs shadow-xs inline-flex items-center justify-center gap-2 transition-transform cursor-pointer"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
                 <span>Review Passed Students Again</span>
               </button>
+              {onOpenMyTeam && (
+                <button
+                  type="button"
+                  onClick={onOpenMyTeam}
+                  className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-[#f6f3f2] hover:bg-[#eae7e7] text-[#1c1b1b] font-semibold text-xs border border-[#e9e5dd] transition-colors cursor-pointer"
+                >
+                  View My Team
+                </button>
+              )}
             </div>
           </div>
         ) : (
-          /* Unified Student-Only Swipe Card Stack */
-          <div className="max-w-xl mx-auto space-y-3">
-            <div className="relative">
-              {/* Background Next-Card Stack Preview */}
-              {nextCard && (
-                <div
-                  aria-hidden="true"
-                  className="pointer-events-none select-none absolute inset-x-3 -bottom-2.5 h-6 bg-slate-100 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-800 rounded-2xl -z-10"
-                />
+          /* Primary Centered Focus Card Container */
+          <div className="w-full max-w-2xl mx-auto relative">
+            {/* Atmospheric Underlay Card Edge Stack */}
+            <div className="absolute inset-0 translate-y-2 scale-[0.985] bg-[#f6f3f2] border border-[#e9e5dd] rounded-2xl -z-10 shadow-xs opacity-70 pointer-events-none" />
+
+            {/* Active Profile Card */}
+            <article
+              data-testid="student-swipe-card"
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerUpOrCancel}
+              onPointerCancel={handlePointerUpOrCancel}
+              className={`w-full bg-white rounded-2xl shadow-sm border border-[#e9e5dd] p-6 sm:p-8 flex flex-col gap-5 select-none transition-transform duration-150 ${
+                isDragging ? 'cursor-grabbing' : 'cursor-grab'
+              } ${
+                dragOffsetX > 45
+                  ? 'ring-2 ring-emerald-500/50'
+                  : dragOffsetX < -45
+                    ? 'ring-2 ring-rose-500/50'
+                    : ''
+              } ${
+                exitDirection === 'right'
+                  ? 'translate-x-10 opacity-75'
+                  : exitDirection === 'left'
+                    ? '-translate-x-10 opacity-75'
+                    : ''
+              }`}
+            >
+              {/* Drag Swipe Visual Stamp */}
+              {Math.abs(dragOffsetX) > 35 && (
+                <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider">
+                  <span
+                    className={`px-2.5 py-1 rounded-full border ${
+                      dragOffsetX < -35
+                        ? 'border-rose-500 text-rose-600 bg-rose-50 opacity-100'
+                        : 'opacity-0'
+                    }`}
+                  >
+                    Pass
+                  </span>
+                  <span
+                    className={`px-2.5 py-1 rounded-full border ${
+                      dragOffsetX > 35
+                        ? 'border-emerald-500 text-emerald-600 bg-emerald-50 opacity-100'
+                        : 'opacity-0'
+                    }`}
+                  >
+                    Interested
+                  </span>
+                </div>
               )}
 
-              {/* Active Student Swipe Card */}
-              <div
-                data-testid="student-swipe-card"
-                onPointerDown={handlePointerDown}
-                onPointerMove={handlePointerMove}
-                onPointerUp={handlePointerUpOrCancel}
-                onPointerCancel={handlePointerUpOrCancel}
-                className={`bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs space-y-5 select-none transition-transform duration-150 ${
-                  isDragging ? 'cursor-grabbing' : 'cursor-grab'
-                } ${
-                  dragOffsetX > 45
-                    ? 'ring-2 ring-emerald-500/50'
-                    : dragOffsetX < -45
-                      ? 'ring-2 ring-rose-500/50'
-                      : ''
-                } ${
-                  exitDirection === 'right'
-                    ? 'translate-x-10 opacity-75'
-                    : exitDirection === 'left'
-                      ? '-translate-x-10 opacity-75'
-                      : ''
-                }`}
-              >
-                {/* Drag Swipe Visual Stamp */}
-                {Math.abs(dragOffsetX) > 35 && (
-                  <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider">
-                    <span
-                      className={`px-2.5 py-1 rounded border ${
-                        dragOffsetX < -35
-                          ? 'border-rose-500 text-rose-600 bg-rose-50 dark:bg-rose-950/50 opacity-100'
-                          : 'opacity-0'
-                      }`}
-                    >
-                      Pass
-                    </span>
-                    <span
-                      className={`px-2.5 py-1 rounded border ${
-                        dragOffsetX > 35
-                          ? 'border-emerald-500 text-emerald-600 bg-emerald-50 dark:bg-emerald-950/50 opacity-100'
-                          : 'opacity-0'
-                      }`}
-                    >
-                      Interested
-                    </span>
-                  </div>
-                )}
-
-                {/* Student Header: Avatar, Name, Verified Campus & Branch/Year */}
-                <div className="flex items-start justify-between gap-4">
-                  <div className="flex items-start gap-3 min-w-0">
+              {/* Student Profile Header Block */}
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex items-center gap-4 min-w-0">
+                  <div className="w-16 h-16 rounded-full bg-[#ffd84d]/30 border border-[#ffd84d]/50 flex items-center justify-center shrink-0 shadow-xs overflow-hidden">
                     <StudentAvatar
                       uid={topCard.id}
                       name={topCard.title}
-                      size="md"
-                      className="mt-0.5"
+                      size="lg"
                     />
-                    <div className="space-y-1 min-w-0">
-                      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                        <span className="font-medium text-slate-700 dark:text-slate-300">
-                          {topCard.subtitle}
-                        </span>
-                        {topCardUser?.verified && (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 font-medium">
-                            <CheckCircle2 className="w-3 h-3" />
-                            PESU Verified
-                          </span>
-                        )}
-                        {topCard.isFirstTimeHacker && (
-                          <span className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 font-medium">
-                            First-time hacker
-                          </span>
-                        )}
-                      </div>
-                      <h2 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100 truncate">
+                  </div>
+                  <div className="flex flex-col min-w-0">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <h2 className="text-xl sm:text-2xl font-bold text-[#1c1b1b] tracking-tight truncate">
                         {topCard.title}
                       </h2>
-                      {topCardProfile?.bio && (
-                        <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed pt-0.5">
-                          {topCardProfile.bio}
-                        </p>
-                      )}
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-[#f6f3f2] text-[#615e56] text-[11px] font-medium border border-[#e9e5dd]">
+                        <span className="w-1.5 h-1.5 rounded-full bg-[#875200]" />
+                        Looking for team
+                      </span>
                     </div>
-                  </div>
-
-                  <div className="text-right shrink-0">
-                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 font-mono tabular-nums text-xs font-bold">
-                      <Sparkles className="w-3.5 h-3.5" />
-                      {topCard.featureBreakdown.totalScore ??
-                        Math.round((topCard.overallScore ?? 0) * 100)}
-                      % Match
-                    </span>
+                    <p className="text-xs text-[#746e65]">
+                      {topCard.subtitle} · PES University ({topCardUser?.campus || 'RR Campus'})
+                    </p>
                   </div>
                 </div>
 
-                {/* Grounded Recommendation Reasons (1–2 specific reasons) */}
-                {topCard.compatibilityReasons.length > 0 && (
-                  <div
-                    data-testid="recommendation-reasons"
-                    className="p-3.5 bg-blue-50/70 dark:bg-blue-950/30 border border-blue-100 dark:border-blue-900/60 rounded-xl space-y-1.5 text-xs"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-semibold text-blue-950 dark:text-blue-200">
-                        Why this student is recommended
-                      </span>
-                      {topCard.featureBreakdown.evaluatedAgainstTeamId && (
-                        <span className="text-[11px] text-blue-700 dark:text-blue-300 font-medium">
-                          Ranked for your{' '}
-                          {topCard.featureBreakdown.evaluatedAgainstMemberCount}
-                          -member team
-                        </span>
-                      )}
-                    </div>
-                    {topCard.compatibilityReasons
-                      .slice(0, 2)
-                      .map((reason, idx) => (
-                        <div
-                          key={idx}
-                          className="flex items-start gap-2 text-slate-800 dark:text-slate-200 font-medium"
-                        >
-                          <span className="text-blue-600 dark:text-blue-400 font-bold">
-                            •
-                          </span>
-                          <span>{reason}</span>
-                        </div>
-                      ))}
-                  </div>
-                )}
-
-                {/* Preferred Roles, Top Skills & Interests/Domains */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs pt-3 border-t border-slate-100 dark:border-slate-800">
-                  <div className="space-y-2">
-                    <div>
-                      <span className="text-slate-400 uppercase tracking-wider text-[10px] font-semibold block mb-1">
-                        Preferred Roles
-                      </span>
-                      <div className="flex flex-wrap gap-1.5">
-                        {topCard.rolesOfferedOrNeeded.map((role) => (
-                          <span
-                            key={role}
-                            className="px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-100 font-semibold"
-                          >
-                            {role}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-
-                    {topCardProfile && topCardProfile.interestTags.length > 0 && (
-                      <div>
-                        <span className="text-slate-400 uppercase tracking-wider text-[10px] font-semibold block mb-1">
-                          Domains & Interests
-                        </span>
-                        <div className="flex flex-wrap gap-1">
-                          {topCardProfile.interestTags.slice(0, 5).map((tag) => (
-                            <span
-                              key={tag}
-                              className="px-2 py-0.5 rounded bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300"
-                            >
-                              {tag}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="space-y-2">
-                    <div>
-                      <span className="text-slate-400 uppercase tracking-wider text-[10px] font-semibold block mb-1">
-                        Top Skills
-                      </span>
-                      <div className="flex flex-wrap gap-1.5">
-                        {topCard.skills.slice(0, 7).map((skill) => {
-                          const isComplementary = (
-                            topCard.featureBreakdown.complementarySkills ?? []
-                          )
-                            .map((s) => s.toLowerCase())
-                            .includes(skill.toLowerCase());
-                          return (
-                            <span
-                              key={skill}
-                              className={`px-2 py-0.5 rounded font-medium ${
-                                isComplementary
-                                  ? 'bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300'
-                                  : 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200'
-                              }`}
-                            >
-                              {skill}
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    <div>
-                      <span className="text-slate-400 uppercase tracking-wider text-[10px] font-semibold block mb-0.5">
-                        Availability & Working Style
-                      </span>
-                      <p className="text-slate-700 dark:text-slate-300">
-                        {topCard.availabilitySummary || 'Flexible schedule'}
-                        {topCard.workingStyle.length > 0
-                          ? ` · ${topCard.workingStyle.slice(0, 2).join(', ')}`
-                          : ''}
-                      </p>
-                    </div>
-                  </div>
+                <div className="text-right shrink-0">
+                  <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-[#fff3c9] text-[#725c00] font-mono tabular-nums text-xs font-bold border border-[#ffd84d]/60">
+                    <Sparkles className="w-3.5 h-3.5 text-[#875200]" />
+                    {topCard.featureBreakdown.totalScore ??
+                      Math.round((topCard.overallScore ?? 0) * 100)}% Match
+                  </span>
                 </div>
+              </div>
 
-                {/* Highlighted GitHub / Project Summary (always visible when available) */}
-                {topCard.featuredEvidence.length > 0 && (
-                  <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2 text-xs">
-                    <span className="text-slate-400 uppercase tracking-wider text-[10px] font-semibold flex items-center gap-1.5">
-                      <FolderGit2 className="w-3.5 h-3.5" />
-                      <span>Highlighted Projects & Proof of Work</span>
+              {/* Concise Builder Bio in quotes */}
+              <div className="pt-1">
+                <p className="text-sm sm:text-base text-[#24211c] italic leading-relaxed">
+                  &ldquo;{topCardProfile?.about || (topCard as { bio?: string }).bio || 'Passionate about building intuitive web experiences and scalable backends. Looking for a high-energy team.'}&rdquo;
+                </p>
+              </div>
+
+              {/* Verified Core Stack */}
+              <div className="flex flex-col gap-1.5">
+                <span className="text-[11px] uppercase tracking-wider font-bold text-[#746e65]">
+                  Core Stack
+                </span>
+                <div className="flex flex-wrap gap-2">
+                  {topCard.skills.slice(0, 6).map((skill) => (
+                    <span
+                      key={skill}
+                      className="inline-flex items-center px-3 py-1 rounded-full bg-[#f6f3f2] text-xs font-medium text-[#1c1b1b] hover:bg-[#eae7e7] transition-colors"
+                    >
+                      {skill}
                     </span>
-                    <div className="grid grid-cols-1 gap-2">
-                      {topCard.featuredEvidence.slice(0, 2).map((ev, idx) => (
-                        <div
-                          key={idx}
-                          className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg space-y-0.5"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-semibold text-slate-900 dark:text-slate-100">
-                              {ev.title}
-                            </span>
-                            {(ev.tech ?? []).length > 0 && (
-                              <span className="text-[11px] text-slate-500">
-                                {(ev.tech ?? []).slice(0, 4).join(' · ')}
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-slate-600 dark:text-slate-300 line-clamp-2">
+                  ))}
+                  {topCard.rolesOfferedOrNeeded.map((role) => (
+                    <span
+                      key={role}
+                      className="inline-flex items-center px-3 py-1 rounded-full bg-[#fff3c9] text-xs font-bold text-[#272015] border border-[#ffd84d]/50"
+                    >
+                      {role}
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              {/* Featured Project Row (if available) */}
+              {topCard.featuredEvidence.length > 0 && (
+                <div className="flex flex-col gap-1.5 pt-1">
+                  <span className="text-[11px] uppercase tracking-wider font-bold text-[#746e65]">
+                    Featured Work
+                  </span>
+                  {topCard.featuredEvidence.slice(0, 1).map((ev, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-center justify-between p-3.5 rounded-xl bg-[#f6f3f2] border border-[#e9e5dd] hover:bg-[#eae7e7] transition-all"
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-8 h-8 rounded-lg bg-white flex items-center justify-center shrink-0 shadow-xs text-[#875200]">
+                          <FolderGit2 className="w-4 h-4" />
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-wrap min-w-0 text-xs">
+                          <span className="font-bold text-[#1c1b1b]">{ev.title}</span>
+                          <span className="text-[#746e65]">·</span>
+                          <span className="text-[#875200] font-medium">
+                            {(ev.tech ?? []).slice(0, 3).join(', ')}
+                          </span>
+                          <span className="text-[#746e65]">—</span>
+                          <span className="text-[#746e65] truncate max-w-[220px]">
                             {ev.description}
-                          </p>
+                          </span>
                         </div>
-                      ))}
+                      </div>
                     </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Quiet Match Reason Callout */}
+              {topCard.compatibilityReasons.length > 0 && (
+                <div className="flex items-start gap-2.5 p-3.5 rounded-xl bg-[#ffd84d]/20 text-[#1c1b1b] border border-[#ffd84d]/30">
+                  <div className="w-6 h-6 rounded-full bg-[#ffd84d] flex items-center justify-center shrink-0 text-[#725c00] mt-0.5">
+                    <Sparkles className="w-3.5 h-3.5" />
+                  </div>
+                  <div className="flex flex-col text-xs">
+                    <span className="font-bold text-[#1c1b1b]">Why this match</span>
+                    <p className="text-[#615e56] mt-0.5 leading-relaxed">
+                      {topCard.compatibilityReasons[0]}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Expandable Details: intro note & score breakdown */}
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => setExpandedDetails(!expandedDetails)}
+                  className="text-xs font-medium text-[#746e65] hover:text-[#1c1b1b] inline-flex items-center gap-1 cursor-pointer"
+                >
+                  {expandedDetails ? (
+                    <>
+                      <ChevronUp className="w-3.5 h-3.5" />
+                      <span>Hide optional intro note &amp; weights</span>
+                    </>
+                  ) : (
+                    <>
+                      <ChevronDown className="w-3.5 h-3.5" />
+                      <span>Add intro note or inspect match math</span>
+                    </>
+                  )}
+                </button>
+
+                {expandedDetails && (
+                  <div className="mt-3 space-y-3 text-xs">
+                    <div className="space-y-1.5">
+                      <label className="font-semibold text-[#1c1b1b] block">
+                        Optional intro note (sent when you both match)
+                      </label>
+                      <input
+                        type="text"
+                        value={noteDraft}
+                        onChange={(e) => setNoteDraft(e.target.value)}
+                        placeholder="Write a quick note about what you want to build..."
+                        className="w-full px-3.5 py-2 bg-[#f6f3f2] border border-[#e9e5dd] rounded-xl text-[#1c1b1b] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#725c00]"
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setShowScoreBreakdown(!showScoreBreakdown)}
+                        className="text-[#746e65] hover:text-[#1c1b1b] cursor-pointer"
+                      >
+                        {showScoreBreakdown ? 'Hide weights' : 'Show weights (45 / 35 / 20)'}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => onBlockUser(topCard.id)}
+                        className="inline-flex items-center gap-1 text-[#746e65] hover:text-rose-600 cursor-pointer"
+                      >
+                        <ShieldAlert className="w-3.5 h-3.5" />
+                        <span>Block student</span>
+                      </button>
+                    </div>
+
+                    {showScoreBreakdown && (
+                      <div className="p-3 bg-[#f6f3f2] rounded-xl grid grid-cols-3 gap-2 font-mono tabular-nums text-[11px] text-[#615e56]">
+                        <div>
+                          <span className="block text-[#746e65]">Skill Complement</span>
+                          <strong>
+                            {topCard.featureBreakdown.skillComplementarityScore ??
+                              topCard.featureBreakdown.interestOrRoleSim}%
+                          </strong>
+                        </div>
+                        <div>
+                          <span className="block text-[#746e65]">Shared Interests</span>
+                          <strong>
+                            {topCard.featureBreakdown.sharedInterestsScore ??
+                              topCard.featureBreakdown.tfidfThemeSim}%
+                          </strong>
+                        </div>
+                        <div>
+                          <span className="block text-[#746e65]">Swipe Affinity</span>
+                          <strong>
+                            {topCard.featureBreakdown.pastSwipeAffinityScore ?? 50}%
+                          </strong>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
+              </div>
 
-                {/* Progressive Disclosure: Optional Note, Score Breakdown & Block */}
-                <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
-                  <button
-                    type="button"
-                    onClick={() => setExpandedDetails(!expandedDetails)}
-                    className="text-xs font-medium text-slate-500 hover:text-slate-900 dark:hover:text-slate-100 inline-flex items-center gap-1 cursor-pointer"
-                  >
-                    {expandedDetails ? (
-                      <>
-                        <ChevronUp className="w-3.5 h-3.5" />
-                        <span>Hide intro note & score details</span>
-                      </>
-                    ) : (
-                      <>
-                        <ChevronDown className="w-3.5 h-3.5" />
-                        <span>Add intro note or inspect recommendation math</span>
-                      </>
-                    )}
-                  </button>
+              {/* Action Button Dock */}
+              <div className="pt-2 flex items-center justify-between gap-3">
+                {/* Pass Action Button */}
+                <button
+                  type="button"
+                  data-testid="swipe-pass-btn"
+                  disabled={submittingCardId === topCard.id}
+                  onClick={() => void triggerSwipe('passed')}
+                  title="Pass profile (Press Left Arrow)"
+                  className="flex-1 flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-[#f6f3f2] hover:bg-[#eae7e7] text-[#4d4634] font-semibold text-xs sm:text-sm transition-all active:scale-[0.99] cursor-pointer disabled:opacity-50"
+                >
+                  <X className="w-4 h-4" />
+                  <span>Pass</span>
+                  <kbd className="hidden sm:inline-block px-1.5 py-0.5 text-[10px] rounded bg-white text-[#746e65] shadow-xs font-mono">
+                    ←
+                  </kbd>
+                </button>
 
-                  {expandedDetails && (
-                    <div className="mt-3 space-y-3 text-xs">
-                      <div className="space-y-1.5">
-                        <label className="font-semibold text-slate-700 dark:text-slate-300 block">
-                          Optional intro note (sent when you both match)
-                        </label>
-                        {topCard.icebreakerDrafts.length > 0 && (
-                          <div className="flex flex-wrap gap-1.5">
-                            {topCard.icebreakerDrafts
-                              .slice(0, 2)
-                              .map((draft, i) => (
-                                <button
-                                  key={i}
-                                  type="button"
-                                  onClick={() => setNoteDraft(draft)}
-                                  className="text-left px-2.5 py-1 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-300 rounded-md cursor-pointer"
-                                >
-                                  “{draft.slice(0, 64)}…”
-                                </button>
-                              ))}
-                          </div>
-                        )}
-                        <input
-                          type="text"
-                          value={noteDraft}
-                          onChange={(e) => setNoteDraft(e.target.value)}
-                          placeholder="Write a quick note about what you want to build..."
-                          className="w-full px-3 py-1.5 bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                        />
-                      </div>
+                {/* Interested in Teaming Button */}
+                <button
+                  type="button"
+                  data-testid="swipe-interested-btn"
+                  disabled={submittingCardId === topCard.id}
+                  onClick={() => void triggerSwipe('interested')}
+                  title="Interested in teaming (Right Arrow)"
+                  className="flex-[1.4] flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs sm:text-sm shadow-sm transition-all active:scale-[0.99] cursor-pointer disabled:opacity-50"
+                >
+                  <Heart className="w-4 h-4 fill-current text-[#1a1a1a]" />
+                  <span>{interestedActionLabel}</span>
+                  <kbd className="hidden sm:inline-block px-1.5 py-0.5 text-[10px] rounded bg-white/70 text-[#1a1a1a] shadow-xs font-mono">
+                    →
+                  </kbd>
+                </button>
+              </div>
+            </article>
 
-                      <div className="flex items-center justify-between pt-2">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setShowScoreBreakdown(!showScoreBreakdown)
-                          }
-                          className="text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 cursor-pointer"
-                        >
-                          {showScoreBreakdown
-                            ? 'Hide recommendation weights'
-                            : 'Show recommendation weights (45 / 35 / 20)'}
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => onBlockUser(topCard.id)}
-                          className="inline-flex items-center gap-1 text-slate-400 hover:text-rose-600 cursor-pointer"
-                        >
-                          <ShieldAlert className="w-3.5 h-3.5" />
-                          <span>Block student</span>
-                        </button>
-                      </div>
-
-                      {showScoreBreakdown && (
-                        <div className="p-3 bg-slate-50 dark:bg-slate-950 rounded-lg grid grid-cols-3 gap-2 font-mono tabular-nums text-[11px] text-slate-600 dark:text-slate-400">
-                          <div>
-                            <span className="block text-slate-400">
-                              Skill Complementarity
-                            </span>
-                            <strong>
-                              {topCard.featureBreakdown
-                                .skillComplementarityScore ??
-                                topCard.featureBreakdown.interestOrRoleSim}
-                              %
-                            </strong>
-                          </div>
-                          <div>
-                            <span className="block text-slate-400">
-                              Shared Interests
-                            </span>
-                            <strong>
-                              {topCard.featureBreakdown.sharedInterestsScore ??
-                                topCard.featureBreakdown.tfidfThemeSim}
-                              %
-                            </strong>
-                          </div>
-                          <div>
-                            <span className="block text-slate-400">
-                              Swipe Affinity
-                            </span>
-                            <strong>
-                              {topCard.featureBreakdown
-                                .pastSwipeAffinityScore ?? 50}
-                              %
-                            </strong>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {/* Primary Swipe Action Controls (Pass Left / Interested Right) */}
-                <div className="flex items-center justify-between gap-3 pt-4 border-t border-slate-100 dark:border-slate-800">
-                  <button
-                    type="button"
-                    data-testid="swipe-pass-btn"
-                    disabled={submittingCardId === topCard.id}
-                    onClick={() => void triggerSwipe('passed')}
-                    className="flex-1 sm:flex-initial px-5 py-2.5 text-xs sm:text-sm font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-rose-50 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300 rounded-xl inline-flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-50"
-                  >
-                    <X className="w-4 h-4" />
-                    <span>Pass</span>
-                  </button>
-
-                  <div className="hidden sm:flex items-center gap-1.5 text-[11px] text-slate-400">
-                    <ArrowLeft className="w-3 h-3" />
-                    <span>Drag or use arrow keys</span>
-                    <ArrowRight className="w-3 h-3" />
-                  </div>
-
-                  <button
-                    type="button"
-                    data-testid="swipe-interested-btn"
-                    disabled={submittingCardId === topCard.id}
-                    onClick={() => void triggerSwipe('interested')}
-                    className="flex-1 sm:flex-initial px-6 py-2.5 text-xs sm:text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl inline-flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-50"
-                  >
-                    <Heart className="w-4 h-4" />
-                    <span>{interestedActionLabel}</span>
-                  </button>
-                </div>
+            {/* Quiet Keyboard & Gestural Footer Hint */}
+            <div className="mt-4 flex items-center justify-center gap-4 text-xs text-[#746e65]">
+              <div className="flex items-center gap-1.5">
+                <kbd className="px-1.5 py-0.5 rounded bg-white border border-[#e9e5dd] shadow-xs text-[#1c1b1b] font-mono font-medium">
+                  ←
+                </kbd>
+                <span>to pass</span>
+              </div>
+              <span className="text-[#dcd9d9]">•</span>
+              <div className="flex items-center gap-1.5">
+                <kbd className="px-1.5 py-0.5 rounded bg-white border border-[#e9e5dd] shadow-xs text-[#1c1b1b] font-mono font-medium">
+                  →
+                </kbd>
+                <span>to match</span>
               </div>
             </div>
           </div>

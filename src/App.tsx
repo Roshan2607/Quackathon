@@ -1688,18 +1688,18 @@ export function App() {
     icon: React.ReactNode;
     count?: number;
   }[] = [
-    { id: 'discover', label: 'Discover', icon: <Compass className="w-4 h-4" /> },
-    { id: 'hackathons', label: 'Hackathons', icon: <Calendar className="w-4 h-4" /> },
+    { id: 'discover', label: 'Discover', icon: <Compass className="w-[19px] h-[19px]" /> },
+    { id: 'hackathons', label: 'Hackathons', icon: <Calendar className="w-[19px] h-[19px]" /> },
     {
       id: 'matches',
-      label: 'Matches',
-      icon: <MessageSquare className="w-4 h-4" />,
+      label: 'Matches & Shortlist',
+      icon: <MessageSquare className="w-[19px] h-[19px]" />,
       count: myConversationsCount > 0 ? myConversationsCount : undefined,
     },
     {
       id: 'my_team',
       label: 'My Team',
-      icon: <Users className="w-4 h-4" />,
+      icon: <Users className="w-[19px] h-[19px]" />,
       count:
         pendingProposalsOrInvitesCount > 0
           ? pendingProposalsOrInvitesCount
@@ -1707,195 +1707,184 @@ export function App() {
             ? myActiveTeamIds.size
             : undefined,
     },
-    { id: 'profile', label: 'Profile', icon: <UserCircle className="w-4 h-4" /> },
+    { id: 'profile', label: 'Profile', icon: <UserCircle className="w-[19px] h-[19px]" /> },
   ];
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
-      {/* Clean 3-Zone Top Navigation Bar (Zero desktop overflow / scrollbar) */}
-      <header className="sticky top-0 z-30 bg-white border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4">
-          {/* Zone 1: Brand Wordmark */}
+    <div className="min-h-screen bg-[#faf8f2] text-[#1c1b1b] flex antialiased">
+      {/* 256px Canary Minimal Unified Sidebar */}
+      <aside className="quack-sidebar" aria-label="Primary navigation">
+        <div className="quack-sidebar-top">
           <button
             type="button"
             onClick={() => navigateToTab('discover')}
-            aria-label="Quackathon Home"
-            className="flex items-center gap-2 text-left cursor-pointer shrink-0"
+            className="quack-brand cursor-pointer border-0 bg-transparent"
+            aria-label="Quackathon home"
           >
-            <img
-              src="/assets/aistudio/mini_7f313967.png"
-              alt="Quackathon"
-              className="h-8 w-8 rounded-lg object-contain sm:hidden"
-            />
-            <img
-              src="/assets/aistudio/long1_66ed7bae.png"
-              alt="Quackathon"
-              className="hidden sm:block h-8 w-auto object-contain"
-            />
+            <span className="quack-brand-mark">
+              <svg viewBox="0 0 48 48" width="26" height="26" aria-hidden="true" focusable="false">
+                <ellipse cx="24" cy="27" rx="15.5" ry="14.5" fill="#ffdc63" />
+                <path d="M13 17c2-10 18-12 22 0" fill="#ffdc63" />
+                <circle cx="19" cy="25" r="1.7" fill="#25221c" />
+                <circle cx="28.5" cy="25" r="1.7" fill="#25221c" />
+                <path d="M19 30h10c0 5-10 5-10 0z" fill="#eba64a" />
+              </svg>
+            </span>
+            <span className="quack-brand-name">quackathon</span>
           </button>
 
-          {/* Zone 2: Concise 5-Item Desktop Navigation */}
-          <nav
-            aria-label="Main navigation"
-            className="hidden md:flex items-center gap-1"
-          >
+          <nav className="quack-side-nav" aria-label="Main pages">
             {navItems.map((item) => (
               <button
                 key={item.id}
                 type="button"
                 onClick={() => navigateToTab(item.id)}
-                className={`px-3 py-1.5 text-sm font-medium rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                  activeTab === item.id
-                    ? 'bg-slate-900 text-white font-semibold'
-                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
-                }`}
+                aria-current={activeTab === item.id ? 'page' : undefined}
+                title={item.label}
+                className={`quack-nav-link ${activeTab === item.id ? 'is-active' : ''}`}
               >
                 {item.icon}
-                <span>{item.label}</span>
+                <span className="quack-nav-label">{item.label}</span>
                 {item.count !== undefined && (
-                  <span className="font-mono tabular-nums text-xs opacity-80">
+                  <span className="ml-auto text-[11px] font-semibold px-2 py-0.5 rounded-full bg-[#f1ede6] text-[#4d4634]">
                     {item.count}
                   </span>
                 )}
               </button>
             ))}
           </nav>
+        </div>
 
-          {/* Zone 3: Authenticated Student Account Menu */}
-          <div className="relative shrink-0" ref={accountMenuRef}>
-            <button
-              type="button"
-              onClick={() => setShowAccountMenu((prev) => !prev)}
-              aria-expanded={showAccountMenu}
-              aria-haspopup="menu"
-              className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-sm font-medium text-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer max-w-[210px]"
+        <div className="quack-sidebar-footer" ref={accountMenuRef}>
+          <button
+            type="button"
+            onClick={() => setShowAccountMenu((prev) => !prev)}
+            aria-label={`Account menu for ${currentUser.displayName}`}
+            aria-haspopup="menu"
+            aria-expanded={showAccountMenu}
+            className="quack-account-chip"
+          >
+            <span className="quack-account-avatar">
+              <svg viewBox="0 0 48 48" width="26" height="26" aria-hidden="true" focusable="false">
+                <ellipse cx="24" cy="27" rx="15.5" ry="14.5" fill="#ffdc63" />
+                <path d="M13 17c2-10 18-12 22 0" fill="#ffdc63" />
+                <circle cx="19" cy="25" r="1.7" fill="#25221c" />
+                <circle cx="28.5" cy="25" r="1.7" fill="#25221c" />
+                <path d="M19 30h10c0 5-10 5-10 0z" fill="#eba64a" />
+              </svg>
+            </span>
+            <span className="quack-user-info">
+              <span className="quack-user-name">{currentUser.displayName}</span>
+              <span className="quack-user-sub">Student profile</span>
+            </span>
+            <span className="quack-account-chevron" aria-hidden="true">⌄</span>
+          </button>
+
+          {showAccountMenu && (
+            <div
+              role="menu"
+              className="absolute bottom-16 left-0 right-0 rounded-xl bg-white border border-[#e9e5dd] shadow-xl p-2 z-50 text-xs"
             >
-              <StudentAvatar
-                uid={currentUser.uid}
-                name={currentUser.displayName}
-                size="xs"
-              />
-              <span className="truncate">{currentUser.displayName}</span>
-              <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-            </button>
-
-            {showAccountMenu && (
-              <div
-                role="menu"
-                className="absolute right-0 mt-1.5 w-60 rounded-xl bg-white border border-slate-200 shadow-lg py-1.5 z-50 text-xs"
-              >
-                {/* Current User Summary */}
-                <div className="px-3.5 py-2.5 border-b border-slate-100">
-                  <div className="font-semibold text-sm text-slate-900 truncate">
-                    {currentUser.displayName}
-                  </div>
-                  <div className="text-xs text-slate-500 truncate mt-0.5">
-                    {currentUser.campus} · {currentUser.program}
-                  </div>
+              {/* Current User Summary */}
+              <div className="px-3 py-2 border-b border-[#f1ede6]">
+                <div className="font-bold text-sm text-[#1c1b1b] truncate">
+                  {currentUser.displayName}
                 </div>
-
-                {/* Student Actions */}
-                <div className="py-1">
-                  <button
-                    type="button"
-                    onClick={() => navigateToTab('profile')}
-                    className="w-full px-3.5 py-2 text-left text-sm font-medium text-slate-700 hover:bg-slate-50 flex items-center justify-between cursor-pointer"
-                  >
-                    <span>Profile &amp; Settings</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleSignOut()}
-                    className="w-full px-3.5 py-2 text-left text-sm font-medium text-rose-600 hover:bg-slate-50 flex items-center justify-between cursor-pointer"
-                  >
-                    <span>Sign Out</span>
-                    <LogOut className="w-3.5 h-3.5" />
-                  </button>
+                <div className="text-xs text-[#746e65] truncate mt-0.5">
+                  {currentUser.campus} · {currentUser.program}
                 </div>
-
-                {/* Moderator & Developer Routes: STRICTLY hidden from normal students */}
-                {isAuthorizedStaff && (
-                  <div className="pt-1 border-t border-slate-100">
-                    <div className="px-3.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                      Moderator Controls
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => navigateToTab('admin')}
-                      className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 cursor-pointer ${
-                        activeTab === 'admin'
-                          ? 'font-semibold text-indigo-600 bg-slate-50'
-                          : 'text-slate-700'
-                      }`}
-                    >
-                      <span className="inline-flex items-center gap-2">
-                        <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
-                        Admin Event Review
-                      </span>
-                      <span className="font-mono text-[10px] text-slate-400">
-                        {pendingAdminCount}
-                      </span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => navigateToTab('integrations')}
-                      className={`w-full px-3.5 py-2 text-left flex items-center justify-between hover:bg-slate-50 cursor-pointer ${
-                        activeTab === 'integrations'
-                          ? 'font-semibold text-indigo-600 bg-slate-50'
-                          : 'text-slate-700'
-                      }`}
-                    >
-                      <span className="inline-flex items-center gap-2">
-                        <Terminal className="w-3.5 h-3.5 text-slate-500" />
-                        Integration Diagnostics
-                      </span>
-                    </button>
-                  </div>
-                )}
               </div>
-            )}
+
+              {/* Student Actions */}
+              <div className="py-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAccountMenu(false);
+                    setShowProfileModal(true);
+                  }}
+                  className="w-full px-3 py-2 text-left text-xs font-medium text-[#27221c] hover:bg-[#fff5d6] rounded-lg cursor-pointer"
+                >
+                  Profile &amp; Settings
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSignOut()}
+                  className="w-full px-3 py-2 text-left text-xs font-medium text-rose-600 hover:bg-rose-50 rounded-lg flex items-center justify-between cursor-pointer"
+                >
+                  <span>Sign Out</span>
+                  <LogOut className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {/* Moderator & Developer Routes */}
+              {isAuthorizedStaff && (
+                <div className="pt-1 border-t border-[#f1ede6]">
+                  <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-[#746e65]">
+                    Moderator Controls
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowAccountMenu(false);
+                      navigateToTab('admin');
+                    }}
+                    className={`w-full px-3 py-1.5 text-left flex items-center justify-between hover:bg-[#fff5d6] rounded-lg cursor-pointer ${
+                      activeTab === 'admin'
+                        ? 'font-semibold text-[#725c00] bg-[#fff5d6]'
+                        : 'text-[#27221c]'
+                    }`}
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5 text-[#725c00]" />
+                      Admin Event Review
+                    </span>
+                    <span className="font-mono text-[10px] text-[#746e65]">
+                      {pendingAdminCount}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowAccountMenu(false);
+                      navigateToTab('integrations');
+                    }}
+                    className={`w-full px-3 py-1.5 text-left flex items-center justify-between hover:bg-[#fff5d6] rounded-lg cursor-pointer ${
+                      activeTab === 'integrations'
+                        ? 'font-semibold text-[#725c00] bg-[#fff5d6]'
+                        : 'text-[#27221c]'
+                    }`}
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      <Terminal className="w-3.5 h-3.5 text-[#725c00]" />
+                      Integration Diagnostics
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </aside>
+
+      {/* Main Page Shell */}
+      <div className="quack-page-shell">
+        {/* Toast Notification */}
+        {toastMessage && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="fixed bottom-4 right-4 z-50 max-w-md bg-[#24211c] text-white px-4 py-3 rounded-xl shadow-lg border border-[#e9e5dd]/30 flex items-center gap-2.5 text-xs font-medium"
+          >
+            <Bell className="w-4 h-4 text-[#ffd84d] shrink-0" />
+            <span>{toastMessage}</span>
           </div>
-        </div>
+        )}
 
-        {/* Mobile Navigation Strip (< md) */}
-        <nav
-          aria-label="Mobile navigation"
-          className="md:hidden border-t border-slate-100 bg-white px-2 py-1.5 grid grid-cols-5 gap-1"
-        >
-          {navItems.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => navigateToTab(item.id)}
-              className={`py-1.5 px-1 rounded-lg text-[11px] font-medium flex flex-col items-center justify-center gap-0.5 cursor-pointer ${
-                activeTab === item.id
-                  ? 'bg-slate-900 text-white font-semibold'
-                  : 'text-slate-600 hover:bg-slate-100'
-              }`}
-            >
-              {item.icon}
-              <span className="truncate max-w-full">{item.label}</span>
-            </button>
-          ))}
-        </nav>
-      </header>
-
-      {/* Toast Notification */}
-      {toastMessage && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="fixed bottom-4 right-4 z-50 max-w-md bg-slate-900 text-white px-4 py-3 rounded-xl shadow-lg border border-slate-700 flex items-center gap-2.5 text-xs font-medium"
-        >
-          <Bell className="w-4 h-4 text-amber-400 shrink-0" />
-          <span>{toastMessage}</span>
-        </div>
-      )}
-
-      {/* Main Content Workspace */}
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6">
+        {/* Main Content Workspace */}
+        <main className="quack-page-main">
         {unregisteredRedirectInfo && (
           <div className="mb-6 rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50/90 dark:bg-amber-950/40 p-4 text-xs text-slate-800 dark:text-slate-200 shadow-sm">
             <div className="flex items-start justify-between gap-3">
@@ -2144,6 +2133,7 @@ export function App() {
             ))}
         </Suspense>
       </main>
+      </div>
 
       {/* Builder Profile Modal (if opened from Account menu) */}
       {showProfileModal && (

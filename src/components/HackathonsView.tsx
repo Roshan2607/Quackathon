@@ -962,30 +962,35 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   };
 
   return (
-    <div className="space-y-5">
-      {/* Clean Page Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold tracking-tight text-slate-900">
-            Hackathons
-          </h1>
-          <p className="text-sm text-slate-600 mt-0.5">
-            Explore verified PES University hackathons and find teammates for upcoming events.
-          </p>
-        </div>
+    <div className="space-y-6">
+      {/* Top Intro Section: Clean, Academic, Unhurried */}
+      <section className="flex flex-col gap-2 pb-2">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[#1c1b1b]">
+              Hackathons
+            </h1>
+            <div className="flex items-center gap-1.5 bg-[#f6f3f2] px-3.5 py-1 rounded-full border border-[#e9e5dd] shrink-0">
+              <span className="w-2 h-2 rounded-full bg-[#fdaa40]" />
+              <span className="text-xs font-medium text-[#746e65]">
+                {filteredHackathons.length} Hackathons
+              </span>
+            </div>
+          </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            setCandidateSourceOverride(null);
-            setShowSubmitModal(true);
-          }}
-          className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold transition-colors cursor-pointer shrink-0 whitespace-nowrap"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Suggest Hackathon</span>
-        </button>
-      </div>
+          <button
+            type="button"
+            onClick={() => {
+              setCandidateSourceOverride(null);
+              setShowSubmitModal(true);
+            }}
+            className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] text-xs font-bold transition-all shadow-xs cursor-pointer shrink-0 whitespace-nowrap"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Suggest Hackathon</span>
+          </button>
+        </div>
+      </section>
 
       {submissionSuccessToast && (
         <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-between gap-3 text-sm text-emerald-900">
@@ -1003,63 +1008,52 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
         </div>
       )}
 
-      {/* Compact Student Filter Controls */}
-      <div className="bg-white rounded-2xl border border-slate-200 p-4 space-y-3">
-        {/* Search + Campus + Secondary Private Academy Switch */}
-        <div className="flex flex-col md:flex-row gap-2.5">
-          <div className="relative flex-1">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder={
-                sourceFilter === 'MY_ACADEMY'
-                  ? 'Search your PESU Academy announcements...'
-                  : 'Search hackathons by name, campus, or topic...'
-              }
-              className="w-full pl-9 pr-3 py-2 text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15"
-            />
+      {/* Filter & Search Toolbar */}
+      <section className="flex flex-col gap-3">
+        {/* Search Bar with Tonal Layering */}
+        <div className="relative w-full">
+          <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-[#746e65]">
+            <Search className="w-4 h-4" />
           </div>
-
-          {sourceFilter !== 'MY_ACADEMY' && (
-            <select
-              aria-label="Filter by campus"
-              value={campusFilter}
-              onChange={(e) =>
-                setCampusFilter(e.target.value as CampusType | 'ALL')
-              }
-              className="text-sm rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-slate-700 focus:bg-white focus:outline-none focus:border-indigo-500 shrink-0"
-            >
-              <option value="ALL">All Campuses</option>
-              <option value="RR Campus">RR Campus</option>
-              <option value="EC Campus">EC Campus</option>
-              <option value="HN Campus">HN Campus</option>
-              <option value="Online / Multi-Campus">Online / Multi-Campus</option>
-            </select>
-          )}
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder={
+              sourceFilter === 'MY_ACADEMY'
+                ? 'Search your PESU Academy announcements...'
+                : 'Search team hackathons and competitions...'
+            }
+            className="w-full pl-10 pr-20 py-2.5 bg-white border border-[#e9e5dd] rounded-xl text-sm text-[#1c1b1b] placeholder:text-[#746e65]/60 shadow-xs focus:outline-none focus:ring-1 focus:ring-[#725c00] transition-all"
+          />
+          <div className="absolute inset-y-0 right-3 flex items-center gap-1.5 text-[#746e65]">
+            <kbd className="text-[10px] font-mono px-2 py-0.5 bg-[#f6f3f2] rounded border border-[#e9e5dd] text-[#746e65]">
+              ⌘K
+            </kbd>
+          </div>
         </div>
 
-        {/* Time Filters + Optional Consent-Gated Academy Toggle */}
-        <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-          <div className="flex flex-wrap items-center gap-1.5">
+        {/* Filter Control Strip: Time chips and Campus Segmented Control */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          {/* Time Range Pills */}
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
             {(
               [
+                { id: 'ALL', label: 'All' },
                 { id: 'UPCOMING', label: sourceFilter === 'MY_ACADEMY' ? 'Latest' : 'Upcoming' },
                 { id: 'THIS_WEEK', label: 'This Week' },
                 { id: 'THIS_MONTH', label: 'This Month' },
                 { id: 'PAST', label: 'Past' },
-                { id: 'ALL', label: 'All' },
               ] as { id: TimeFilterPreset; label: string }[]
             ).map((item) => (
               <button
                 key={item.id}
                 type="button"
                 onClick={() => setTimePreset(item.id)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                className={`px-3.5 py-1.5 rounded-full text-xs transition-colors cursor-pointer whitespace-nowrap ${
                   timePreset === item.id
-                    ? 'bg-slate-900 text-white font-semibold'
-                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                    ? 'bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
+                    : 'bg-white text-[#746e65] hover:bg-[#f6f3eb] border border-[#e9e5dd] font-medium'
                 }`}
               >
                 {item.label}
@@ -1067,33 +1061,52 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
             ))}
           </div>
 
-          <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg">
-            <button
-              type="button"
-              onClick={() => setSourceFilter('ALL_PUBLISHED')}
-              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                sourceFilter !== 'MY_ACADEMY'
-                  ? 'bg-white text-slate-900 shadow-xs font-semibold'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Hackathons
-            </button>
-            <button
-              type="button"
-              onClick={() => setSourceFilter('MY_ACADEMY')}
-              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                sourceFilter === 'MY_ACADEMY'
-                  ? 'bg-white text-slate-900 shadow-xs font-semibold'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <Lock className="w-3 h-3" />
-              <span>PESU Academy</span>
-            </button>
+          <div className="flex items-center gap-2">
+            {sourceFilter !== 'MY_ACADEMY' && (
+              <select
+                aria-label="Filter by campus"
+                value={campusFilter}
+                onChange={(e) =>
+                  setCampusFilter(e.target.value as CampusType | 'ALL')
+                }
+                className="text-xs font-medium rounded-full border border-[#e9e5dd] bg-white px-3 py-1.5 text-[#1c1b1b] shadow-xs cursor-pointer focus:outline-none"
+              >
+                <option value="ALL">All PESU (RR &amp; EC)</option>
+                <option value="RR Campus">RR Campus</option>
+                <option value="EC Campus">EC Campus</option>
+                <option value="HN Campus">HN Campus</option>
+                <option value="Online / Multi-Campus">Online / Multi-Campus</option>
+              </select>
+            )}
+
+            <div className="flex items-center p-0.5 bg-[#f6f3f2] rounded-xl border border-[#e9e5dd]">
+              <button
+                type="button"
+                onClick={() => setSourceFilter('ALL_PUBLISHED')}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                  sourceFilter !== 'MY_ACADEMY'
+                    ? 'bg-white text-[#1c1b1b] shadow-xs'
+                    : 'text-[#746e65] hover:text-[#1c1b1b]'
+                }`}
+              >
+                Hackathons
+              </button>
+              <button
+                type="button"
+                onClick={() => setSourceFilter('MY_ACADEMY')}
+                className={`inline-flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                  sourceFilter === 'MY_ACADEMY'
+                    ? 'bg-white text-[#1c1b1b] shadow-xs'
+                    : 'text-[#746e65] hover:text-[#1c1b1b]'
+                }`}
+              >
+                <Lock className="w-3 h-3 text-[#725c00]" />
+                <span>PESU Academy</span>
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      </section>
 
       {/* ==================================================================== */}
       {/* VIEW A: MY PESU ACADEMY ANNOUNCEMENTS (PRIVATE, CONSENT-GATED)       */}
@@ -1504,58 +1517,66 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                 <article
                   key={h.id}
                   data-testid={`hackathon-card-${h.id}`}
-                  className="bg-white rounded-2xl border border-slate-200 p-5 flex flex-col justify-between gap-4 hover:border-slate-300 transition-colors"
+                  className="event-card bg-white rounded-xl border border-[#e9e5dd] p-5 flex flex-col justify-between gap-4 shadow-xs hover:shadow-md transition-all duration-200"
                 >
-                  <div className="space-y-2.5">
-                    {/* Event Name */}
-                    <button
-                      type="button"
-                      onClick={() => setSelectedDetailHackathon(h)}
-                      className="text-left group cursor-pointer block w-full"
-                    >
-                      <h2 className="text-base font-bold text-slate-900 group-hover:text-indigo-600 leading-snug transition-colors">
-                        {h.name}
-                      </h2>
-                    </button>
-
-                    {/* Clean Unboxed Metadata */}
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-slate-600">
-                      <span className="inline-flex items-center gap-1.5 font-medium text-slate-800">
-                        <Calendar className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        <span>{dateDisplay}</span>
-                      </span>
-
-                      <span className="inline-flex items-center gap-1.5">
-                        <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        <span>{locationDisplay}</span>
-                      </span>
-
-                      {hasVerifiedTeamSize && (
-                        <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-slate-600">
-                          <Users className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                          <span>
-                            {h.minTeamSize === h.maxTeamSize
-                              ? `${h.minTeamSize} members`
-                              : `${h.minTeamSize}–${h.maxTeamSize} members`}
-                          </span>
-                        </span>
-                      )}
+                  <div className="flex items-start gap-4">
+                    <div className="w-11 h-11 rounded-xl bg-[#ffd84d]/25 flex items-center justify-center shrink-0 text-[#725c00]">
+                      <Calendar className="w-5 h-5 text-[#875200]" />
                     </div>
 
-                    <div className="text-xs">
-                      <span className="text-slate-500">Registration: </span>
-                      <span className={`font-semibold ${statusColorClass}`}>
-                        {statusLabel}
-                      </span>
+                    <div className="flex-1 min-w-0 space-y-1.5">
+                      <div className="flex items-center gap-2 flex-wrap text-[11px]">
+                        <span className="px-2 py-0.5 rounded bg-[#f6f3f2] text-[#4d4634] font-semibold border border-[#e9e5dd]">
+                          Hackathon
+                        </span>
+                        <span className="text-[#746e65]/60">•</span>
+                        <span className="text-[#746e65]">{locationDisplay}</span>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setSelectedDetailHackathon(h)}
+                        className="text-left group cursor-pointer block w-full"
+                      >
+                        <h2 className="text-base font-bold text-[#1c1b1b] group-hover:text-[#725c00] leading-snug transition-colors truncate">
+                          {h.name}
+                        </h2>
+                      </button>
+
+                      {/* Clean Unboxed Metadata */}
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#746e65]">
+                        <span className="inline-flex items-center gap-1 font-medium text-[#1c1b1b]">
+                          <Calendar className="w-3.5 h-3.5 text-[#875200] shrink-0" />
+                          <span>{dateDisplay}</span>
+                        </span>
+
+                        {hasVerifiedTeamSize && (
+                          <span className="inline-flex items-center gap-1 font-mono text-[11px] text-[#746e65]">
+                            <Users className="w-3.5 h-3.5 text-[#746e65] shrink-0" />
+                            <span>
+                              {h.minTeamSize === h.maxTeamSize
+                                ? `${h.minTeamSize} members`
+                                : `${h.minTeamSize}–${h.maxTeamSize} members`}
+                            </span>
+                          </span>
+                        )}
+
+                        <span className="inline-flex items-center gap-1">
+                          <span className="text-[#746e65]">Status:</span>
+                          <span className={`font-semibold ${statusColorClass}`}>
+                            {statusLabel}
+                          </span>
+                        </span>
+                      </div>
                     </div>
                   </div>
 
                   {/* Card Footer: View Details + Find Teammates (strictly when eligible) */}
-                  <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-3">
+                  <div className="pt-3 border-t border-[#f1ede6] flex items-center justify-between gap-3">
                     <button
                       type="button"
                       onClick={() => setSelectedDetailHackathon(h)}
-                      className="text-xs font-semibold text-slate-600 hover:text-indigo-600 cursor-pointer"
+                      className="text-xs font-semibold text-[#746e65] hover:text-[#1c1b1b] cursor-pointer"
                     >
                       View Details
                     </button>
@@ -1564,12 +1585,13 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                       <button
                         type="button"
                         onClick={() => onSelectHackathonForDiscovery(h.id)}
-                        className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] text-xs font-bold transition-colors cursor-pointer shrink-0 whitespace-nowrap shadow-xs"
                       >
-                        Find Teammates
+                        <Users className="w-3.5 h-3.5" />
+                        <span>Find Teammates</span>
                       </button>
                     ) : (
-                      <span className="text-xs font-medium text-slate-400">
+                      <span className="text-xs font-medium text-[#746e65]">
                         {regStatus.status === 'ended'
                           ? 'Event ended'
                           : 'Registration closed'}

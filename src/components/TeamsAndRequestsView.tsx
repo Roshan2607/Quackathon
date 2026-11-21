@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Check,
   CheckCircle2,
+  Clock,
   ClipboardCheck,
   Edit3,
   ExternalLink,
@@ -90,12 +91,12 @@ const REGISTRATION_STATUS_LABELS: Record<
   forming: {
     label: 'Forming Roster',
     badgeClass:
-      'bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-800',
+      'bg-[#fff3c9] text-[#725c00] border-[#ffd84d]',
   },
   ready_to_register: {
     label: 'Ready to Register',
     badgeClass:
-      'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800',
+      'bg-[#e6f4ea] text-[#137333] border-[#ceead6]',
   },
   registration_in_progress: {
     label: 'Registration in Progress',
@@ -105,7 +106,7 @@ const REGISTRATION_STATUS_LABELS: Record<
   registered: {
     label: 'Officially Registered',
     badgeClass:
-      'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-800 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800',
+      'bg-[#e8f0fe] text-[#1a73e8] border-[#aecbfa]',
   },
   registration_closed: {
     label: 'Registration Closed',
@@ -409,66 +410,96 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> =
       }, [teamConversation, messages]);
 
       return (
-        <div className="space-y-5">
-          {/* Top Bar: My Team Overview & Active Roster Switcher */}
-          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                <Users className="w-4 h-4 text-blue-600" />
-                <span>My Team & Roster Governance</span>
-              </h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Mutual student matches automatically form a 2-person team. Grow
-                your team up to 4 students with unanimous member approval.
-              </p>
+        <div className="space-y-6 max-w-5xl mx-auto">
+          {/* Top Bar: Canary Minimal My Team Header */}
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-[#e9e5dd]">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2.5">
+                <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[#1c1b1b]">
+                  My Team
+                </h1>
+                {selectedTeam && (
+                  <span className="px-2.5 py-0.5 rounded-full bg-[#ffd84d] text-[#1c1b1b] text-xs font-semibold">
+                    {rosterMemberships.length} of {maxAllowedSize} members
+                  </span>
+                )}
+              </div>
+              {selectedTeam && (
+                <div className="flex flex-wrap items-center gap-2 text-xs text-[#746e65]">
+                  <span className="font-semibold text-[#1c1b1b]">
+                    {selectedTeam.name.split(' (')[0]}
+                  </span>
+                  <span>•</span>
+                  <span>{teamHackathon?.name ?? selectedTeam.hackathonId}</span>
+                  <span>•</span>
+                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[#ffd84d]/30 text-[#1c1b1b] text-xs font-semibold">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#d97706]" />
+                    {registrationRecord?.registrationStatus === 'registered' ? 'Registered' : 'Forming'}
+                  </span>
+                </div>
+              )}
             </div>
 
-            {myTeams.length > 1 && (
-              <select
-                aria-label="Select Active Team"
-                value={selectedTeam?.id ?? ''}
-                onChange={(e) => {
-                  const nextTeam = myTeams.find((t) => t.id === e.target.value);
-                  setActiveTeamId(e.target.value);
-                  if (nextTeam && onSelectHackathon) {
-                    onSelectHackathon(nextTeam.hackathonId);
-                  }
-                }}
-                className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-semibold text-slate-900 dark:text-slate-100 cursor-pointer"
-              >
-                {myTeams.map((t) => {
-                  const h = hackathons.find((hk) => hk.id === t.hackathonId);
-                  return (
-                    <option key={t.id} value={t.id}>
-                      {t.name.split(' (')[0]} · {h?.name ?? t.hackathonId} (
-                      {t.memberCount}/{t.targetSize})
-                    </option>
-                  );
-                })}
-              </select>
-            )}
+            <div className="flex flex-wrap items-center gap-2.5 self-start md:self-auto">
+              {myTeams.length > 1 && (
+                <select
+                  aria-label="Select Active Team"
+                  value={selectedTeam?.id ?? ''}
+                  onChange={(e) => {
+                    const nextTeam = myTeams.find((t) => t.id === e.target.value);
+                    setActiveTeamId(e.target.value);
+                    if (nextTeam && onSelectHackathon) {
+                      onSelectHackathon(nextTeam.hackathonId);
+                    }
+                  }}
+                  className="px-3 py-2 rounded-xl border border-[#e9e5dd] bg-white text-xs font-semibold text-[#1c1b1b] shadow-xs cursor-pointer focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                >
+                  {myTeams.map((t) => {
+                    const h = hackathons.find((hk) => hk.id === t.hackathonId);
+                    return (
+                      <option key={t.id} value={t.id}>
+                        {t.name.split(' (')[0]} · {h?.name ?? t.hackathonId} ({t.memberCount}/{t.targetSize})
+                      </option>
+                    );
+                  })}
+                </select>
+              )}
+
+              {selectedTeam && onUpdateTeamDetails && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (isEditingTeam) {
+                      setIsEditingTeam(false);
+                    } else {
+                      startEditingTeam(selectedTeam);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-white hover:bg-[#f6f3f2] text-[#1c1b1b] text-xs font-semibold transition-colors cursor-pointer border border-[#e9e5dd] shadow-xs"
+                >
+                  <Edit3 className="w-3.5 h-3.5 text-[#746e65]" />
+                  <span>{isEditingTeam ? 'Close Edit' : 'Edit Team Details'}</span>
+                </button>
+              )}
+            </div>
           </div>
 
-          {/* Incoming Team Invitations (Competing Invitations Banner for Candidates) */}
+          {/* Incoming Candidate Invitations Banner */}
           {incomingCandidateInvitations.length > 0 && (
             <div
               data-testid="incoming-team-invitations"
-              className="bg-blue-50/70 dark:bg-blue-950/30 rounded-xl border border-blue-200 dark:border-blue-900 p-4 sm:p-5 space-y-3"
+              className="bg-[#fff9e6] rounded-2xl border border-[#ffd84d] p-5 space-y-3.5 shadow-xs"
             >
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-blue-800 dark:text-blue-300">
-                  <UserPlus className="w-4 h-4" />
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#725c00]">
+                  <UserPlus className="w-4 h-4 text-[#725c00]" />
                   <span>
-                    Team Invitations & Proposals for You (
-                    {incomingCandidateInvitations.length})
+                    Team Invitations &amp; Proposals for You ({incomingCandidateInvitations.length})
                   </span>
                 </div>
-                {incomingCandidateInvitations.filter(
-                  (i) => i.status === 'invited'
-                ).length > 1 && (
-                  <span className="text-[11px] font-medium text-blue-700 dark:text-blue-300">
-                    Multiple teams invited you — accepting one automatically
-                    declines competing offers for that hackathon.
+                {incomingCandidateInvitations.filter((i) => i.status === 'invited').length > 1 && (
+                  <span className="text-xs font-medium text-[#875200]">
+                    Multiple offers: accepting one automatically declines others for that hackathon.
                   </span>
                 )}
               </div>
@@ -477,46 +508,42 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> =
                 {incomingCandidateInvitations.map((inv) => {
                   const team = teams.find((t) => t.id === inv.teamId);
                   const hack = hackathons.find((h) => h.id === inv.hackathonId);
-                  const proposer = users.find(
-                    (u) => u.uid === inv.proposerUid
-                  );
+                  const proposer = users.find((u) => u.uid === inv.proposerUid);
                   const isReadyToAccept = inv.status === 'invited';
 
                   return (
                     <div
                       key={inv.id}
-                      className="p-4 rounded-xl bg-white dark:bg-slate-900 border border-blue-200 dark:border-blue-800/80 space-y-2.5 text-xs"
+                      className="p-4 rounded-xl bg-white border border-[#e9e5dd] space-y-2.5 text-xs shadow-xs"
                     >
                       <div className="flex items-start justify-between gap-2">
                         <div>
-                          <span className="text-[11px] text-slate-500">
+                          <span className="text-[11px] text-[#746e65]">
                             {hack?.name ?? inv.hackathonId}
                           </span>
-                          <h4 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                          <h4 className="text-sm font-bold text-[#1c1b1b]">
                             {team?.name ?? 'Student Team'}
                           </h4>
-                          <p className="text-slate-500">
-                            Proposed by{' '}
-                            {proposer?.displayName ?? inv.proposerUid} · Role:{' '}
-                            <strong>{inv.proposedRole}</strong>
+                          <p className="text-[#746e65]">
+                            Proposed by {proposer?.displayName ?? inv.proposerUid} · Role: <strong>{inv.proposedRole}</strong>
                           </p>
                         </div>
 
                         <span
-                          className={`px-2 py-0.5 rounded font-mono text-[11px] font-semibold ${
+                          className={`px-2.5 py-1 rounded-full text-[11px] font-semibold shrink-0 ${
                             isReadyToAccept
-                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-300'
-                              : 'bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/60 dark:text-amber-300'
+                              ? 'bg-[#e6f4ea] text-[#137333] border border-[#ceead6]'
+                              : 'bg-[#fff3c9] text-[#725c00] border border-[#ffd84d]'
                           }`}
                         >
                           {isReadyToAccept
-                            ? 'Unanimously Approved · Invited'
-                            : `Awaiting Team Votes (${inv.votes.filter((v) => v.decision === 'approve').length}/${inv.requiredVoterUids.length})`}
+                            ? 'Approved · Invited'
+                            : `Awaiting Votes (${inv.votes.filter((v) => v.decision === 'approve').length}/${inv.requiredVoterUids.length})`}
                         </span>
                       </div>
 
                       {inv.note && (
-                        <p className="text-slate-600 dark:text-slate-300 italic">
+                        <p className="text-[#4d4634] italic bg-[#faf8f2] p-2 rounded-lg border border-[#e9e5dd]/60">
                           &ldquo;{inv.note}&rdquo;
                         </p>
                       )}
@@ -526,30 +553,23 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> =
                           <button
                             type="button"
                             data-testid={`accept-invitation-${inv.id}`}
-                            onClick={() =>
-                              void onRespondTeamProposal(inv.id, 'accept')
-                            }
-                            className="flex-1 py-2 px-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                            onClick={() => void onRespondTeamProposal(inv.id, 'accept')}
+                            className="px-3.5 py-1.5 rounded-lg bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs shadow-xs cursor-pointer"
                           >
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Accept & Join Team</span>
+                            Accept &amp; Join Team
                           </button>
                           <button
                             type="button"
                             data-testid={`decline-invitation-${inv.id}`}
-                            onClick={() =>
-                              void onRespondTeamProposal(inv.id, 'decline')
-                            }
-                            className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300 font-medium cursor-pointer"
+                            onClick={() => void onRespondTeamProposal(inv.id, 'decline')}
+                            className="px-3.5 py-1.5 rounded-lg border border-[#e9e5dd] hover:bg-[#f6f3f2] text-[#746e65] font-semibold text-xs cursor-pointer"
                           >
                             Decline
                           </button>
                         </div>
                       ) : (
-                        <p className="text-[11px] text-slate-500">
-                          Once all current members of{' '}
-                          {team?.name ?? 'this team'} vote to approve, you will
-                          be able to accept and join.
+                        <p className="text-[11px] text-[#746e65]">
+                          Once all current members vote to approve, you will be able to join.
                         </p>
                       )}
                     </div>
@@ -561,270 +581,639 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> =
 
           {/* Main Team Content or Empty State */}
           {!selectedTeam ? (
-            <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-10 text-center space-y-3">
-              <Users className="w-8 h-8 text-slate-400 mx-auto" />
-              <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
-                You aren&apos;t on an active team yet
-              </h3>
-              <p className="text-xs text-slate-500 max-w-md mx-auto">
-                Swipe right on students you want to build with in Discover. When
-                another student swipes right on you too, Quackathon
-                automatically forms your 2-person team and opens your Team Chat!
-              </p>
+            <div className="bg-white rounded-2xl border border-[#e9e5dd] p-10 text-center space-y-4 max-w-lg mx-auto shadow-xs">
+              <div className="w-16 h-16 rounded-full bg-[#ffd84d]/40 flex items-center justify-center mx-auto text-[#725c00]">
+                <Users className="w-8 h-8 text-[#725c00]" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-lg font-bold text-[#1c1b1b]">
+                  You aren&apos;t on an active team yet
+                </h3>
+                <p className="text-xs text-[#746e65] leading-relaxed">
+                  Swipe right on students you want to build with in Discover. When another student swipes right on you too, Quackathon automatically forms your 2-person team!
+                </p>
+              </div>
               {onOpenDiscover && (
                 <button
                   type="button"
                   onClick={onOpenDiscover}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer"
+                  className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] text-xs font-bold shadow-xs cursor-pointer transition-all"
                 >
-                  <Sparkles className="w-3.5 h-3.5" />
+                  <Sparkles className="w-4 h-4 text-[#725c00]" />
                   <span>Discover Students</span>
                 </button>
               )}
             </div>
           ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-              {/* Left 7 Columns: Team Roster, Capabilities, Proposals & Registration */}
-              <div className="lg:col-span-7 space-y-5">
-                {/* 1. Team Identity & Roster Card */}
-                <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="space-y-0.5">
-                      <span className="text-xs font-medium text-blue-600 dark:text-blue-400">
-                        {teamHackathon?.name ?? selectedTeam.hackathonId}
-                      </span>
-                      {!isEditingTeam ? (
-                        <div className="flex items-center gap-2">
-                          <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100">
-                            {selectedTeam.name}
-                          </h3>
-                          {onUpdateTeamDetails && (
-                            <button
-                              type="button"
-                              onClick={() => startEditingTeam(selectedTeam)}
-                              className="p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
-                              title="Edit team name & project idea"
-                            >
-                              <Edit3 className="w-3.5 h-3.5" />
-                            </button>
-                          )}
-                        </div>
-                      ) : null}
-                    </div>
+            <div className="space-y-6">
+              {/* STITCH SCREEN: 4-Slot Roster 2x2 Grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Active Locked Team Members */}
+                {rosterMemberships.map((m) => {
+                  const u = users.find((usr) => usr.uid === m.uid);
+                  const p = profiles[m.uid];
+                  const isLead = selectedTeam.leaderId === m.uid;
 
-                    <div className="flex items-center gap-2 shrink-0">
-                      {selectedTeam.status === 'full' ||
-                      rosterMemberships.length >= maxAllowedSize ? (
-                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300 font-mono tabular-nums">
-                          <Lock className="w-3.5 h-3.5" />
-                          <span>
-                            Full ({rosterMemberships.length}/{maxAllowedSize})
-                          </span>
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-blue-50 dark:bg-blue-950/60 border border-blue-200 dark:border-blue-800 text-xs font-semibold text-blue-800 dark:text-blue-300 font-mono tabular-nums">
-                          <Users className="w-3.5 h-3.5" />
-                          <span>
-                            {rosterMemberships.length}/{maxAllowedSize} Members
-                          </span>
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Inline Team Edit Form */}
-                  {isEditingTeam ? (
-                    <form
-                      onSubmit={(e) => void handleSaveTeamEdit(e)}
-                      className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-3 text-xs"
+                  return (
+                    <div
+                      key={m.id}
+                      className="bg-white p-5 rounded-2xl flex flex-col justify-between shadow-xs border border-[#e9e5dd] space-y-3"
                     >
-                      <div>
-                        <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                          Team Name
-                        </label>
-                        <input
-                          type="text"
-                          required
-                          value={editName}
-                          onChange={(e) => setEditName(e.target.value)}
-                          className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                          Team Pitch / Goal
-                        </label>
-                        <input
-                          type="text"
-                          value={editPitch}
-                          onChange={(e) => setEditPitch(e.target.value)}
-                          className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                          Project Idea / Problem Track
-                        </label>
-                        <input
-                          type="text"
-                          value={editProjectIdea}
-                          onChange={(e) => setEditProjectIdea(e.target.value)}
-                          placeholder="What problem statement or prototype are you building?"
-                          className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                        />
-                      </div>
-                      <div className="flex items-center justify-end gap-2">
-                        <button
-                          type="button"
-                          onClick={() => setIsEditingTeam(false)}
-                          className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 cursor-pointer"
-                        >
-                          Cancel
-                        </button>
-                        <button
-                          type="submit"
-                          className="px-3.5 py-1.5 rounded-lg bg-blue-600 text-white font-semibold cursor-pointer"
-                        >
-                          Save Changes
-                        </button>
-                      </div>
-                    </form>
-                  ) : (
-                    <div className="space-y-1 text-xs text-slate-600 dark:text-slate-300">
-                      <p>{selectedTeam.pitch}</p>
-                      {selectedTeam.projectIdea && (
-                        <p className="text-slate-500">
-                          <strong>Project Idea:</strong>{' '}
-                          {selectedTeam.projectIdea}
-                        </p>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Active Team Members List */}
-                  <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2.5">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-semibold text-slate-700 dark:text-slate-300">
-                        Current Team Roster ({rosterMemberships.length}/
-                        {maxAllowedSize})
-                      </span>
-                      <span className="text-slate-400">
-                        Max 4 students per team
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      {rosterMemberships.map((m) => {
-                        const u = users.find((usr) => usr.uid === m.uid);
-                        const p = profiles[m.uid];
-                        return (
-                          <div
-                            key={m.id}
-                            className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800 space-y-1 text-xs"
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <div className="flex items-center gap-2 min-w-0">
-                                <StudentAvatar
-                                  uid={m.uid}
-                                  name={u?.displayName ?? m.uid}
-                                  size="xs"
-                                />
-                                <span className="font-bold text-slate-900 dark:text-slate-100 truncate">
-                                  {(u?.displayName ?? m.uid).replace(
-                                    ' (Synthetic Demo)',
-                                    ''
-                                  )}
+                      <div className="space-y-3">
+                        <div className="flex items-start justify-between">
+                          <div className="flex items-center gap-3">
+                            <StudentAvatar
+                              uid={m.uid}
+                              name={u?.displayName ?? m.uid}
+                              size="md"
+                            />
+                            <div className="flex flex-col min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-bold text-sm text-[#1c1b1b] truncate">
+                                  {(u?.displayName ?? m.uid).replace(' (Synthetic Demo)', '')}
                                 </span>
-                              </div>
-                              {selectedTeam.leaderId === m.uid && (
-                                <span className="px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-950/60 text-[10px] font-semibold text-blue-700 dark:text-blue-300 shrink-0">
-                                  Lead
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-slate-500 pl-8">
-                              {m.role}
-                              {u?.campus ? ` · ${u.campus}` : ''}
-                            </div>
-                            {p && p.skillTags.length > 0 && (
-                              <div className="flex flex-wrap gap-1 pt-1">
-                                {p.skillTags.slice(0, 4).map((skill) => (
-                                  <span
-                                    key={skill}
-                                    className="px-1.5 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[10px] text-slate-700 dark:text-slate-300"
-                                  >
-                                    {skill}
+                                {isLead && (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-[#ffd84d]/40 text-[#725c00] text-[10px] font-bold">
+                                    Team Lead
                                   </span>
-                                ))}
+                                )}
                               </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {/* Combined Skills & Missing Capabilities */}
-                  {teamCapabilities && (
-                    <div className="pt-3 border-t border-slate-100 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                      <div>
-                        <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">
-                          Combined Team Skills
-                        </span>
-                        <div className="flex flex-wrap gap-1">
-                          {Array.from(teamCapabilities.combinedSkills)
-                            .slice(0, 8)
-                            .map((sk) => (
-                              <span
-                                key={sk}
-                                className="px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300"
-                              >
-                                {sk}
+                              <span className="text-xs text-[#746e65]">
+                                {u?.graduationYear ? `Class of ${u.graduationYear}` : 'PES Student'}{' '}
+                                {u?.campus ? `· ${u.campus}` : ''}
                               </span>
-                            ))}
-                        </div>
-                      </div>
-                      <div>
-                        <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">
-                          Complementary Roles to Recruit
-                        </span>
-                        {teamCapabilities.missingRoles.length > 0 ? (
-                          <div className="flex flex-wrap gap-1">
-                            {teamCapabilities.missingRoles.map((role) => (
-                              <span
-                                key={role}
-                                className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 font-medium"
-                              >
-                                + {role}
-                              </span>
-                            ))}
+                            </div>
                           </div>
-                        ) : (
-                          <span className="text-emerald-700 dark:text-emerald-400 font-medium">
-                            All core roles covered!
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-[#f6f3f2] text-[#746e65] text-[11px] font-medium border border-[#e9e5dd]">
+                            <Lock className="w-3 h-3 text-[#746e65]" />
+                            <span>Locked</span>
                           </span>
+                        </div>
+
+                        <div className="pt-1">
+                          <span className="text-[10px] font-semibold text-[#746e65] uppercase tracking-wider block mb-0.5">
+                            Focus Area
+                          </span>
+                          <p className="text-xs font-semibold text-[#1c1b1b]">
+                            {m.role || p?.preferredRoles?.[0] || 'Full Stack Engineer'}
+                          </p>
+                        </div>
+
+                        {p && p.skillTags.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5 pt-1">
+                            {p.skillTags.slice(0, 4).map((skill) => (
+                              <span
+                                key={skill}
+                                className="px-2.5 py-1 rounded-full bg-[#f6f3f2] text-[#4d4634] text-[11px] font-medium border border-[#e9e5dd]/60"
+                              >
+                                {skill}
+                              </span>
+                            ))}
+                          </div>
                         )}
                       </div>
                     </div>
+                  );
+                })}
+
+                {/* Open Slots up to maxAllowedSize (e.g. Slot #4 Seeking Teammate) */}
+                {Array.from({ length: Math.max(0, maxAllowedSize - rosterMemberships.length) }).map((_, idx) => {
+                  const slotNum = rosterMemberships.length + idx + 1;
+                  const neededRole =
+                    selectedTeam.rolesNeeded?.[idx] ||
+                    teamCapabilities?.missingRoles?.[idx] ||
+                    'Teammate Needed';
+
+                  return (
+                    <div
+                      key={`open-slot-${slotNum}`}
+                      className="bg-white p-5 rounded-2xl flex flex-col justify-between shadow-xs border-2 border-dashed border-[#ffd84d] relative overflow-hidden space-y-3"
+                    >
+                      <div className="absolute inset-0 bg-[#ffd84d]/10 pointer-events-none" />
+                      <div className="relative z-10 space-y-3">
+                        <div className="flex items-start justify-between">
+                          <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 rounded-full bg-[#ffe07e]/40 flex items-center justify-center shrink-0 text-[#725c00]">
+                              <UserPlus className="w-5 h-5 text-[#725c00]" />
+                            </div>
+                            <div className="flex flex-col min-w-0">
+                              <span className="font-bold text-sm text-[#1c1b1b]">
+                                Slot #{slotNum} · Open
+                              </span>
+                              <span className="text-xs text-[#875200] font-medium">
+                                {neededRole}
+                              </span>
+                            </div>
+                          </div>
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-[#ffd84d] text-[#1c1b1b] text-[11px] font-bold">
+                            Seeking
+                          </span>
+                        </div>
+
+                        <div className="pt-1">
+                          <span className="text-[10px] font-semibold text-[#746e65] uppercase tracking-wider block mb-0.5">
+                            Target Focus
+                          </span>
+                          <p className="text-xs text-[#1c1b1b]">
+                            {selectedTeam.pitch || 'Looking for passionate PES students to complete our roster.'}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="mt-3 pt-3 border-t border-[#e9e5dd]/60 relative z-10 flex flex-wrap items-center justify-between gap-2">
+                        <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#f6f3f2] text-[#746e65] text-[11px] font-medium border border-[#e9e5dd]/60">
+                          <Clock className="w-3 h-3 text-[#746e65]" />
+                          <span>
+                            {activeProposalsForSelectedTeam.length > 0
+                              ? `${activeProposalsForSelectedTeam.length} invite pending review`
+                              : '0 invites pending'}
+                          </span>
+                        </div>
+                        {onOpenDiscover && (
+                          <button
+                            type="button"
+                            onClick={onOpenDiscover}
+                            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs shadow-xs transition-colors cursor-pointer"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            <span>Invite from Discover</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Roster Status Subtext */}
+              <div className="p-3 text-center rounded-xl bg-[#f6f3f2] border border-[#e9e5dd] text-xs text-[#746e65]">
+                Status: <span className="font-bold text-[#1c1b1b]">{registrationRecord?.registrationStatus === 'registered' ? 'Registered' : 'Forming'}</span> ({rosterMemberships.length}/{maxAllowedSize} members) → Next: <span className="font-bold text-[#1c1b1b]">{registrationRecord?.registrationStatus === 'registered' ? 'Ready for Hackathon Event Day' : 'Ready to Register. Hackathon registration requires final submission by Team Lead once team is full.'}</span>
+              </div>
+
+              {/* Inline Team Edit Form (if active) */}
+              {isEditingTeam && (
+                <form
+                  onSubmit={(e) => void handleSaveTeamEdit(e)}
+                  className="p-5 rounded-2xl bg-white border border-[#e9e5dd] space-y-3.5 text-xs shadow-xs"
+                >
+                  <h4 className="text-sm font-bold text-[#1c1b1b]">Edit Team Information</h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block font-semibold text-[#1c1b1b] mb-1">
+                        Team Name
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={editName}
+                        onChange={(e) => setEditName(e.target.value)}
+                        className="w-full px-3 py-2 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] text-xs text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-[#1c1b1b] mb-1">
+                        Team Pitch / Goal
+                      </label>
+                      <input
+                        type="text"
+                        value={editPitch}
+                        onChange={(e) => setEditPitch(e.target.value)}
+                        className="w-full px-3 py-2 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] text-xs text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-[#1c1b1b] mb-1">
+                      Project Idea / Problem Track
+                    </label>
+                    <input
+                      type="text"
+                      value={editProjectIdea}
+                      onChange={(e) => setEditProjectIdea(e.target.value)}
+                      placeholder="What problem statement or prototype are you building?"
+                      className="w-full px-3 py-2 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] text-xs text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                    />
+                  </div>
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsEditingTeam(false)}
+                      className="px-4 py-2 rounded-xl border border-[#e9e5dd] text-[#746e65] hover:text-[#1c1b1b] cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold cursor-pointer shadow-xs"
+                    >
+                      Save Changes
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* 2-Column Split: Governance / Capabilities / Proposals on Left, Team Chat on Right */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                {/* Left 7 Columns: Capabilities, Proposals, Registration, Governance */}
+                <div className="lg:col-span-7 space-y-5">
+                  {/* Combined Skills & Complementary Roles */}
+                  {teamCapabilities && (
+                    <div className="bg-white rounded-2xl border border-[#e9e5dd] p-5 space-y-3.5 shadow-xs">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-4 h-4 text-[#725c00]" />
+                        <h3 className="text-sm font-bold text-[#1c1b1b]">
+                          Team Skill Coverage &amp; Complementary Roles
+                        </h3>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                        <div>
+                          <span className="text-[11px] font-semibold text-[#746e65] uppercase tracking-wider block mb-1.5">
+                            Combined Team Skills
+                          </span>
+                          <div className="flex flex-wrap gap-1">
+                            {Array.from(teamCapabilities.combinedSkills)
+                              .slice(0, 8)
+                              .map((sk) => (
+                                <span
+                                  key={sk}
+                                  className="px-2 py-0.5 rounded-full bg-[#f6f3f2] text-[#4d4634] border border-[#e9e5dd]/60"
+                                >
+                                  {sk}
+                                </span>
+                              ))}
+                          </div>
+                        </div>
+                        <div>
+                          <span className="text-[11px] font-semibold text-[#746e65] uppercase tracking-wider block mb-1.5">
+                            Complementary Roles to Recruit
+                          </span>
+                          {teamCapabilities.missingRoles.length > 0 ? (
+                            <div className="flex flex-wrap gap-1">
+                              {teamCapabilities.missingRoles.map((role) => (
+                                <span
+                                  key={role}
+                                  className="px-2 py-0.5 rounded-full bg-[#fff3c9] border border-[#ffd84d] text-[#725c00] font-semibold"
+                                >
+                                  + {role}
+                                </span>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-[#137333] font-medium">
+                              All core roles covered!
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
                   )}
 
-                  {/* Leave Team Footer */}
+                  {/* Candidate Proposals & Unanimous Team Voting */}
+                  <div className="bg-white rounded-2xl border border-[#e9e5dd] p-5 space-y-3.5 shadow-xs">
+                    <div>
+                      <h3 className="text-sm font-bold text-[#1c1b1b] flex items-center gap-2">
+                        <Vote className="w-4 h-4 text-[#725c00]" />
+                        <span>
+                          Candidate Proposals &amp; Unanimous Team Voting ({activeProposalsForSelectedTeam.length})
+                        </span>
+                      </h3>
+                      <p className="text-xs text-[#746e65] mt-0.5">
+                        When a teammate and candidate match, a proposal is created. Every current member must vote to approve.
+                      </p>
+                    </div>
+
+                    {activeProposalsForSelectedTeam.length === 0 ? (
+                      <div className="p-4 rounded-xl bg-[#faf8f2] text-center text-xs text-[#746e65] border border-[#e9e5dd]">
+                        No active candidate proposals. Find and swipe on students in Discover to propose new teammates!
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {activeProposalsForSelectedTeam.map((prop) => {
+                          const candidateUser = users.find((u) => u.uid === prop.candidateUid);
+                          const candidateProf = profiles[prop.candidateUid];
+                          const proposerUser = users.find((u) => u.uid === prop.proposerUid);
+                          const approvedCount = prop.votes.filter((v) => v.decision === 'approve').length;
+                          const totalRequired = prop.requiredVoterUids.length;
+                          const myVote = prop.votes.find((v) => v.voterUid === currentUser.uid);
+
+                          return (
+                            <div
+                              key={prop.id}
+                              data-testid={`team-proposal-${prop.id}`}
+                              className="p-4 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] space-y-3 text-xs"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div>
+                                  <div className="font-bold text-sm text-[#1c1b1b]">
+                                    {candidateUser?.displayName ?? prop.candidateUid}
+                                  </div>
+                                  <div className="text-[#746e65]">
+                                    Proposed by {proposerUser?.displayName ?? prop.proposerUid} · Role: <strong>{prop.proposedRole}</strong>
+                                  </div>
+                                  {candidateProf && candidateProf.skillTags.length > 0 && (
+                                    <div className="flex flex-wrap gap-1 pt-1.5">
+                                      {candidateProf.skillTags.slice(0, 5).map((sk) => (
+                                        <span
+                                          key={sk}
+                                          className="px-2 py-0.5 rounded-full bg-white border border-[#e9e5dd] text-[11px] text-[#4d4634]"
+                                        >
+                                          {sk}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+
+                                <span
+                                  className={`px-2.5 py-1 rounded-full text-[11px] font-semibold shrink-0 ${
+                                    prop.status === 'invited'
+                                      ? 'bg-[#e6f4ea] text-[#137333] border border-[#ceead6]'
+                                      : 'bg-[#fff3c9] text-[#725c00] border border-[#ffd84d]'
+                                  }`}
+                                >
+                                  {prop.status === 'invited'
+                                    ? 'Unanimously Approved'
+                                    : `Pending Votes (${approvedCount}/${totalRequired})`}
+                                </span>
+                              </div>
+
+                              <div className="p-2.5 rounded-lg bg-white border border-[#e9e5dd] space-y-1 text-[11px]">
+                                <span className="font-semibold text-[#1c1b1b]">Team Member Votes:</span>
+                                <div className="flex flex-wrap gap-2">
+                                  {prop.requiredVoterUids.map((vUid) => {
+                                    const voter = users.find((u) => u.uid === vUid);
+                                    const vVote = prop.votes.find((v) => v.voterUid === vUid);
+                                    return (
+                                      <span
+                                        key={vUid}
+                                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded ${
+                                          vVote?.decision === 'approve'
+                                            ? 'bg-[#e6f4ea] text-[#137333]'
+                                            : vVote?.decision === 'reject'
+                                            ? 'bg-rose-50 text-rose-700'
+                                            : 'bg-[#f6f3f2] text-[#746e65]'
+                                        }`}
+                                      >
+                                        {vVote?.decision === 'approve' && <Check className="w-3 h-3 text-[#137333]" />}
+                                        {vVote?.decision === 'reject' && <X className="w-3 h-3 text-rose-700" />}
+                                        <span>{voter?.displayName ?? vUid}</span>
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+
+                              {prop.status === 'pending_votes' && onVoteTeamProposal && (
+                                <div className="flex items-center gap-2 pt-1 border-t border-[#e9e5dd]">
+                                  {myVote ? (
+                                    <span className="text-[11px] text-[#746e65]">
+                                      You voted: <strong className="capitalize">{myVote.decision}</strong>
+                                    </span>
+                                  ) : (
+                                    <>
+                                      <span className="text-[11px] text-[#746e65] mr-auto">Your vote is required:</span>
+                                      <button
+                                        type="button"
+                                        data-testid={`vote-approve-${prop.id}`}
+                                        onClick={() => void onVoteTeamProposal(prop.id, 'approve')}
+                                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs cursor-pointer shadow-xs"
+                                      >
+                                        <Check className="w-3.5 h-3.5" />
+                                        <span>Approve</span>
+                                      </button>
+                                      <button
+                                        type="button"
+                                        data-testid={`vote-reject-${prop.id}`}
+                                        onClick={() => void onVoteTeamProposal(prop.id, 'reject')}
+                                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-[#e9e5dd] hover:bg-rose-50 hover:text-rose-700 text-[#746e65] font-semibold text-xs cursor-pointer"
+                                      >
+                                        <X className="w-3.5 h-3.5" />
+                                        <span>Reject</span>
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Legacy Join Requests Fallback */}
+                  {pendingJoinRequests.length > 0 && (
+                    <div className="bg-white rounded-2xl border border-[#e9e5dd] p-5 space-y-3.5 shadow-xs">
+                      <div>
+                        <h3 className="text-sm font-bold text-[#1c1b1b] flex items-center gap-2">
+                          <UserCheck className="w-4 h-4 text-[#725c00]" />
+                          <span>Direct Join Requests ({pendingJoinRequests.length})</span>
+                        </h3>
+                        <p className="text-xs text-[#746e65] mt-0.5">
+                          Requests submitted before unanimous team matching was initialized.
+                        </p>
+                      </div>
+
+                      <div className="space-y-2.5">
+                        {pendingJoinRequests.map((req) => {
+                          const sender = users.find((u) => u.uid === req.applicantUid);
+                          const prof = profiles[req.applicantUid];
+
+                          return (
+                            <div
+                              key={req.id}
+                              className="p-3.5 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] flex items-center justify-between gap-3 text-xs"
+                            >
+                              <div>
+                                <span className="font-bold text-[#1c1b1b]">
+                                  {sender?.displayName ?? req.applicantUid}
+                                </span>
+                                <span className="text-[#746e65] ml-2">Role: {req.proposedRole}</span>
+                                {prof && prof.skillTags.length > 0 && (
+                                  <div className="flex flex-wrap gap-1 pt-1">
+                                    {prof.skillTags.slice(0, 3).map((sk) => (
+                                      <span key={sk} className="px-2 py-0.5 rounded-full bg-white border border-[#e9e5dd] text-[10px]">
+                                        {sk}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+
+                              {onResolveJoinRequest && (
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => onResolveJoinRequest(req.id, 'accept')}
+                                    className="px-3 py-1.5 rounded-lg bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs cursor-pointer shadow-xs"
+                                  >
+                                    Accept
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => onResolveJoinRequest(req.id, 'reject')}
+                                    className="px-3 py-1.5 rounded-lg border border-[#e9e5dd] hover:bg-rose-50 text-[#746e65] text-xs cursor-pointer"
+                                  >
+                                    Decline
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Hackathon Registration Readiness & Official Registration Tracker */}
+                  {registrationRecord && (
+                    <div
+                      data-testid="team-registration-card"
+                      className="bg-white rounded-2xl border border-[#e9e5dd] p-5 space-y-3.5 shadow-xs"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-bold text-[#1c1b1b] flex items-center gap-2">
+                            <ClipboardCheck className="w-4 h-4 text-[#137333]" />
+                            <span>Hackathon Registration Readiness</span>
+                          </h3>
+                          <p className="text-xs text-[#746e65] mt-0.5">
+                            {registrationRecord.eligibilityReason}
+                          </p>
+                        </div>
+
+                        <span
+                          className={`px-2.5 py-1 rounded-full border text-xs font-semibold shrink-0 ${
+                            REGISTRATION_STATUS_LABELS[registrationRecord.registrationStatus].badgeClass
+                          }`}
+                        >
+                          {REGISTRATION_STATUS_LABELS[registrationRecord.registrationStatus].label}
+                        </span>
+                      </div>
+
+                      {registrationRecord.externalRegistrationReference && (
+                        <div className="p-3 rounded-xl bg-[#faf8f2] border border-[#e9e5dd] text-xs space-y-0.5">
+                          <div className="font-semibold text-[#1c1b1b] flex items-center gap-1.5">
+                            <ShieldCheck className="w-4 h-4 text-[#725c00]" />
+                            <span>
+                              Registration Reference: {registrationRecord.externalRegistrationReference}
+                            </span>
+                          </div>
+                          {registrationRecord.confirmationNotes && (
+                            <p className="text-[#746e65]">
+                              {registrationRecord.confirmationNotes}
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#e9e5dd] text-xs">
+                        {registrationRecord.officialRegistrationUrl ? (
+                          <a
+                            href={registrationRecord.officialRegistrationUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#1c1b1b] text-white font-semibold hover:opacity-90"
+                          >
+                            <span>Open Event Registration Portal</span>
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        ) : (
+                          <span className="text-[#746e65]">
+                            Registration portal link pending.
+                          </span>
+                        )}
+
+                        {onUpdateTeamRegistration &&
+                          selectedTeam.leaderId === currentUser.uid &&
+                          registrationRecord.registrationStatus !== 'registered' && (
+                            <button
+                              type="button"
+                              data-testid="open-mark-registered-btn"
+                              onClick={() => setShowRegForm(!showRegForm)}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold shadow-xs cursor-pointer"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              <span>Submit Registration Confirmation</span>
+                            </button>
+                          )}
+                      </div>
+
+                      {showRegForm && onUpdateTeamRegistration && (
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            void onUpdateTeamRegistration(selectedTeam.id, {
+                              registrationStatus: 'registered',
+                              externalRegistrationReference: regReferenceInput.trim() || null,
+                              confirmationNotes: regNotesInput.trim() || null,
+                            });
+                            setShowRegForm(false);
+                          }}
+                          className="p-4 rounded-xl bg-[#faf8f2] border border-[#ffd84d] space-y-3 text-xs"
+                        >
+                          <h4 className="font-bold text-[#1c1b1b]">
+                            Confirm Official Hackathon Registration
+                          </h4>
+                          <div>
+                            <label className="block text-[#1c1b1b] font-medium mb-1">
+                              Confirmation ID / Team Reference Number
+                            </label>
+                            <input
+                              type="text"
+                              value={regReferenceInput}
+                              onChange={(e) => setRegReferenceInput(e.target.value)}
+                              placeholder="e.g. PES-HACK-8842"
+                              className="w-full px-3 py-1.5 rounded-lg border border-[#e9e5dd] bg-white text-xs text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[#1c1b1b] font-medium mb-1">
+                              Confirmation Notes (Optional)
+                            </label>
+                            <input
+                              type="text"
+                              value={regNotesInput}
+                              onChange={(e) => setRegNotesInput(e.target.value)}
+                              placeholder="e.g. Verified by Hackathon Lead"
+                              className="w-full px-3 py-1.5 rounded-lg border border-[#e9e5dd] bg-white text-xs text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                            />
+                          </div>
+                          <div className="flex items-center justify-end gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => setShowRegForm(false)}
+                              className="px-3 py-1.5 rounded-lg border border-[#e9e5dd] text-[#746e65] cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="submit"
+                              data-testid="confirm-mark-registered-btn"
+                              className="px-3.5 py-1.5 rounded-lg bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold cursor-pointer"
+                            >
+                              Lock &amp; Confirm Registered
+                            </button>
+                          </div>
+                        </form>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Leave Team Button */}
                   {onLeaveTeam && (
-                    <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 text-xs">
-                      <span className="text-slate-400">
+                    <div className="p-4 rounded-2xl bg-white border border-[#e9e5dd] flex items-center justify-between gap-3 text-xs shadow-xs">
+                      <span className="text-[#746e65]">
                         {registrationRecord?.registrationStatus === 'registered'
-                          ? 'Roster is locked because the team is marked as officially registered.'
+                          ? 'Roster locked because team is officially registered.'
                           : 'Need to switch teams? Leaving reopens your discovery feed.'}
                       </span>
                       <button
                         type="button"
                         data-testid="leave-team-btn"
-                        disabled={
-                          registrationRecord?.registrationStatus ===
-                          'registered'
-                        }
+                        disabled={registrationRecord?.registrationStatus === 'registered'}
                         onClick={() => void onLeaveTeam(selectedTeam.id)}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900/60 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/40 font-medium cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-rose-200 text-rose-700 hover:bg-rose-50 font-semibold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
                       >
                         <LogOut className="w-3.5 h-3.5" />
                         <span>Leave Team</span>
@@ -833,500 +1222,87 @@ export const TeamsAndRequestsView: React.FC<TeamsAndRequestsViewProps> =
                   )}
                 </div>
 
-                {/* 2. Pending Candidate Proposals & Unanimous Member Voting */}
-                <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 space-y-3.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                        <Vote className="w-4 h-4 text-blue-600" />
-                        <span>
-                          Candidate Proposals & Unanimous Team Voting (
-                          {activeProposalsForSelectedTeam.length})
-                        </span>
-                      </h3>
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        When a team member and a student mutually swipe right, a
-                        proposal is created here. Every current team member must
-                        approve before the candidate is invited.
-                      </p>
+                {/* Right 5 Columns: Embedded Team Group Chat */}
+                <div className="lg:col-span-5">
+                  <div
+                    data-testid="team-chat-panel"
+                    className="bg-white rounded-2xl border border-[#e9e5dd] flex flex-col h-[600px] shadow-xs overflow-hidden"
+                  >
+                    <div className="p-4 border-b border-[#e9e5dd] flex items-center justify-between gap-2 bg-white">
+                      <div>
+                        <h3 className="text-sm font-bold text-[#1c1b1b] flex items-center gap-2">
+                          <MessageSquare className="w-4 h-4 text-[#725c00]" />
+                          <span>Team Chat · {selectedTeam.name.split(' (')[0]}</span>
+                        </h3>
+                        <p className="text-[11px] text-[#746e65]">
+                          Private to your {rosterMemberships.length} active team members
+                        </p>
+                      </div>
                     </div>
-                  </div>
 
-                  {activeProposalsForSelectedTeam.length === 0 ? (
-                    <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/40 text-center text-xs text-slate-500">
-                      No active candidate proposals right now. Swipe right on
-                      students in Discover to propose new teammates!
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      {activeProposalsForSelectedTeam.map((prop) => {
-                        const candidateUser = users.find(
-                          (u) => u.uid === prop.candidateUid
-                        );
-                        const candidateProf = profiles[prop.candidateUid];
-                        const proposerUser = users.find(
-                          (u) => u.uid === prop.proposerUid
-                        );
-                        const approvedCount = prop.votes.filter(
-                          (v) => v.decision === 'approve'
-                        ).length;
-                        const totalRequired = prop.requiredVoterUids.length;
-                        const myVote = prop.votes.find(
-                          (v) => v.voterUid === currentUser.uid
-                        );
-
-                        return (
-                          <div
-                            key={prop.id}
-                            data-testid={`team-proposal-${prop.id}`}
-                            className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 space-y-3 text-xs"
-                          >
-                            <div className="flex items-start justify-between gap-2">
-                              <div>
-                                <div className="font-bold text-sm text-slate-900 dark:text-slate-100">
-                                  {candidateUser?.displayName ??
-                                    prop.candidateUid}
-                                </div>
-                                <div className="text-slate-500">
-                                  Proposed by{' '}
-                                  {proposerUser?.displayName ??
-                                    prop.proposerUid}{' '}
-                                  · Role: <strong>{prop.proposedRole}</strong>
-                                </div>
-                                {candidateProf &&
-                                  candidateProf.skillTags.length > 0 && (
-                                    <div className="flex flex-wrap gap-1 pt-1.5">
-                                      {candidateProf.skillTags
-                                        .slice(0, 6)
-                                        .map((sk) => (
-                                          <span
-                                            key={sk}
-                                            className="px-2 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[11px]"
-                                          >
-                                            {sk}
-                                          </span>
-                                        ))}
-                                    </div>
-                                  )}
-                              </div>
-
-                              <span
-                                className={`px-2.5 py-1 rounded-lg font-mono text-[11px] font-semibold shrink-0 ${
-                                  prop.status === 'invited'
-                                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-300'
-                                    : 'bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/60 dark:text-blue-300'
-                                }`}
-                              >
-                                {prop.status === 'invited'
-                                  ? 'Invited · Awaiting Candidate'
-                                  : `${approvedCount}/${totalRequired} Approved`}
-                              </span>
-                            </div>
-
-                            {/* Member Vote Breakdown */}
-                            <div className="flex flex-wrap items-center gap-2 pt-1">
-                              {prop.requiredVoterUids.map((voterUid) => {
-                                const voter = users.find(
-                                  (u) => u.uid === voterUid
-                                );
-                                const voteObj = prop.votes.find(
-                                  (v) => v.voterUid === voterUid
-                                );
-                                return (
-                                  <span
-                                    key={voterUid}
-                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${
-                                      voteObj?.decision === 'approve'
-                                        ? 'bg-emerald-100/80 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-300'
-                                        : 'bg-slate-200/70 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
-                                    }`}
-                                  >
-                                    {voteObj?.decision === 'approve' ? (
-                                      <CheckCircle2 className="w-3 h-3" />
-                                    ) : null}
-                                    <span>
-                                      {(voter?.displayName ?? voterUid).split(
-                                        ' '
-                                      )[0]}
-                                      :{' '}
-                                      {voteObj?.decision === 'approve'
-                                        ? 'Approved'
-                                        : 'Pending'}
-                                    </span>
-                                  </span>
-                                );
-                              })}
-                            </div>
-
-                            {/* Vote Buttons for Current Member */}
-                            {prop.status === 'pending_votes' &&
-                              onVoteTeamProposal && (
-                                <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-200/70 dark:border-slate-800">
-                                  <span className="text-slate-500">
-                                    {myVote?.decision === 'approve'
-                                      ? 'You approved this candidate. Waiting for remaining teammates.'
-                                      : 'Your vote is required to invite this candidate:'}
-                                  </span>
-                                  <div className="flex items-center gap-2">
-                                    {myVote?.decision !== 'approve' && (
-                                      <button
-                                        type="button"
-                                        data-testid={`approve-proposal-${prop.id}`}
-                                        onClick={() =>
-                                          void onVoteTeamProposal(
-                                            prop.id,
-                                            'approve'
-                                          )
-                                        }
-                                        className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer"
-                                      >
-                                        <UserCheck className="w-3.5 h-3.5" />
-                                        <span>Approve</span>
-                                      </button>
-                                    )}
-                                    <button
-                                      type="button"
-                                      data-testid={`reject-proposal-${prop.id}`}
-                                      onClick={() =>
-                                        void onVoteTeamProposal(
-                                          prop.id,
-                                          'reject'
-                                        )
-                                      }
-                                      className="px-3 py-1.5 rounded-lg border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 hover:bg-rose-50 font-medium inline-flex items-center gap-1 cursor-pointer"
-                                    >
-                                      <X className="w-3.5 h-3.5" />
-                                      <span>Reject</span>
-                                    </button>
-                                  </div>
-                                </div>
-                              )}
+                    {/* Messages Feed */}
+                    <div className="flex-1 p-4 overflow-y-auto space-y-2.5 bg-[#faf8f2]">
+                      {teamChatMessages.length === 0 ? (
+                        <div className="h-full flex flex-col items-center justify-center text-center text-xs text-[#746e65] space-y-2">
+                          <div className="w-10 h-10 rounded-full bg-[#ffd84d]/30 flex items-center justify-center text-[#725c00]">
+                            <MessageSquare className="w-5 h-5 text-[#725c00]" />
                           </div>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {resolvedProposalsForSelectedTeam.length > 0 && (
-                    <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1 text-xs">
-                      <span className="text-[11px] font-semibold text-slate-400">
-                        Past Proposal Outcomes
-                      </span>
-                      {resolvedProposalsForSelectedTeam
-                        .slice(0, 4)
-                        .map((prop) => {
-                          const candidate = users.find(
-                            (u) => u.uid === prop.candidateUid
-                          );
+                          <p>Say hello to your teammates and plan your hackathon project!</p>
+                        </div>
+                      ) : (
+                        teamChatMessages.map((msg) => {
+                          const isMe = msg.senderUid === currentUser.uid;
+                          const sender = users.find((u) => u.uid === msg.senderUid);
                           return (
                             <div
-                              key={prop.id}
-                              className="flex items-center justify-between text-slate-500 py-0.5"
+                              key={msg.id}
+                              className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}
                             >
-                              <span>
-                                {candidate?.displayName ?? prop.candidateUid}
-                              </span>
-                              <span className="capitalize font-medium">
-                                {prop.status.replace(/_/g, ' ')}
+                              <div
+                                className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-xs leading-relaxed ${
+                                  isMe
+                                    ? 'bg-[#ffd84d] text-[#1c1b1b] rounded-tr-xs font-medium shadow-2xs'
+                                    : 'bg-white text-[#1c1b1b] rounded-tl-xs border border-[#e9e5dd] shadow-2xs'
+                                }`}
+                              >
+                                {msg.body}
+                              </div>
+                              <span className="text-[10px] text-[#746e65] mt-0.5 px-1">
+                                {sender?.displayName ?? msg.senderUid} ·{' '}
+                                {new Date(msg.createdAt).toLocaleTimeString([], {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}
                               </span>
                             </div>
                           );
-                        })}
-                    </div>
-                  )}
-
-                  {/* Legacy Join Requests Fallback */}
-                  {pendingJoinRequests.length > 0 && onResolveJoinRequest && (
-                    <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2">
-                      <span className="text-xs font-semibold text-slate-500 block">
-                        Direct Join Requests ({pendingJoinRequests.length})
-                      </span>
-                      {pendingJoinRequests.map((req) => {
-                        const applicant = users.find(
-                          (u) => u.uid === req.applicantUid
-                        );
-                        return (
-                          <div
-                            key={req.id}
-                            className="p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50 flex items-center justify-between gap-2 text-xs"
-                          >
-                            <span>
-                              <strong>
-                                {applicant?.displayName ?? req.applicantUid}
-                              </strong>{' '}
-                              ({req.proposedRole})
-                            </span>
-                            <div className="flex items-center gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  onResolveJoinRequest(req.id, 'accept')
-                                }
-                                className="px-2.5 py-1 rounded bg-blue-600 text-white font-semibold cursor-pointer"
-                              >
-                                Accept
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  onResolveJoinRequest(req.id, 'reject')
-                                }
-                                className="px-2.5 py-1 rounded border border-slate-300 text-slate-600 cursor-pointer"
-                              >
-                                Reject
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-
-                {/* 3. Hackathon Registration Readiness & Official Registration Tracker (Part E) */}
-                {registrationRecord && (
-                  <div
-                    data-testid="team-registration-card"
-                    className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 space-y-3.5"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                          <ClipboardCheck className="w-4 h-4 text-emerald-600" />
-                          <span>Hackathon Registration Readiness</span>
-                        </h3>
-                        <p className="text-xs text-slate-500 mt-0.5">
-                          {registrationRecord.eligibilityReason}
-                        </p>
-                      </div>
-
-                      <span
-                        className={`px-2.5 py-1 rounded-lg border text-xs font-semibold shrink-0 ${
-                          REGISTRATION_STATUS_LABELS[
-                            registrationRecord.registrationStatus
-                          ].badgeClass
-                        }`}
-                      >
-                        {
-                          REGISTRATION_STATUS_LABELS[
-                            registrationRecord.registrationStatus
-                          ].label
-                        }
-                      </span>
-                    </div>
-
-                    {registrationRecord.externalRegistrationReference && (
-                      <div className="p-3 rounded-lg bg-indigo-50/60 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-900 text-xs space-y-0.5">
-                        <div className="font-semibold text-indigo-950 dark:text-indigo-200 flex items-center gap-1.5">
-                          <ShieldCheck className="w-4 h-4 text-indigo-600" />
-                          <span>
-                            Registration Reference:{' '}
-                            {registrationRecord.externalRegistrationReference}
-                          </span>
-                        </div>
-                        {registrationRecord.confirmationNotes && (
-                          <p className="text-slate-600 dark:text-slate-300">
-                            {registrationRecord.confirmationNotes}
-                          </p>
-                        )}
-                      </div>
-                    )}
-
-                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800 text-xs">
-                      {registrationRecord.officialRegistrationUrl ? (
-                        <a
-                          href={registrationRecord.officialRegistrationUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 font-semibold hover:opacity-90"
-                        >
-                          <span>Open Official Event Registration Page</span>
-                          <ExternalLink className="w-3.5 h-3.5" />
-                        </a>
-                      ) : (
-                        <span className="text-slate-400">
-                          Official registration URL not yet published on event
-                          listing.
-                        </span>
-                      )}
-
-                      {onUpdateTeamRegistration && (
-                        <div className="flex flex-wrap items-center gap-2">
-                          {registrationRecord.eligibleToRegister &&
-                            registrationRecord.registrationStatus !==
-                              'registered' && (
-                              <button
-                                type="button"
-                                data-testid="open-mark-registered-btn"
-                                onClick={() => setShowRegForm(!showRegForm)}
-                                className="px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold cursor-pointer"
-                              >
-                                {showRegForm
-                                  ? 'Cancel'
-                                  : 'Record Official Registration'}
-                              </button>
-                            )}
-
-                          {registrationRecord.registrationStatus ===
-                            'registered' && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                void onUpdateTeamRegistration(selectedTeam.id, {
-                                  registrationStatus: 'ready_to_register',
-                                })
-                              }
-                              className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 cursor-pointer"
-                            >
-                              Unlock / Amend Registration
-                            </button>
-                          )}
-                        </div>
+                        })
                       )}
                     </div>
 
-                    {showRegForm && onUpdateTeamRegistration && (
-                      <form
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          void onUpdateTeamRegistration(selectedTeam.id, {
-                            registrationStatus: 'registered',
-                            externalRegistrationReference:
-                              regReferenceInput.trim() || null,
-                            confirmationNotes: regNotesInput.trim() || null,
-                          });
-                          setShowRegForm(false);
-                        }}
-                        className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2.5 text-xs"
-                      >
-                        <div>
-                          <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                            External Registration ID / Team Code (Optional)
-                          </label>
-                          <input
-                            type="text"
-                            value={regReferenceInput}
-                            onChange={(e) =>
-                              setRegReferenceInput(e.target.value)
-                            }
-                            placeholder="e.g., UNSTOP-2026-9941 or Devfolio Team Link"
-                            className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                          />
-                        </div>
-                        <div>
-                          <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                            Confirmation Notes (Optional)
-                          </label>
-                          <input
-                            type="text"
-                            value={regNotesInput}
-                            onChange={(e) => setRegNotesInput(e.target.value)}
-                            placeholder="e.g., Submitted by team lead on official portal"
-                            className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
-                          />
-                        </div>
-                        <div className="flex justify-end">
-                          <button
-                            type="submit"
-                            data-testid="confirm-mark-registered-btn"
-                            className="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold cursor-pointer"
-                          >
-                            Confirm Team Registered
-                          </button>
-                        </div>
-                      </form>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Right 5 Columns: Embedded Team Group Chat (Part D.3) */}
-              <div className="lg:col-span-5">
-                <div
-                  data-testid="team-chat-panel"
-                  className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 flex flex-col h-[580px]"
-                >
-                  <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-                    <div>
-                      <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                        <MessageSquare className="w-4 h-4 text-blue-600" />
-                        <span>Team Chat · {selectedTeam.name.split(' (')[0]}</span>
-                      </h3>
-                      <p className="text-[11px] text-slate-500">
-                        Private to your {rosterMemberships.length} active team
-                        members · Auto-syncs every 4s
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Persistent Team Messages Feed */}
-                  <div className="flex-1 p-4 overflow-y-auto space-y-2.5 bg-slate-50/40 dark:bg-slate-950/30">
-                    {teamChatMessages.length === 0 ? (
-                      <div className="h-full flex flex-col items-center justify-center text-center text-xs text-slate-400 space-y-1">
-                        <MessageSquare className="w-6 h-6 text-slate-300" />
-                        <p>
-                          Say hello to your teammates and coordinate your
-                          hackathon problem track!
-                        </p>
-                      </div>
-                    ) : (
-                      teamChatMessages.map((msg) => {
-                        const isMe = msg.senderUid === currentUser.uid;
-                        const sender = users.find(
-                          (u) => u.uid === msg.senderUid
-                        );
-                        return (
-                          <div
-                            key={msg.id}
-                            className={`flex flex-col ${
-                              isMe ? 'items-end' : 'items-start'
-                            }`}
-                          >
-                            <div
-                              className={`max-w-[85%] rounded-xl px-3.5 py-2 text-xs leading-relaxed ${
-                                isMe
-                                  ? 'bg-blue-600 text-white'
-                                  : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-200'
-                              }`}
-                            >
-                              {msg.body}
-                            </div>
-                            <span className="text-[10px] text-slate-400 mt-0.5 px-1">
-                              {sender?.displayName ?? msg.senderUid} ·{' '}
-                              {new Date(msg.createdAt).toLocaleTimeString([], {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                              })}
-                            </span>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-
-                  {/* Team Chat Composer */}
-                  <form
-                    onSubmit={(e) => void handleSendChat(e)}
-                    className="p-3 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center gap-2"
-                  >
-                    <input
-                      type="text"
-                      data-testid="team-chat-input"
-                      value={chatDraft}
-                      onChange={(e) => setChatDraft(e.target.value)}
-                      placeholder="Message your team..."
-                      className="flex-1 px-3.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs text-slate-900 dark:text-slate-100"
-                    />
-                    <button
-                      type="submit"
-                      data-testid="team-chat-send-btn"
-                      disabled={!chatDraft.trim() || sendingChat}
-                      className="px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    {/* Team Chat Composer */}
+                    <form
+                      onSubmit={(e) => void handleSendChat(e)}
+                      className="p-3 border-t border-[#e9e5dd] bg-white flex items-center gap-2"
                     >
-                      <Send className="w-3.5 h-3.5" />
-                      <span>Send</span>
-                    </button>
-                  </form>
+                      <input
+                        type="text"
+                        data-testid="team-chat-input"
+                        value={chatDraft}
+                        onChange={(e) => setChatDraft(e.target.value)}
+                        placeholder="Message your team..."
+                        className="flex-1 bg-[#faf8f2] border border-[#e9e5dd] rounded-xl px-4 py-2 text-xs text-[#1c1b1b] placeholder:text-[#746e65] focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                      />
+                      <button
+                        type="submit"
+                        data-testid="team-chat-send-btn"
+                        disabled={!chatDraft.trim() || sendingChat}
+                        className="px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs shadow-xs transition-colors cursor-pointer disabled:opacity-40"
+                      >
+                        <Send className="w-3.5 h-3.5" />
+                      </button>
+                    </form>
+                  </div>
                 </div>
               </div>
             </div>
