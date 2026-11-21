@@ -3,7 +3,6 @@ import {
   CampusType,
   EventCandidate,
   EventSourceType,
-  EventType,
   ExecutionMode,
   Hackathon,
   PrivateAcademyHint,
@@ -11,10 +10,7 @@ import {
   SourceUrlVerificationStatus,
   User,
 } from '../types/domain';
-import {
-  PesuAnnouncementsResponse,
-  PesuPublicEventsSyncResponse,
-} from '../types/apiContracts';
+import { PesuPublicEventsSyncResponse } from '../types/apiContracts';
 import {
   classifyEventCandidateText,
   extractLiveEventFileMetadata,
@@ -24,41 +20,34 @@ import {
   verifyLiveEventUrl,
 } from '../services/adapters';
 import {
-  buildSanitizedCandidateDraftFromAnnouncement,
-  detectTechnicalEventFromAnnouncement,
-  filterAnnouncementsByPublicationDate,
-  filterAndSortEventsByTime,
   formatEventDateDisplayIST,
   formatEventTypeCategoryLabel,
-  getHackathonSourceLabel,
   getTodayDateStringIST,
-  getVerifiableRegistrationStatus,
-  isEligibleTeamHackathonCatalogEvent,
-  NormalizedPesuAnnouncement,
   resolveHackathonSourceCategory,
-  TimeFilterPreset,
-  UnifiedEventSourceFilter,
 } from '../lib/eventsAndAnnouncements';
+import {
+  describeHackathonRegistrationDetail,
+  filterUpcomingStudentHackathons,
+  paginateItems,
+} from '../lib/pagination';
+import { isHackathonEligibleForMatching } from '../services/matchingEngine';
 import { apiFetch } from '../lib/apiClient';
+import { Modal } from './Modal';
+import { SelectMenu, SelectMenuOption } from './SelectMenu';
+import { QUACKATHON_MINI_LOGO_SRC } from './LoginPage';
 import {
   AlertTriangle,
   Calendar,
-  CheckCircle2,
-  Clock,
+  ChevronLeft,
+  ChevronRight,
   ExternalLink,
   FileText,
-  Filter,
-  Globe,
   Info,
   Link2,
   Loader2,
-  Lock,
   MapPin,
   Plus,
-  RefreshCw,
   Search,
-  ShieldCheck,
-  Sparkles,
   Upload,
   Users,
   XCircle,
@@ -81,129 +70,32 @@ interface HackathonsViewProps {
   onNotify?: (message: string) => void;
 }
 
-interface PersistedEventsFilterState {
-  sourceFilter: UnifiedEventSourceFilter;
-  timePreset: TimeFilterPreset;
-  customStart: string;
-  customEnd: string;
-  openRegistrationOnly: boolean;
-  campusFilter: CampusType | 'ALL';
-  searchQuery: string;
-}
+const PAGE_SIZE = 10;
 
-const FILTER_STORAGE_KEY = 'quackathon_events_filters_v1';
-
-function loadPersistedFilterState(): PersistedEventsFilterState {
-  const defaults: PersistedEventsFilterState = {
-    sourceFilter: 'ALL_PUBLISHED',
-    timePreset: 'UPCOMING',
-    customStart: '',
-    customEnd: '',
-    openRegistrationOnly: false,
-    campusFilter: 'ALL',
-    searchQuery: '',
-  };
-  if (typeof window === 'undefined') return defaults;
-  try {
-    const raw = sessionStorage.getItem(FILTER_STORAGE_KEY);
-    if (!raw) return defaults;
-    const parsed = JSON.parse(raw) as Partial<PersistedEventsFilterState>;
-    const normalizedSource: UnifiedEventSourceFilter =
-      parsed.sourceFilter === 'MY_ACADEMY' ? 'MY_ACADEMY' : 'ALL_PUBLISHED';
-    const validPresets: TimeFilterPreset[] = [
-      'UPCOMING',
-      'THIS_WEEK',
-      'THIS_MONTH',
-      'PAST',
-      'ALL',
-    ];
-    const normalizedTime: TimeFilterPreset =
-      parsed.timePreset && validPresets.includes(parsed.timePreset)
-        ? parsed.timePreset
-        : defaults.timePreset;
-    return {
-      sourceFilter: normalizedSource,
-      timePreset: normalizedTime,
-      customStart: '',
-      customEnd: '',
-      openRegistrationOnly: false,
-      campusFilter: parsed.campusFilter ?? defaults.campusFilter,
-      searchQuery: parsed.searchQuery ?? defaults.searchQuery,
-    };
-  } catch {
-    return defaults;
-  }
-}
+const CAMPUS_OPTIONS: SelectMenuOption[] = [
+  { value: 'ALL', label: 'All PESU Campuses' },
+  { value: 'RR Campus', label: 'RR Campus' },
+  { value: 'EC Campus', label: 'EC Campus' },
+  { value: 'Online / Multi-Campus', label: 'Online / Multi-Campus' },
+];
 
 export const HackathonsView: React.FC<HackathonsViewProps> = ({
   currentUser,
-  currentProfile,
   executionMode,
   hackathons,
   onSelectHackathonForDiscovery,
   onSubmitEventCandidate,
-  onSaveProfile,
-  onConnectPesuAcademy,
   onRefreshCatalog,
   onNotify,
 }) => {
-  const initialFilters = useMemo(() => loadPersistedFilterState(), []);
-
-  const [sourceFilter, setSourceFilter] = useState<UnifiedEventSourceFilter>(
-    initialFilters.sourceFilter
-  );
-  const [timePreset, setTimePreset] = useState<TimeFilterPreset>(
-    initialFilters.timePreset
-  );
-  const [customStart, setCustomStart] = useState<string>(
-    initialFilters.customStart
-  );
-  const [customEnd, setCustomEnd] = useState<string>(initialFilters.customEnd);
-  const [openRegistrationOnly, setOpenRegistrationOnly] = useState<boolean>(
-    initialFilters.openRegistrationOnly
-  );
-  const [campusFilter, setCampusFilter] = useState<CampusType | 'ALL'>(
-    initialFilters.campusFilter
-  );
-  const [searchQuery, setSearchQuery] = useState(initialFilters.searchQuery);
+  const [campusFilter, setCampusFilter] = useState<CampusType | 'ALL'>('ALL');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
   const [selectedDetailHackathon, setSelectedDetailHackathon] =
     useState<Hackathon | null>(null);
 
-  // Persist filter selections in sessionStorage while navigating within the page
-  useEffect(() => {
-    try {
-      const toStore: PersistedEventsFilterState = {
-        sourceFilter,
-        timePreset,
-        customStart,
-        customEnd,
-        openRegistrationOnly,
-        campusFilter,
-        searchQuery,
-      };
-      sessionStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(toStore));
-    } catch {
-      // ignore storage errors
-    }
-  }, [
-    sourceFilter,
-    timePreset,
-    customStart,
-    customEnd,
-    openRegistrationOnly,
-    campusFilter,
-    searchQuery,
-  ]);
-
-  // Public PESU Events (`events.pes.edu`) Live Sync State
+  // Public PESU Events (`events.pes.edu`) Auto-Sync on cold start
   const [isSyncingPesuPublic, setIsSyncingPesuPublic] = useState(false);
-  const [lastPublicSyncMeta, setLastPublicSyncMeta] = useState<{
-    fetchedAt: string;
-    discoveredCount: number;
-    reachablePagesCount: number;
-    userMessage: string;
-    ok: boolean;
-  } | null>(null);
   const didAutoSyncPublicRef = useRef(false);
 
   const handleSyncPesuPublicEvents = useCallback(
@@ -218,27 +110,11 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
           body: { forceRefresh },
           timeoutMs: 25000,
         });
-        if (res.data) {
-          setLastPublicSyncMeta({
-            fetchedAt: res.data.fetchedAt || new Date().toISOString(),
-            discoveredCount: res.data.discoveredCount ?? 0,
-            reachablePagesCount: res.data.reachablePagesCount ?? 0,
-            userMessage:
-              res.data.userMessage || 'Checked events.pes.edu public listings.',
-            ok: Boolean(res.data.ok),
-          });
-        }
         if (res.ok && onRefreshCatalog) {
           await onRefreshCatalog();
         }
       } catch {
-        setLastPublicSyncMeta({
-          fetchedAt: new Date().toISOString(),
-          discoveredCount: 0,
-          reachablePagesCount: 0,
-          userMessage: 'Could not reach events.pes.edu at this moment.',
-          ok: false,
-        });
+        // Silent fallback: keep live catalog intact
       } finally {
         setIsSyncingPesuPublic(false);
       }
@@ -246,7 +122,6 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
     [isSyncingPesuPublic, onRefreshCatalog]
   );
 
-  // Auto-sync public PESU events on initial load if none of the published events come from events.pes.edu yet
   useEffect(() => {
     if (didAutoSyncPublicRef.current || executionMode !== 'live') return;
     const hasPesuPublicEvents = hackathons.some(
@@ -257,145 +132,6 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
       void handleSyncPesuPublicEvents(false);
     }
   }, [executionMode, hackathons, handleSyncPesuPublicEvents]);
-
-  // PESU Academy Announcements State (Strictly Private & Consent-Gated)
-  const [academyAnnouncements, setAcademyAnnouncements] = useState<
-    NormalizedPesuAnnouncement[]
-  >([]);
-  const [isLoadingAnnouncements, setIsLoadingAnnouncements] = useState(false);
-  const [announcementsResponseState, setAnnouncementsResponseState] = useState<{
-    loaded: boolean;
-    ok: boolean;
-    errorCode?: PesuAnnouncementsResponse['errorCode'];
-    requiresOptIn?: boolean;
-    requiresScopeGrant?: boolean;
-    requiresReauth?: boolean;
-    grantedScopes?: string[];
-    fetchedAt?: string;
-    userMessage?: string;
-  }>({
-    loaded: false,
-    ok: false,
-  });
-  const [isSavingOptIn, setIsSavingOptIn] = useState(false);
-  const [includeSanitizedSummaryById, setIncludeSanitizedSummaryById] =
-    useState<Record<string, boolean>>({});
-
-  const fetchAcademyAnnouncements = useCallback(
-    async (forceRefresh = false) => {
-      if (!currentUser.privacyPreferences.academyAnnouncementsOptIn) {
-        setAcademyAnnouncements([]);
-        setAnnouncementsResponseState({
-          loaded: true,
-          ok: false,
-          errorCode: 'OPT_IN_REQUIRED',
-          requiresOptIn: true,
-          userMessage:
-            'PESU Academy announcement retrieval is disabled by default. Review the delegated access disclosure below and opt in to connect.',
-        });
-        return;
-      }
-
-      setIsLoadingAnnouncements(true);
-      try {
-        const query = forceRefresh ? '?refresh=true' : '';
-        const res = await apiFetch<PesuAnnouncementsResponse>(
-          `/api/pesu/announcements${query}`,
-          { timeoutMs: 15000 }
-        );
-        const data = res.data;
-
-        if (res.ok && data?.ok && Array.isArray(data.announcements)) {
-          setAcademyAnnouncements(
-            data.announcements.map((a) => ({
-              id: String(a.id),
-              title: a.title || 'Untitled PESU Announcement',
-              date: a.date ?? null,
-              description: a.description || '',
-              image: a.image ?? null,
-              attachments: typeof a.attachments === 'number' ? a.attachments : 0,
-            }))
-          );
-          setAnnouncementsResponseState({
-            loaded: true,
-            ok: true,
-            fetchedAt: data.fetchedAt || new Date().toISOString(),
-            grantedScopes: data.grantedScopes,
-            userMessage:
-              data.userMessage ||
-              `Retrieved ${data.announcements.length} announcement(s).`,
-          });
-        } else {
-          setAcademyAnnouncements([]);
-          const isProxyHtml403 = Boolean(res.isHtmlResponse && res.status === 403);
-          setAnnouncementsResponseState({
-            loaded: true,
-            ok: false,
-            errorCode: isProxyHtml403
-              ? 'PROXY_FORBIDDEN_HTML'
-              : data?.errorCode || 'PROVIDER_UNAVAILABLE',
-            requiresOptIn: data?.requiresOptIn,
-            requiresScopeGrant: data?.requiresScopeGrant,
-            requiresReauth: data?.requiresReauth,
-            grantedScopes: data?.grantedScopes,
-            userMessage: isProxyHtml403
-              ? 'This request received an HTML HTTP 403 from the host proxy before reaching the Quackathon API. Open Quackathon directly on its active backend origin or retry shortly.'
-              : data?.userMessage ||
-                res.errorMessage ||
-                'Could not retrieve PESU Academy announcements.',
-          });
-        }
-      } catch {
-        setAcademyAnnouncements([]);
-        setAnnouncementsResponseState({
-          loaded: true,
-          ok: false,
-          errorCode: 'NETWORK_ERROR',
-          userMessage:
-            'Network error while contacting PESU Academy announcements endpoint.',
-        });
-      } finally {
-        setIsLoadingAnnouncements(false);
-      }
-    },
-    [currentUser.privacyPreferences.academyAnnouncementsOptIn]
-  );
-
-  useEffect(() => {
-    if (sourceFilter === 'MY_ACADEMY') {
-      void fetchAcademyAnnouncements(false);
-    }
-  }, [
-    sourceFilter,
-    currentUser.privacyPreferences.academyAnnouncementsOptIn,
-    fetchAcademyAnnouncements,
-  ]);
-
-  const handleToggleAcademyOptIn = async (enable: boolean) => {
-    if (!onSaveProfile || !currentProfile) {
-      onNotify?.(
-        'Please sign in with your PESU account first to configure Academy announcement preferences.'
-      );
-      return;
-    }
-    setIsSavingOptIn(true);
-    try {
-      await onSaveProfile(currentProfile, {
-        ...currentUser.privacyPreferences,
-        academyAnnouncementsOptIn: enable,
-      });
-      if (enable) {
-        onNotify?.(
-          'Enabled PESU Academy announcement opt-in. Checking your PESU OAuth2 session scopes...'
-        );
-      } else {
-        setAcademyAnnouncements([]);
-        onNotify?.('Disabled PESU Academy announcement access.');
-      }
-    } finally {
-      setIsSavingOptIn(false);
-    }
-  };
 
   // Suggest Event Modal State
   const [showSubmitModal, setShowSubmitModal] = useState(false);
@@ -408,7 +144,6 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   const [isExtractingLive, setIsExtractingLive] = useState(false);
   const [useAiFallbackForUrl, setUseAiFallbackForUrl] = useState(false);
 
-  // Distinct URL Tracking State
   const [originalSubmissionUrl, setOriginalSubmissionUrl] = useState<
     string | null
   >(null);
@@ -418,8 +153,6 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   const [sourceUrlStatus, setSourceUrlStatus] =
     useState<SourceUrlVerificationStatus>('unverified');
   const [redirectChainInfo, setRedirectChainInfo] = useState<string[]>([]);
-
-  // Uploaded File State
   const [uploadedAttachmentMeta, setUploadedAttachmentMeta] = useState<
     EventCandidate['uploadedAttachment'] | undefined
   >(undefined);
@@ -427,7 +160,6 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
     string | null
   >(null);
 
-  // Editable Event Candidate Form State
   const [title, setTitle] = useState('');
   const [organizer, setOrganizer] = useState('');
   const [description, setDescription] = useState('');
@@ -439,7 +171,9 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
   const [registrationUrl, setRegistrationUrl] = useState('');
   const [minTeamSize, setMinTeamSize] = useState<string>('');
   const [maxTeamSize, setMaxTeamSize] = useState<string>('');
-  const [themesInput, setThemesInput] = useState('Applied AI/ML, Developer Tools');
+  const [themesInput, setThemesInput] = useState(
+    'Applied AI/ML, Developer Tools'
+  );
   const [submissionSuccessToast, setSubmissionSuccessToast] = useState<
     string | null
   >(null);
@@ -456,146 +190,52 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
     maxTeamSize: parsedMaxTeam,
   });
 
-  // Populate Suggest Event modal from a detected PESU Academy announcement (privacy-safe)
-  const handleOpenSuggestFromAnnouncement = (
-    ann: NormalizedPesuAnnouncement
-  ) => {
-    const detected = detectTechnicalEventFromAnnouncement(ann);
-    if (!detected) return;
-    const includeSummary = Boolean(includeSanitizedSummaryById[ann.id]);
-    const draft = buildSanitizedCandidateDraftFromAnnouncement({
-      announcement: ann,
-      detected,
-      includeSanitizedSummary: includeSummary,
-    });
+  const todayIst = getTodayDateStringIST();
 
-    setCandidateSourceOverride('academy_opt_in_hint');
-    setSubmissionTab('url');
-    setRawUrl(draft.registrationUrl ?? '');
-    setOriginalSubmissionUrl(draft.originalSubmissionUrl ?? null);
-    setVerifiedCanonicalUrl(null);
-    setSourceUrlStatus(draft.registrationUrl ? 'unverified' : 'unavailable');
-    setRedirectChainInfo([]);
-    setUploadedAttachmentMeta(undefined);
-    setExtractionEvidenceQuote(
-      detected.evidenceExcerpts.join(' · ') ||
-        `Suggested from PESU Academy announcement "${ann.title}"`
-    );
-
-    setTitle(draft.title || ann.title);
-    setOrganizer(draft.organizer || 'PES University');
-    setDescription(draft.description || '');
-    setCampus(draft.venue?.campus ?? '');
-    setVenueName(draft.venue?.name ?? '');
-    // CRITICAL: Only use explicitly detected event dates (never the announcement's publication date!)
-    setStartAt(draft.startAt ? draft.startAt.slice(0, 10) : '');
-    setEndAt(draft.endAt ? draft.endAt.slice(0, 10) : '');
-    setRegistrationDeadline(
-      draft.registrationDeadline ? draft.registrationDeadline.slice(0, 10) : ''
-    );
-    setRegistrationUrl(draft.registrationUrl ?? '');
-    setMinTeamSize(
-      draft.teamSize?.min !== null && draft.teamSize?.min !== undefined
-        ? String(draft.teamSize.min)
-        : ''
-    );
-    setMaxTeamSize(
-      draft.teamSize?.max !== null && draft.teamSize?.max !== undefined
-        ? String(draft.teamSize.max)
-        : ''
-    );
-    setThemesInput((draft.themes ?? []).join(', '));
-    setUrlError(null);
-    setUrlWarnings([
-      'Personal student identifiers and private announcement text were automatically stripped for public submission.',
-      ...(draft.startAt
-        ? []
-        : [
-            'No event start date was stated in the announcement; leaving Date blank will safely label it "Date TBA".',
-          ]),
-    ]);
-    setShowSubmitModal(true);
-  };
-
-  // Eligible Hackathons-only catalog (excludes workshops, talks, conferences, cultural events, and solo-only events)
-  const eligibleCatalogHackathons = useMemo(
-    () => hackathons.filter((h) => isEligibleTeamHackathonCatalogEvent(h)),
+  // Upcoming-only verified team hackathons (excludes ended, closed, past, workshops/talks)
+  const upcomingHackathons = useMemo(
+    () => filterUpcomingStudentHackathons(hackathons),
     [hackathons]
   );
 
-  // Source-filtered + Search/Campus-filtered + IST Time-filtered Published Hackathons
-  const sourceCounts = useMemo(() => {
-    let allCount = 0;
-    let pesPublicCount = 0;
-    let communityCount = 0;
-    for (const h of eligibleCatalogHackathons) {
-      allCount++;
-      if (resolveHackathonSourceCategory(h) === 'PES_PUBLIC') {
-        pesPublicCount++;
-      } else {
-        communityCount++;
-      }
-    }
-    return {
-      allCount,
-      pesPublicCount,
-      communityCount,
-      academyCount: academyAnnouncements.length,
-    };
-  }, [eligibleCatalogHackathons, academyAnnouncements.length]);
-
+  // Apply Search + Campus filter deterministically
   const filteredHackathons = useMemo(() => {
-    const baseFiltered = eligibleCatalogHackathons.filter((h) => {
-      const cat = resolveHackathonSourceCategory(h);
-      if (sourceFilter === 'PES_PUBLIC' && cat !== 'PES_PUBLIC') return false;
-      if (sourceFilter === 'COMMUNITY_VERIFIED' && cat !== 'COMMUNITY_VERIFIED')
+    const q = searchQuery.trim().toLowerCase();
+    return upcomingHackathons.filter((h) => {
+      if (campusFilter !== 'ALL' && h.venue?.campus !== campusFilter) {
         return false;
-
-      if (campusFilter !== 'ALL' && h.venue.campus !== campusFilter)
-        return false;
-
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
+      }
+      if (q) {
         const matchesName = h.name.toLowerCase().includes(q);
-        const matchesOrg = h.organizer.toLowerCase().includes(q);
-        const matchesTheme = h.themes.some((t) => t.toLowerCase().includes(q));
-        const matchesVenue = (h.venue.name ?? '').toLowerCase().includes(q);
+        const matchesOrg = (h.organizer ?? '').toLowerCase().includes(q);
+        const matchesTheme = (h.themes ?? []).some((t) =>
+          t.toLowerCase().includes(q)
+        );
+        const matchesVenue = (h.venue?.name ?? '').toLowerCase().includes(q);
         if (!matchesName && !matchesOrg && !matchesTheme && !matchesVenue) {
           return false;
         }
       }
       return true;
     });
+  }, [upcomingHackathons, campusFilter, searchQuery]);
 
-    return filterAndSortEventsByTime(
-      baseFiltered.map((h) => ({ ...h, title: h.name })),
-      {
-        preset: timePreset,
-        customStart,
-        customEnd,
-        openRegistrationOnly,
-      }
-    );
-  }, [
-    eligibleCatalogHackathons,
-    sourceFilter,
-    campusFilter,
-    searchQuery,
-    timePreset,
-    customStart,
-    customEnd,
-    openRegistrationOnly,
-  ]);
+  // Reset to Page 1 whenever search or filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchQuery, campusFilter]);
 
-  // Filtered Academy Announcements (strictly by original publication date in IST)
-  const filteredAnnouncements = useMemo(() => {
-    return filterAnnouncementsByPublicationDate(academyAnnouncements, {
-      preset: timePreset,
-      customStart,
-      customEnd,
-      searchQuery,
-    });
-  }, [academyAnnouncements, timePreset, customStart, customEnd, searchQuery]);
+  const pagination = useMemo(
+    () => paginateItems(filteredHackathons, currentPage, PAGE_SIZE),
+    [filteredHackathons, currentPage]
+  );
+
+  // Keep currentPage clamped if catalog shrinks
+  useEffect(() => {
+    if (pagination.currentPage !== currentPage) {
+      setCurrentPage(pagination.currentPage);
+    }
+  }, [pagination.currentPage, currentPage]);
 
   const handleFetchUrlPreview = async () => {
     setUrlError(null);
@@ -626,7 +266,8 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
           );
           setVerifiedCanonicalUrl(null);
           setUrlError(
-            verifyRes.userMessage ?? 'URL verification failed. Enter details manually.'
+            verifyRes.userMessage ??
+              'URL verification failed. Enter details manually.'
           );
           return;
         }
@@ -638,7 +279,9 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
           rawUrl;
         setVerifiedCanonicalUrl(resolvedCanonical);
         setSourceUrlStatus(
-          verifyRes.status === 'redirected_valid' ? 'redirected_valid' : 'verified'
+          verifyRes.status === 'redirected_valid'
+            ? 'redirected_valid'
+            : 'verified'
         );
 
         const res = await extractLiveEventUrlMetadata(
@@ -704,6 +347,78 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
       if (d.venue?.name) setVenueName(d.venue.name);
       setStartAt(d.startAt ? d.startAt.slice(0, 10) : '');
       setEndAt(d.endAt ? d.endAt.slice(0, 10) : '');
+      setRegistrationDeadline(
+        d.registrationDeadline ? d.registrationDeadline.slice(0, 10) : ''
+      );
+      if (d.registrationUrl) setRegistrationUrl(d.registrationUrl);
+      setMinTeamSize(
+        d.teamSize?.min !== null && d.teamSize?.min !== undefined
+          ? String(d.teamSize.min)
+          : ''
+      );
+      setMaxTeamSize(
+        d.teamSize?.max !== null && d.teamSize?.max !== undefined
+          ? String(d.teamSize.max)
+          : ''
+      );
+      if (d.themes) setThemesInput(d.themes.join(', '));
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUrlError(null);
+    setUrlWarnings([]);
+    setCandidateSourceOverride('uploaded_brochure_or_poster');
+    setIsExtractingLive(true);
+
+    try {
+      const base64Data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = typeof reader.result === 'string' ? reader.result : '';
+          const commaIdx = result.indexOf(',');
+          resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+        };
+        reader.onerror = () => reject(new Error('Could not read uploaded file.'));
+        reader.readAsDataURL(file);
+      });
+
+      const res = await extractLiveEventFileMetadata({
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        base64Data,
+      });
+
+      setUploadedAttachmentMeta({
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        byteSize: file.size,
+        extractedEvidenceQuote: res.draft?.fieldEvidence?.source?.[0]?.excerpt,
+      });
+
+      if (!res.ok || !res.draft) {
+        setUrlError(
+          res.errorMessage ??
+            'File extraction failed. Please fill out the fields manually.'
+        );
+        setUrlWarnings(res.warnings);
+        return;
+      }
+      setUrlWarnings(res.warnings);
+      const d = res.draft;
+      if (d.title) setTitle(d.title);
+      if (d.organizer) setOrganizer(d.organizer);
+      if (d.description) setDescription(d.description);
+      if (d.venue?.campus) setCampus(d.venue.campus);
+      if (d.venue?.name) setVenueName(d.venue.name);
+      setStartAt(d.startAt ? d.startAt.slice(0, 10) : '');
+      setEndAt(d.endAt ? d.endAt.slice(0, 10) : '');
+      setRegistrationDeadline(
+        d.registrationDeadline ? d.registrationDeadline.slice(0, 10) : ''
+      );
+      if (d.registrationUrl) setRegistrationUrl(d.registrationUrl);
       setMinTeamSize(
         d.teamSize?.min !== null && d.teamSize?.min !== undefined
           ? String(d.teamSize.min)
@@ -715,1055 +430,341 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
           : ''
       );
       if (d.themes && d.themes.length > 0) setThemesInput(d.themes.join(', '));
+      setExtractionEvidenceQuote(d.fieldEvidence?.source?.[0]?.excerpt ?? null);
+    } finally {
+      setIsExtractingLive(false);
     }
-  };
-
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setUrlError(null);
-    setUrlWarnings([]);
-    setCandidateSourceOverride('uploaded_brochure_or_poster');
-
-    const allowedTypes = [
-      'application/pdf',
-      'image/png',
-      'image/jpeg',
-      'image/webp',
-    ];
-    if (!allowedTypes.includes(file.type)) {
-      setUrlError(
-        `Unsupported file type "${file.type}". Please upload a PDF brochure or PNG/JPG/WebP poster.`
-      );
-      return;
-    }
-
-    if (file.size > 10 * 1024 * 1024) {
-      setUrlError('File exceeds 10MB limit. Please upload a smaller brochure or poster.');
-      return;
-    }
-
-    setUploadedAttachmentMeta({
-      fileName: file.name,
-      mimeType: file.type,
-      byteSize: file.size,
-    });
-
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const resultStr = String(reader.result || '');
-      const base64Data = resultStr.includes(',')
-        ? resultStr.split(',')[1]
-        : resultStr;
-
-      setIsExtractingLive(true);
-      try {
-        const res = await extractLiveEventFileMetadata({
-          fileName: file.name,
-          mimeType: file.type,
-          base64Data,
-        });
-
-        if (!res.ok || !res.draft) {
-          setUrlError(
-            res.errorMessage ??
-              'Could not automatically extract fields from this file. Your file is attached — please enter details manually below.'
-          );
-          setUrlWarnings(res.warnings);
-          return;
-        }
-
-        const d = res.draft;
-        setUrlWarnings(res.warnings);
-        setUploadedAttachmentMeta(d.uploadedAttachment);
-        setExtractionEvidenceQuote(
-          d.uploadedAttachment?.extractedEvidenceQuote ?? null
-        );
-        if (d.title) setTitle(d.title);
-        if (d.organizer) setOrganizer(d.organizer);
-        if (d.description) setDescription(d.description);
-        if (d.venue?.campus) setCampus(d.venue.campus);
-        if (d.venue?.name) setVenueName(d.venue.name);
-        setStartAt(d.startAt ? d.startAt.slice(0, 10) : '');
-        setEndAt(d.endAt ? d.endAt.slice(0, 10) : '');
-        setRegistrationDeadline(
-          d.registrationDeadline ? d.registrationDeadline.slice(0, 10) : ''
-        );
-        if (d.registrationUrl) setRegistrationUrl(d.registrationUrl);
-        if (d.originalSubmissionUrl)
-          setOriginalSubmissionUrl(d.originalSubmissionUrl);
-        setMinTeamSize(
-          d.teamSize?.min !== null && d.teamSize?.min !== undefined
-            ? String(d.teamSize.min)
-            : ''
-        );
-        setMaxTeamSize(
-          d.teamSize?.max !== null && d.teamSize?.max !== undefined
-            ? String(d.teamSize.max)
-            : ''
-        );
-        if (d.themes && d.themes.length > 0)
-          setThemesInput(d.themes.join(', '));
-      } finally {
-        setIsExtractingLive(false);
-      }
-    };
-    reader.readAsDataURL(file);
   };
 
   const handleSubmitCandidate = (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim() || !organizer.trim()) return;
 
-    const cleanStartAt = startAt.trim() ? startAt.trim() : null;
-    const cleanEndAt = endAt.trim() ? endAt.trim() : cleanStartAt;
-    const cleanDeadline = registrationDeadline.trim()
-      ? registrationDeadline.trim()
-      : null;
-
-    const fingerprint = `${title
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '_')}_${cleanStartAt || 'date_tba'}`;
-
-    const resolvedSource: EventSourceType =
+    const finalSourceType: EventSourceType =
       candidateSourceOverride ??
       (submissionTab === 'file'
         ? 'uploaded_brochure_or_poster'
         : 'submitted_public_url');
 
-    const newCandidate: EventCandidate = {
-      id: `cand_user_${Date.now()}`,
-      source: resolvedSource,
-      sourceUrl:
-        verifiedCanonicalUrl ??
-        originalSubmissionUrl ??
-        (rawUrl.trim() || undefined),
+    const nowIso = new Date().toISOString();
+    const candidate: EventCandidate = {
+      id: `cand_${Date.now()}`,
+      source: finalSourceType,
+      submittedByUid: currentUser.uid,
+      externalFingerprint: `student_${title.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_')}_${startAt || 'tbd'}`,
+      sourceUrl: verifiedCanonicalUrl ?? (rawUrl.trim() || undefined),
       originalSubmissionUrl:
         originalSubmissionUrl ?? (rawUrl.trim() || null),
       verifiedCanonicalUrl: verifiedCanonicalUrl ?? null,
-      sourceUrlStatus:
-        submissionTab === 'file' && !originalSubmissionUrl
-          ? 'unavailable'
-          : sourceUrlStatus,
+      sourceUrlStatus,
       uploadedAttachment: uploadedAttachmentMeta,
-      submittedByUid: currentUser.uid,
-      externalFingerprint: fingerprint,
       title: title.trim(),
       organizer: organizer.trim(),
       eventType: liveClassification.eventType,
       matchable: liveClassification.matchable,
-      themes: themesInput
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-      description: description.trim(),
-      // CRITICAL: Never substitute today's date if startAt/endAt is unknown! Keep null ("Date TBA").
-      startAt: cleanStartAt,
-      endAt: cleanEndAt,
-      registrationDeadline: cleanDeadline,
-      timezone: 'Asia/Kolkata',
       venue: {
         campus: campus || null,
         name: venueName.trim() || null,
       },
-      format:
-        campus === 'Online / Multi-Campus'
-          ? 'online'
-          : campus
-            ? 'onsite'
-            : 'unknown',
+      format: campus === 'Online / Multi-Campus' ? 'online' : 'onsite',
+      startAt: startAt || null,
+      endAt: endAt || startAt || null,
+      registrationDeadline: registrationDeadline || null,
+      timezone: 'Asia/Kolkata',
       teamSize: {
         min: parsedMinTeam,
         max: parsedMaxTeam,
       },
-      registrationUrl:
-        registrationUrl.trim() ||
-        verifiedCanonicalUrl ||
-        originalSubmissionUrl ||
-        null,
+      themes: themesInput
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean),
+      description:
+        description.trim() || 'Student-submitted event pending review.',
+      registrationUrl: registrationUrl.trim() || null,
       eligibilityNotes: null,
       fieldEvidence: {
-        title: [
+        source: [
           {
-            sourceUrl:
-              verifiedCanonicalUrl ||
-              originalSubmissionUrl ||
-              (uploadedAttachmentMeta
-                ? `attachment://${uploadedAttachmentMeta.fileName}`
-                : 'manual-entry'),
+            sourceUrl: verifiedCanonicalUrl ?? (rawUrl.trim() || 'manual_entry'),
             excerpt:
-              extractionEvidenceQuote ||
-              `Submitted by ${currentUser.displayName}: "${title.trim()}"`,
+              extractionEvidenceQuote ??
+              `Submitted by ${currentUser.displayName}`,
           },
         ],
       },
       classification: {
-        ruleGatePassed: liveClassification.ruleGatePassed,
-        mlScore: liveClassification.mlScore,
+        ruleGatePassed: liveClassification.matchable,
+        mlScore:
+          finalSourceType === 'uploaded_brochure_or_poster'
+            ? 0.88
+            : verifiedCanonicalUrl
+            ? 0.9
+            : 0.75,
         reason: liveClassification.reason,
       },
-      reviewStatus:
-        liveClassification.matchable &&
-        parsedMinTeam !== null &&
-        parsedMaxTeam !== null &&
-        sourceUrlStatus === 'verified'
-          ? 'new'
-          : 'needs_confirmation',
+      reviewStatus: 'needs_confirmation',
       warnings: urlWarnings,
-      lastSeenAt: new Date().toISOString(),
+      lastSeenAt: nowIso,
     };
 
-    onSubmitEventCandidate(newCandidate);
-    setSubmissionSuccessToast(
-      `Submitted "${newCandidate.title}" to the Admin Review Queue (${
-        newCandidate.startAt ? newCandidate.startAt : 'Date TBA'
-      }). Unreviewed submissions stay staged until verified.`
-    );
+    onSubmitEventCandidate(candidate);
     setShowSubmitModal(false);
-    setCandidateSourceOverride(null);
+    setSubmissionSuccessToast(
+      `"${candidate.title}" submitted for review. It will appear once verified.`
+    );
+    onNotify?.(`"${candidate.title}" submitted for review.`);
+    setTimeout(() => setSubmissionSuccessToast(null), 5000);
+
     setRawUrl('');
+    setCandidateSourceOverride(null);
+    setOriginalSubmissionUrl(null);
+    setVerifiedCanonicalUrl(null);
+    setSourceUrlStatus('unverified');
+    setRedirectChainInfo([]);
+    setUploadedAttachmentMeta(undefined);
+    setExtractionEvidenceQuote(null);
     setTitle('');
     setOrganizer('');
     setDescription('');
+    setCampus('');
+    setVenueName('');
     setStartAt('');
     setEndAt('');
     setRegistrationDeadline('');
     setRegistrationUrl('');
     setMinTeamSize('');
     setMaxTeamSize('');
-    setUploadedAttachmentMeta(undefined);
-    setOriginalSubmissionUrl(null);
-    setVerifiedCanonicalUrl(null);
+    setUrlError(null);
+    setUrlWarnings([]);
   };
 
-  const todayIst = getTodayDateStringIST();
-
-  const isHackathonEligibleForTeamMatching = (h: Hackathon): boolean => {
-    const regStatus = getVerifiableRegistrationStatus(h, todayIst);
-    if (regStatus.status === 'closed' || regStatus.status === 'ended') {
-      return false;
-    }
-    if (typeof h.maxTeamSize === 'number' && h.maxTeamSize < 2) {
-      return false;
-    }
-    if (
-      !h.matchable ||
-      h.findTeammatesEligible === false ||
-      h.registrationStatus === 'CLOSED' ||
-      h.status === 'completed' ||
-      h.status === 'archived' ||
-      h.status === 'registration_closed'
-    ) {
-      return false;
-    }
-    return true;
-  };
+  const detailRegInfo = selectedDetailHackathon
+    ? describeHackathonRegistrationDetail(selectedDetailHackathon, todayIst)
+    : null;
+  const detailMatchable = selectedDetailHackathon
+    ? isHackathonEligibleForMatching(selectedDetailHackathon)
+    : false;
 
   return (
     <div className="space-y-6">
-      {/* Top Intro Section: Clean, Academic, Unhurried */}
-      <section className="flex flex-col gap-2 pb-2">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[#1c1b1b]">
-              Hackathons
-            </h1>
-            <div className="flex items-center gap-1.5 bg-[#f6f3f2] px-3.5 py-1 rounded-full border border-[#e9e5dd] shrink-0">
-              <span className="w-2 h-2 rounded-full bg-[#fdaa40]" />
-              <span className="text-xs font-medium text-[#746e65]">
-                {filteredHackathons.length} Hackathons
-              </span>
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => {
-              setCandidateSourceOverride(null);
-              setShowSubmitModal(true);
-            }}
-            className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] text-xs font-bold transition-all shadow-xs cursor-pointer shrink-0 whitespace-nowrap"
-          >
-            <Plus className="w-4 h-4" />
-            <span>Suggest Hackathon</span>
-          </button>
+      {/* Page Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-baseline gap-3">
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[#1c1b1b]">
+            Hackathons
+          </h1>
+          <span className="text-xs font-medium text-[#746e65] tabular-nums">
+            {filteredHackathons.length}{' '}
+            {filteredHackathons.length === 1 ? 'upcoming event' : 'upcoming events'}
+          </span>
         </div>
-      </section>
+
+        <button
+          type="button"
+          onClick={() => {
+            setCandidateSourceOverride(null);
+            setShowSubmitModal(true);
+          }}
+          className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] active:scale-[0.98] border border-[#e5be35] text-[#1c1b1b] text-xs font-bold shadow-xs transition-all duration-150 cursor-pointer whitespace-nowrap shrink-0 self-start sm:self-auto"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          <span>Suggest Hackathon</span>
+        </button>
+      </div>
 
       {submissionSuccessToast && (
-        <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-between gap-3 text-sm text-emerald-900">
-          <div className="flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-            <span>{submissionSuccessToast}</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => setSubmissionSuccessToast(null)}
-            className="text-xs text-emerald-700 hover:underline font-medium cursor-pointer"
-          >
-            Dismiss
-          </button>
+        <div
+          role="status"
+          className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 font-medium"
+        >
+          {submissionSuccessToast}
         </div>
       )}
 
-      {/* Filter & Search Toolbar */}
-      <section className="flex flex-col gap-3">
-        {/* Search Bar with Tonal Layering */}
-        <div className="relative w-full">
-          <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-[#746e65]">
-            <Search className="w-4 h-4" />
-          </div>
+      {/* Search & Campus Filter Bar */}
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+        <div className="relative flex-1 min-w-0">
+          <Search className="w-4 h-4 text-[#746e65] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
           <input
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder={
-              sourceFilter === 'MY_ACADEMY'
-                ? 'Search your PESU Academy announcements...'
-                : 'Search team hackathons and competitions...'
-            }
-            className="w-full pl-10 pr-20 py-2.5 bg-white border border-[#e9e5dd] rounded-xl text-sm text-[#1c1b1b] placeholder:text-[#746e65]/60 shadow-xs focus:outline-none focus:ring-1 focus:ring-[#725c00] transition-all"
+            placeholder="Search upcoming hackathons..."
+            aria-label="Search upcoming hackathons"
+            className="w-full pl-10 pr-4 py-2.5 text-sm rounded-xl border border-[#e9e5dd] bg-white text-[#1c1b1b] placeholder:text-[#746e65] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:border-[#d0c6ae] transition-colors duration-150"
           />
-          <div className="absolute inset-y-0 right-3 flex items-center gap-1.5 text-[#746e65]">
-            <kbd className="text-[10px] font-mono px-2 py-0.5 bg-[#f6f3f2] rounded border border-[#e9e5dd] text-[#746e65]">
-              ⌘K
-            </kbd>
-          </div>
         </div>
 
-        {/* Filter Control Strip: Time chips and Campus Segmented Control */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          {/* Time Range Pills */}
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
-            {(
-              [
-                { id: 'ALL', label: 'All' },
-                { id: 'UPCOMING', label: sourceFilter === 'MY_ACADEMY' ? 'Latest' : 'Upcoming' },
-                { id: 'THIS_WEEK', label: 'This Week' },
-                { id: 'THIS_MONTH', label: 'This Month' },
-                { id: 'PAST', label: 'Past' },
-              ] as { id: TimeFilterPreset; label: string }[]
-            ).map((item) => (
+        <SelectMenu
+          value={campusFilter}
+          options={CAMPUS_OPTIONS}
+          onChange={(val) => setCampusFilter(val as CampusType | 'ALL')}
+          ariaLabel="Filter by campus"
+          className="sm:w-52 shrink-0"
+          menuAlign="right"
+        />
+      </div>
+
+      {/* Upcoming Hackathons Grid */}
+      {filteredHackathons.length === 0 ? (
+        <div className="bg-white border border-[#e9e5dd] rounded-2xl p-10 text-center space-y-3.5">
+          <div className="w-14 h-14 mx-auto rounded-2xl bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center p-2">
+            <img
+              src={QUACKATHON_MINI_LOGO_SRC}
+              alt="Quackathon"
+              className="w-full h-full object-contain"
+            />
+          </div>
+          <div className="space-y-1">
+            <h2 className="text-base font-bold text-[#1c1b1b]">
+              {searchQuery.trim() || campusFilter !== 'ALL'
+                ? 'No upcoming hackathons match your search'
+                : 'No upcoming hackathons listed yet'}
+            </h2>
+            <p className="text-xs text-[#746e65] max-w-md mx-auto leading-relaxed">
+              {searchQuery.trim() || campusFilter !== 'ALL'
+                ? 'Try clearing your search query or switching back to all campuses.'
+                : 'Only upcoming, verified team hackathons appear here. Past and closed competitions are automatically hidden.'}
+            </p>
+          </div>
+          <div className="flex items-center justify-center gap-2.5 pt-1 flex-wrap">
+            {(searchQuery.trim() || campusFilter !== 'ALL') && (
               <button
-                key={item.id}
                 type="button"
-                onClick={() => setTimePreset(item.id)}
-                className={`px-3.5 py-1.5 rounded-full text-xs transition-colors cursor-pointer whitespace-nowrap ${
-                  timePreset === item.id
-                    ? 'bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
-                    : 'bg-white text-[#746e65] hover:bg-[#f6f3eb] border border-[#e9e5dd] font-medium'
-                }`}
+                onClick={() => {
+                  setSearchQuery('');
+                  setCampusFilter('ALL');
+                }}
+                className="px-3.5 py-2 rounded-xl border border-[#e9e5dd] bg-white hover:bg-[#f6f3eb] text-xs font-semibold text-[#1c1b1b] transition-colors duration-150 cursor-pointer"
               >
-                {item.label}
+                Clear Filters
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setCandidateSourceOverride(null);
+                setShowSubmitModal(true);
+              }}
+              className="px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-xs font-bold text-[#1c1b1b] transition-colors duration-150 cursor-pointer"
+            >
+              Suggest a Hackathon
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-5">
+          <div
+            className="grid grid-cols-1 md:grid-cols-2 gap-4"
+            data-testid="hackathons-grid"
+          >
+            {pagination.pageItems.map((h) => (
+              <button
+                key={h.id}
+                type="button"
+                onClick={() => setSelectedDetailHackathon(h)}
+                data-testid={`hackathon-card-${h.id}`}
+                className="quack-interactive-card group w-full text-left bg-white border border-[#e9e5dd] rounded-2xl p-5 flex items-center justify-between gap-4 cursor-pointer focus-visible:outline-2 focus-visible:outline-[#bd920c]"
+              >
+                <div className="flex items-center gap-3.5 min-w-0">
+                  <div className="w-11 h-11 rounded-xl bg-[#fff3c9] border border-[#f2dc8c] flex items-center justify-center shrink-0 text-[#725c00]">
+                    <Calendar className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <h2 className="text-base font-bold text-[#1c1b1b] truncate group-hover:text-[#725c00] transition-colors duration-150">
+                      {h.name}
+                    </h2>
+                    <p className="text-xs text-[#746e65] mt-1 tabular-nums">
+                      {formatEventDateDisplayIST(h)}
+                    </p>
+                  </div>
+                </div>
+                <ChevronRight className="w-4 h-4 text-[#746e65] group-hover:text-[#1c1b1b] group-hover:translate-x-0.5 transition-all duration-150 shrink-0" />
               </button>
             ))}
           </div>
 
-          <div className="flex items-center gap-2">
-            {sourceFilter !== 'MY_ACADEMY' && (
-              <select
-                aria-label="Filter by campus"
-                value={campusFilter}
-                onChange={(e) =>
-                  setCampusFilter(e.target.value as CampusType | 'ALL')
-                }
-                className="text-xs font-medium rounded-full border border-[#e9e5dd] bg-white px-3 py-1.5 text-[#1c1b1b] shadow-xs cursor-pointer focus:outline-none"
-              >
-                <option value="ALL">All PESU (RR &amp; EC)</option>
-                <option value="RR Campus">RR Campus</option>
-                <option value="EC Campus">EC Campus</option>
-                <option value="HN Campus">HN Campus</option>
-                <option value="Online / Multi-Campus">Online / Multi-Campus</option>
-              </select>
-            )}
-
-            <div className="flex items-center p-0.5 bg-[#f6f3f2] rounded-xl border border-[#e9e5dd]">
-              <button
-                type="button"
-                onClick={() => setSourceFilter('ALL_PUBLISHED')}
-                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap ${
-                  sourceFilter !== 'MY_ACADEMY'
-                    ? 'bg-white text-[#1c1b1b] shadow-xs'
-                    : 'text-[#746e65] hover:text-[#1c1b1b]'
-                }`}
-              >
-                Hackathons
-              </button>
-              <button
-                type="button"
-                onClick={() => setSourceFilter('MY_ACADEMY')}
-                className={`inline-flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap ${
-                  sourceFilter === 'MY_ACADEMY'
-                    ? 'bg-white text-[#1c1b1b] shadow-xs'
-                    : 'text-[#746e65] hover:text-[#1c1b1b]'
-                }`}
-              >
-                <Lock className="w-3 h-3 text-[#725c00]" />
-                <span>PESU Academy</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* ==================================================================== */}
-      {/* VIEW A: MY PESU ACADEMY ANNOUNCEMENTS (PRIVATE, CONSENT-GATED)       */}
-      {/* ==================================================================== */}
-      {sourceFilter === 'MY_ACADEMY' ? (
-        <div className="space-y-3">
-          {/* Delegated Credential-Storage Disclosure & Privacy Notice */}
-          <div className="bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200/80 dark:border-amber-800/50 rounded-xl p-4 space-y-2.5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <Lock className="w-4 h-4 text-amber-600 shrink-0" />
-                <h2 className="text-xs font-bold text-slate-900 dark:text-slate-100">
-                  Private PESU Academy Announcements · Explicit Student Consent & Delegated Access
-                </h2>
-              </div>
-              {currentUser.privacyPreferences.academyAnnouncementsOptIn && (
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={isLoadingAnnouncements}
-                    onClick={() => void fetchAcademyAnnouncements(true)}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 cursor-pointer disabled:opacity-50"
-                  >
-                    <RefreshCw
-                      className={`w-3 h-3 ${isLoadingAnnouncements ? 'animate-spin' : ''}`}
-                    />
-                    <span>Refresh Feed</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isSavingOptIn}
-                    onClick={() => void handleToggleAcademyOptIn(false)}
-                    className="text-[11px] text-slate-500 hover:text-rose-600 underline cursor-pointer"
-                  >
-                    Disable Opt-In
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
-              <strong>How PESU-Dev Delegated Access Works:</strong> Standard PESU Sign-In (
-              <code className="font-mono text-[11px]">openid name profile email</code>) only verifies your student identity and never stores your PESU Academy password. Optional announcement access (
-              <code className="font-mono text-[11px]">announcements:read</code>) uses the PESU OAuth2 provider&apos;s{' '}
-              <strong>delegated mode</strong>, which requires the provider (
-              <code className="font-mono text-[11px]">pesu-oauth2.onrender.com</code>) to seal your PESU Academy credentials in an encrypted vault to fetch announcements on your behalf. Quackathon never receives your password, never exposes your Academy access token to the browser, and never publishes your private announcements automatically.
-            </p>
-
-            <div className="pt-2 border-t border-amber-200/70 dark:border-amber-800/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
-              <p className="text-slate-600 dark:text-slate-300">
-                <strong>Missing a PESU Academy Homepage Banner Event?</strong>{' '}
-                Homepage carousel banners (e.g., ReRo Online Hackathon, International Hour, The Alumni Playbook, Weekend CTF Workshops) are rendered by a separate portal widget not exposed by{' '}
-                <code className="font-mono text-[11px]">/api/v1/announcements</code>.
+          {/* Conventional Numbered Pagination (Hidden when all results fit on 1 page) */}
+          {pagination.showPagination && (
+            <nav
+              aria-label="Hackathons pagination"
+              data-testid="hackathons-pagination"
+              className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2 border-t border-[#e9e5dd]"
+            >
+              <p className="text-xs text-[#746e65] tabular-nums">
+                Showing {pagination.startIndex}–{pagination.endIndex} of{' '}
+                {pagination.totalItems} upcoming hackathons
               </p>
-              <button
-                type="button"
-                data-testid="submit-homepage-banner-btn"
-                onClick={() => setShowSubmitModal(true)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-blue-600 text-white text-xs font-semibold hover:opacity-90 shrink-0 cursor-pointer"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Submit Banner / Poster / Event Link</span>
-              </button>
-            </div>
-          </div>
-
-          {/* State 1: Opt-In Required */}
-          {!currentUser.privacyPreferences.academyAnnouncementsOptIn ? (
-            <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-6 text-center space-y-3">
-              <ShieldCheck className="w-7 h-7 text-amber-600 mx-auto" />
-              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                Optional PESU Academy Announcement Access is Off
-              </h3>
-              <p className="text-xs text-slate-500 max-w-lg mx-auto">
-                Enable optional delegated access if you want Quackathon to retrieve your PESU Academy announcements privately and highlight technical events you can suggest for review.
-              </p>
-              <div className="pt-1 flex flex-wrap justify-center gap-2">
+              <div className="flex items-center gap-1.5 flex-wrap justify-center">
                 <button
                   type="button"
-                  disabled={isSavingOptIn}
-                  onClick={() => void handleToggleAcademyOptIn(true)}
-                  className="px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-blue-600 text-white text-xs font-semibold cursor-pointer disabled:opacity-50"
+                  disabled={!pagination.hasPrevious}
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-[#e9e5dd] bg-white hover:bg-[#f6f3eb] text-xs font-semibold text-[#1c1b1b] disabled:opacity-40 disabled:cursor-not-allowed transition-colors duration-150 cursor-pointer"
                 >
-                  {isSavingOptIn
-                    ? 'Saving Preference...'
-                    : 'I Understand — Enable Optional Academy Announcements'}
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                  <span>Previous</span>
                 </button>
-              </div>
-            </div>
-          ) : isLoadingAnnouncements ? (
-            /* State 2: Loading */
-            <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
-              <Loader2 className="w-6 h-6 text-blue-600 animate-spin mx-auto" />
-              <p className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                Fetching your PESU Academy announcements from PESU-Dev resource server...
-              </p>
-            </div>
-          ) : !announcementsResponseState.ok ? (
-            /* State 3: Distinct Authorization / Missing Scope / Expired Session / Upstream Error States */
-            <div className="bg-white dark:bg-slate-900 rounded-xl border border-amber-200 dark:border-amber-800/70 p-6 space-y-3">
-              <div className="flex items-start gap-3">
-                <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-                <div className="space-y-1.5 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                      {announcementsResponseState.errorCode ===
-                        'MISSING_ANNOUNCEMENTS_SCOPE'
-                        ? 'Additional PESU OAuth2 Scope Required (announcements:read)'
-                        : announcementsResponseState.errorCode ===
-                            'DELEGATED_CREDENTIALS_REQUIRED'
-                          ? 'Delegated PESU Academy Consent Required'
-                          : announcementsResponseState.errorCode ===
-                                'TOKEN_EXPIRED_OR_REVOKED' ||
-                              announcementsResponseState.errorCode ===
-                                'AUTH_REQUIRED'
-                            ? 'PESU OAuth2 Session Required or Expired'
-                            : announcementsResponseState.errorCode ===
-                                'PROXY_FORBIDDEN_HTML'
-                              ? 'Request Blocked by Host Proxy (HTTP 403)'
-                              : 'PESU Academy Announcements Currently Unavailable'}
-                    </h3>
-                    {announcementsResponseState.errorCode && (
-                      <span className="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 font-mono text-[10px] font-semibold">
-                        {announcementsResponseState.errorCode}
-                      </span>
-                    )}
-                  </div>
 
-                  <p className="text-xs text-slate-600 dark:text-slate-300">
-                    {announcementsResponseState.userMessage}
-                  </p>
-
-                  {announcementsResponseState.grantedScopes &&
-                    announcementsResponseState.grantedScopes.length > 0 && (
-                      <p className="text-[11px] font-mono text-slate-500">
-                        Currently granted scopes:{' '}
-                        {announcementsResponseState.grantedScopes.join(', ')}
-                      </p>
-                    )}
-
-                  <div className="pt-2 flex flex-wrap items-center gap-2">
-                    {(announcementsResponseState.requiresScopeGrant ||
-                      announcementsResponseState.requiresReauth ||
-                      announcementsResponseState.errorCode ===
-                        'AUTH_REQUIRED' ||
-                      announcementsResponseState.errorCode ===
-                        'MISSING_ANNOUNCEMENTS_SCOPE' ||
-                      announcementsResponseState.errorCode ===
-                        'DELEGATED_CREDENTIALS_REQUIRED' ||
-                      announcementsResponseState.errorCode ===
-                        'TOKEN_EXPIRED_OR_REVOKED') &&
-                      onConnectPesuAcademy && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => onConnectPesuAcademy('popup')}
-                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer"
-                          >
-                            <ShieldCheck className="w-3.5 h-3.5" />
-                            <span>
-                              Authorize PESU Academy Access (announcements:read)
-                            </span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onConnectPesuAcademy('redirect')}
-                            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/60 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 text-xs font-semibold cursor-pointer"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                            <span>Authorize (Full-Page Redirect)</span>
-                          </button>
-                        </>
-                      )}
-
+                {pagination.pageNumbers.map((pageNum) => {
+                  const isCurrent = pageNum === pagination.currentPage;
+                  return (
                     <button
+                      key={pageNum}
                       type="button"
-                      onClick={() => void fetchAcademyAnnouncements(true)}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 text-xs font-semibold text-slate-700 dark:text-slate-300 cursor-pointer"
+                      aria-current={isCurrent ? 'page' : undefined}
+                      onClick={() => setCurrentPage(pageNum)}
+                      className={`min-w-[34px] h-[32px] px-2.5 rounded-lg border text-xs font-semibold tabular-nums transition-colors duration-150 cursor-pointer ${
+                        isCurrent
+                          ? 'bg-[#ffd84d] border-[#e5be35] text-[#1c1b1b] font-bold shadow-2xs'
+                          : 'bg-white border-[#e9e5dd] text-[#4d4634] hover:bg-[#f6f3eb]'
+                      }`}
                     >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                      <span>Retry</span>
+                      {pageNum}
                     </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : filteredAnnouncements.length === 0 ? (
-            /* State 4: True Empty State (Authorized & Succeeded, 0 matching announcements) */
-            <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
-              <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">
-                {academyAnnouncements.length === 0
-                  ? '0 announcements returned from your PESU Academy feed.'
-                  : 'No announcements match your current publication date or search filter.'}
-              </p>
-              {academyAnnouncements.length > 0 && (
+                  );
+                })}
+
                 <button
                   type="button"
-                  onClick={() => {
-                    setTimePreset('ALL');
-                    setSearchQuery('');
-                  }}
-                  className="text-xs font-semibold text-blue-600 hover:underline cursor-pointer"
+                  disabled={!pagination.hasNext}
+                  onClick={() =>
+                    setCurrentPage((p) =>
+                      Math.min(pagination.totalPages, p + 1)
+                    )
+                  }
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-[#e9e5dd] bg-white hover:bg-[#f6f3eb] text-xs font-semibold text-[#1c1b1b] disabled:opacity-40 disabled:cursor-not-allowed transition-colors duration-150 cursor-pointer"
                 >
-                  Show all {academyAnnouncements.length} announcement(s)
-                </button>
-              )}
-            </div>
-          ) : (
-            /* State 5: Grounded Announcement Cards with Technical Event Detection */
-            <div className="space-y-3">
-              <div className="flex items-center justify-between text-[11px] text-slate-500 px-1">
-                <span>
-                  Showing {filteredAnnouncements.length} of{' '}
-                  {academyAnnouncements.length} private announcement(s)
-                </span>
-                {announcementsResponseState.fetchedAt && (
-                  <span className="font-mono">
-                    Fetched:{' '}
-                    {new Date(
-                      announcementsResponseState.fetchedAt
-                    ).toLocaleString()}
-                  </span>
-                )}
-              </div>
-
-              {filteredAnnouncements.map((ann) => {
-                const detected = detectTechnicalEventFromAnnouncement(ann);
-                return (
-                  <div
-                    key={ann.id}
-                    className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-2.5"
-                  >
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <div className="space-y-1">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 text-[10px] font-semibold">
-                            Private Academy Announcement
-                          </span>
-                          <span className="text-[11px] text-slate-500 font-mono">
-                            Published: {ann.date ?? 'Date Unstated'}
-                          </span>
-                          {ann.attachments > 0 && (
-                            <span className="text-[11px] text-slate-500 inline-flex items-center gap-1">
-                              <FileText className="w-3 h-3" />
-                              {ann.attachments} attachment
-                              {ann.attachments === 1 ? '' : 's'}
-                            </span>
-                          )}
-                        </div>
-                        <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                          {ann.title}
-                        </h3>
-                      </div>
-                    </div>
-
-                    {ann.description && (
-                      <p className="text-xs text-slate-600 dark:text-slate-300 whitespace-pre-line line-clamp-4">
-                        {ann.description}
-                      </p>
-                    )}
-
-                    {/* Evidence-Based Technical Event Candidate Box */}
-                    {detected && (
-                      <div className="mt-2 pt-2.5 border-t border-slate-100 dark:border-slate-800 bg-blue-50/50 dark:bg-blue-950/20 rounded-lg p-3 space-y-2">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex flex-wrap items-center gap-1.5 text-xs">
-                            <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                            <span className="font-bold text-slate-900 dark:text-slate-100">
-                              Detected Technical Event Candidate:
-                            </span>
-                            <span className="px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-200 text-[10px] font-semibold uppercase">
-                              {detected.eventType.replace('_', ' ')}
-                            </span>
-                            <span className="text-[11px] text-slate-600 dark:text-slate-400">
-                              · Event Date:{' '}
-                              <strong>
-                                {detected.startAt
-                                  ? `${detected.startAt}${
-                                      detected.endAt &&
-                                      detected.endAt !== detected.startAt
-                                        ? ` to ${detected.endAt}`
-                                        : ''
-                                    }`
-                                  : 'Date TBA (not stated in text)'}
-                              </strong>
-                            </span>
-                            {detected.venueName || detected.campus ? (
-                              <span className="text-[11px] text-slate-600 dark:text-slate-400">
-                                ·{' '}
-                                {[detected.venueName, detected.campus]
-                                  .filter(Boolean)
-                                  .join(', ')}
-                              </span>
-                            ) : null}
-                          </div>
-
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleOpenSuggestFromAnnouncement(ann)
-                            }
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-blue-600 text-white text-xs font-semibold cursor-pointer shrink-0"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                            <span>Suggest Event for Review</span>
-                          </button>
-                        </div>
-
-                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
-                          <span>
-                            Personal details and raw announcement text are stripped by default before staging for admin review.
-                          </span>
-                          <label className="inline-flex items-center gap-1.5 cursor-pointer select-none text-slate-700 dark:text-slate-300">
-                            <input
-                              type="checkbox"
-                              checked={Boolean(
-                                includeSanitizedSummaryById[ann.id]
-                              )}
-                              onChange={(e) =>
-                                setIncludeSanitizedSummaryById((prev) => ({
-                                  ...prev,
-                                  [ann.id]: e.target.checked,
-                                }))
-                              }
-                              className="rounded border-slate-300"
-                            />
-                            <span>Include sanitized excerpt</span>
-                          </label>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      ) : (
-        /* ==================================================================== */
-        /* VIEW B: CLEAN FOCUSED HACKATHONS DISCOVERY GRID                      */
-        /* ==================================================================== */
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {filteredHackathons.length === 0 ? (
-            <div className="col-span-full bg-white rounded-2xl border border-slate-200 p-8 text-center space-y-3">
-              <p className="text-sm font-semibold text-slate-800">
-                No hackathons match your current filters.
-              </p>
-              <p className="text-xs text-slate-500 max-w-md mx-auto">
-                {timePreset === 'UPCOMING'
-                  ? 'No upcoming hackathons are listed yet. Switch to "All" or "Past" to browse earlier events, or suggest an upcoming hackathon.'
-                  : 'Try clearing your search or changing the campus or date filter.'}
-              </p>
-              <div className="pt-1 flex flex-wrap justify-center gap-2">
-                {timePreset !== 'ALL' && (
-                  <button
-                    type="button"
-                    onClick={() => setTimePreset('ALL')}
-                    className="px-3.5 py-2 rounded-xl bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 cursor-pointer"
-                  >
-                    Show All Hackathons
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCandidateSourceOverride(null);
-                    setShowSubmitModal(true);
-                  }}
-                  className="px-3.5 py-2 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
-                >
-                  Suggest Hackathon
+                  <span>Next</span>
+                  <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
-            </div>
-          ) : (
-            filteredHackathons.map((h) => {
-              const dateDisplay = formatEventDateDisplayIST(h);
-              const regStatus = getVerifiableRegistrationStatus(h, todayIst);
-              const eligibleForTeammates = isHackathonEligibleForTeamMatching(h);
-              const hasVerifiedTeamSize =
-                h.minTeamSize !== null && h.maxTeamSize !== null;
-              const locationDisplay =
-                h.format === 'online'
-                  ? h.venue.campus && h.venue.campus !== 'Online / Multi-Campus'
-                    ? `Online · ${h.venue.campus}`
-                    : 'Online'
-                  : [h.venue.name, h.venue.campus].filter(Boolean).join(' · ') ||
-                    'PES University';
-
-              const isConfirmedOpen =
-                regStatus.status === 'open_confirmed' ||
-                regStatus.status === 'deadline_known';
-              const statusLabel = isConfirmedOpen
-                ? 'Open'
-                : regStatus.status === 'closed'
-                  ? 'Closed'
-                  : regStatus.status === 'ended'
-                    ? 'Ended'
-                    : 'Unknown';
-
-              const statusColorClass = isConfirmedOpen
-                ? 'text-emerald-700'
-                : regStatus.status === 'closed' || regStatus.status === 'ended'
-                  ? 'text-slate-500'
-                  : 'text-amber-700';
-
-              return (
-                <article
-                  key={h.id}
-                  data-testid={`hackathon-card-${h.id}`}
-                  className="event-card bg-white rounded-xl border border-[#e9e5dd] p-5 flex flex-col justify-between gap-4 shadow-xs hover:shadow-md transition-all duration-200"
-                >
-                  <div className="flex items-start gap-4">
-                    <div className="w-11 h-11 rounded-xl bg-[#ffd84d]/25 flex items-center justify-center shrink-0 text-[#725c00]">
-                      <Calendar className="w-5 h-5 text-[#875200]" />
-                    </div>
-
-                    <div className="flex-1 min-w-0 space-y-1.5">
-                      <div className="flex items-center gap-2 flex-wrap text-[11px]">
-                        <span className="px-2 py-0.5 rounded bg-[#f6f3f2] text-[#4d4634] font-semibold border border-[#e9e5dd]">
-                          Hackathon
-                        </span>
-                        <span className="text-[#746e65]/60">•</span>
-                        <span className="text-[#746e65]">{locationDisplay}</span>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={() => setSelectedDetailHackathon(h)}
-                        className="text-left group cursor-pointer block w-full"
-                      >
-                        <h2 className="text-base font-bold text-[#1c1b1b] group-hover:text-[#725c00] leading-snug transition-colors truncate">
-                          {h.name}
-                        </h2>
-                      </button>
-
-                      {/* Clean Unboxed Metadata */}
-                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#746e65]">
-                        <span className="inline-flex items-center gap-1 font-medium text-[#1c1b1b]">
-                          <Calendar className="w-3.5 h-3.5 text-[#875200] shrink-0" />
-                          <span>{dateDisplay}</span>
-                        </span>
-
-                        {hasVerifiedTeamSize && (
-                          <span className="inline-flex items-center gap-1 font-mono text-[11px] text-[#746e65]">
-                            <Users className="w-3.5 h-3.5 text-[#746e65] shrink-0" />
-                            <span>
-                              {h.minTeamSize === h.maxTeamSize
-                                ? `${h.minTeamSize} members`
-                                : `${h.minTeamSize}–${h.maxTeamSize} members`}
-                            </span>
-                          </span>
-                        )}
-
-                        <span className="inline-flex items-center gap-1">
-                          <span className="text-[#746e65]">Status:</span>
-                          <span className={`font-semibold ${statusColorClass}`}>
-                            {statusLabel}
-                          </span>
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Card Footer: View Details + Find Teammates (strictly when eligible) */}
-                  <div className="pt-3 border-t border-[#f1ede6] flex items-center justify-between gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedDetailHackathon(h)}
-                      className="text-xs font-semibold text-[#746e65] hover:text-[#1c1b1b] cursor-pointer"
-                    >
-                      View Details
-                    </button>
-
-                    {eligibleForTeammates ? (
-                      <button
-                        type="button"
-                        onClick={() => onSelectHackathonForDiscovery(h.id)}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] text-xs font-bold transition-colors cursor-pointer shrink-0 whitespace-nowrap shadow-xs"
-                      >
-                        <Users className="w-3.5 h-3.5" />
-                        <span>Find Teammates</span>
-                      </button>
-                    ) : (
-                      <span className="text-xs font-medium text-[#746e65]">
-                        {regStatus.status === 'ended'
-                          ? 'Event ended'
-                          : 'Registration closed'}
-                      </span>
-                    )}
-                  </div>
-                </article>
-              );
-            })
+            </nav>
           )}
         </div>
       )}
 
       {/* ==================================================================== */}
-      {/* EVENT DETAIL VIEW MODAL (Full Description, Organizer, Source Links)  */}
+      {/* EXPANDED HACKATHON DETAILS MODAL (Keyboard Accessible + Focus Trap)  */}
       {/* ==================================================================== */}
-      {selectedDetailHackathon && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="event-detail-modal-title"
-        >
-          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-lg w-full border border-slate-200 dark:border-slate-800 shadow-2xl overflow-hidden my-8">
-            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-start justify-between gap-3">
-              <div className="space-y-1">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300">
-                    {formatEventTypeCategoryLabel(selectedDetailHackathon.eventType)}
-                  </span>
-                  <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300">
-                    {getHackathonSourceLabel(selectedDetailHackathon).label}
-                  </span>
-                </div>
-                <h2
-                  id="event-detail-modal-title"
-                  className="text-base font-bold text-slate-900 dark:text-slate-100"
-                >
-                  {selectedDetailHackathon.name}
-                </h2>
-                <p className="text-xs text-slate-500">
-                  Organized by {selectedDetailHackathon.organizer}
-                </p>
-              </div>
+      {selectedDetailHackathon && detailRegInfo && (
+        <Modal
+          title={selectedDetailHackathon.name}
+          subtitle={`${formatEventTypeCategoryLabel(selectedDetailHackathon.eventType)} · ${selectedDetailHackathon.organizer}`}
+          headerIcon={<Calendar className="w-4 h-4 text-[#725c00]" />}
+          maxWidthClass="max-w-xl"
+          onClose={() => setSelectedDetailHackathon(null)}
+          footer={
+            <>
               <button
                 type="button"
                 onClick={() => setSelectedDetailHackathon(null)}
-                className="text-xs text-slate-500 hover:text-slate-800 px-2.5 py-1 rounded-lg border border-slate-200 cursor-pointer shrink-0"
+                className="px-4 py-2 rounded-xl border border-[#e9e5dd] bg-white hover:bg-[#f6f3eb] text-xs font-semibold text-[#4d4634] transition-colors duration-150 cursor-pointer"
               >
                 Close
               </button>
-            </div>
-
-            <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto text-xs">
-              <div className="grid grid-cols-2 gap-3 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200/70 dark:border-slate-800">
-                <div>
-                  <div className="text-[11px] text-slate-500 font-medium">
-                    Event Date (IST)
-                  </div>
-                  <div className="font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
-                    {formatEventDateDisplayIST(selectedDetailHackathon)}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-[11px] text-slate-500 font-medium">
-                    Location / Format
-                  </div>
-                  <div className="font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
-                    {selectedDetailHackathon.format === 'online'
-                      ? 'Online'
-                      : [
-                          selectedDetailHackathon.venue.name,
-                          selectedDetailHackathon.venue.campus,
-                        ]
-                          .filter(Boolean)
-                          .join(' · ') || 'PES University'}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-[11px] text-slate-500 font-medium">
-                    Registration Status
-                  </div>
-                  <div className="font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
-                    {
-                      getVerifiableRegistrationStatus(
-                        selectedDetailHackathon,
-                        todayIst
-                      ).label
-                    }
-                  </div>
-                </div>
-                <div>
-                  <div className="text-[11px] text-slate-500 font-medium">
-                    Team Size
-                  </div>
-                  <div className="font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
-                    {selectedDetailHackathon.minTeamSize !== null &&
-                    selectedDetailHackathon.maxTeamSize !== null
-                      ? selectedDetailHackathon.minTeamSize ===
-                        selectedDetailHackathon.maxTeamSize
-                        ? `${selectedDetailHackathon.minTeamSize} members`
-                        : `${selectedDetailHackathon.minTeamSize}–${selectedDetailHackathon.maxTeamSize} members`
-                      : 'Not specified on official page'}
-                  </div>
-                </div>
-              </div>
-
-              {selectedDetailHackathon.description && (
-                <div className="space-y-1">
-                  <div className="font-semibold text-slate-800 dark:text-slate-200">
-                    About this Hackathon
-                  </div>
-                  <p className="text-slate-600 dark:text-slate-300 whitespace-pre-line leading-relaxed">
-                    {selectedDetailHackathon.description}
-                  </p>
-                </div>
-              )}
-
-              {/* Verified Source & Registration Links */}
-              <div className="space-y-1.5 pt-2 border-t border-slate-100 dark:border-slate-800">
-                <div className="font-semibold text-slate-800 dark:text-slate-200">
-                  Official Links & Provenance
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {selectedDetailHackathon.registrationUrl &&
-                    selectedDetailHackathon.registrationUrl.startsWith('http') && (
-                      <a
-                        href={selectedDetailHackathon.registrationUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold"
-                      >
-                        <span>Registration Link</span>
-                        <ExternalLink className="w-3.5 h-3.5" />
-                      </a>
-                    )}
-                  {Array.from(
-                    new Set(
-                      [
-                        selectedDetailHackathon.verifiedCanonicalUrl,
-                        ...(selectedDetailHackathon.sourceIds ?? []).filter((s) =>
-                          s.startsWith('http')
-                        ),
-                      ].filter((u): u is string => Boolean(u))
-                    )
-                  ).map((url, idx) => (
-                    <a
-                      key={url}
-                      href={url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold"
-                    >
-                      <span>
-                        Official Source Page{idx > 0 ? ` #${idx + 1}` : ''}
-                      </span>
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            <div className="p-4 border-t border-slate-200 flex items-center justify-end gap-2 bg-slate-50/50">
-              <button
-                type="button"
-                onClick={() => setSelectedDetailHackathon(null)}
-                className="px-3.5 py-1.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 cursor-pointer"
-              >
-                Close
-              </button>
-              {isHackathonEligibleForTeamMatching(selectedDetailHackathon) ? (
+              {detailMatchable ? (
                 <button
                   type="button"
                   onClick={() => {
@@ -1771,437 +772,544 @@ export const HackathonsView: React.FC<HackathonsViewProps> = ({
                     setSelectedDetailHackathon(null);
                     onSelectHackathonForDiscovery(id);
                   }}
-                  className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-[#1c1b1b] text-xs font-bold shadow-2xs transition-colors duration-150 cursor-pointer"
                 >
                   Find Teammates
                 </button>
               ) : (
-                <span className="text-xs font-medium text-slate-500 px-2">
-                  Team matching closed for this event
+                <span className="text-xs font-medium text-[#746e65] px-2">
+                  Teammate matching unavailable
                 </span>
               )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ==================================================================== */}
-      {/* SUGGEST EVENT MODAL (URL EXTRACTION OR BROCHURE/POSTER UPLOAD)       */}
-      {/* ==================================================================== */}
-      {showSubmitModal && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="suggest-event-modal-title"
+            </>
+          }
         >
-          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-xl w-full border border-slate-200 dark:border-slate-800 shadow-2xl overflow-hidden my-8">
-            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+          <div className="space-y-5 text-xs">
+            {/* Key Event Metadata Grid */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-[#faf8f2] border border-[#e9e5dd] rounded-xl p-4">
               <div>
-                <h2
-                  id="suggest-event-modal-title"
-                  className="text-base font-bold text-slate-900 dark:text-slate-100"
-                >
-                  {candidateSourceOverride === 'academy_opt_in_hint'
-                    ? 'Suggest Event from PESU Academy Announcement'
-                    : 'Suggest a Public Event or Upload Brochure'}
-                </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  All submissions enter the Admin Review Queue first. Leave dates blank if unknown (&quot;Date TBA&quot;).
+                <div className="text-[11px] font-medium text-[#746e65]">
+                  Event Date
+                </div>
+                <div className="font-semibold text-[#1c1b1b] mt-0.5 tabular-nums">
+                  {formatEventDateDisplayIST(selectedDetailHackathon)}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-[11px] font-medium text-[#746e65] flex items-center gap-1">
+                  <MapPin className="w-3 h-3" />
+                  <span>Venue &amp; Format</span>
+                </div>
+                <div className="font-semibold text-[#1c1b1b] mt-0.5">
+                  {selectedDetailHackathon.format === 'online'
+                    ? 'Online'
+                    : [
+                        selectedDetailHackathon.venue?.name,
+                        selectedDetailHackathon.venue?.campus,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ') || 'PES University'}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-[11px] font-medium text-[#746e65] flex items-center gap-1">
+                  <Users className="w-3 h-3" />
+                  <span>Team Size</span>
+                </div>
+                <div className="font-semibold text-[#1c1b1b] mt-0.5 tabular-nums">
+                  {selectedDetailHackathon.minTeamSize !== null &&
+                  selectedDetailHackathon.maxTeamSize !== null
+                    ? selectedDetailHackathon.minTeamSize ===
+                      selectedDetailHackathon.maxTeamSize
+                      ? `${selectedDetailHackathon.minTeamSize} members`
+                      : `${selectedDetailHackathon.minTeamSize}–${selectedDetailHackathon.maxTeamSize} members`
+                    : 'Not specified on official page'}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-[11px] font-medium text-[#746e65]">
+                  Registration Status
+                </div>
+                <div className="font-semibold text-[#1c1b1b] mt-0.5">
+                  {detailRegInfo.label}
+                </div>
+              </div>
+
+              {selectedDetailHackathon.registrationDeadline && (
+                <div className="sm:col-span-2 pt-2 border-t border-[#e9e5dd]">
+                  <div className="text-[11px] font-medium text-[#746e65]">
+                    Registration Deadline
+                  </div>
+                  <div className="font-semibold text-[#1c1b1b] mt-0.5 tabular-nums">
+                    {formatEventDateDisplayIST({
+                      startAt: selectedDetailHackathon.registrationDeadline,
+                      endAt: selectedDetailHackathon.registrationDeadline,
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Eligibility & Registration Guidance */}
+            <div
+              className={`rounded-xl border px-3.5 py-2.5 text-xs leading-relaxed ${
+                detailRegInfo.kind === 'not_yet_open'
+                  ? 'bg-[#fff3c9]/50 border-[#f0d98c] text-[#564500]'
+                  : detailRegInfo.kind === 'open'
+                  ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                  : 'bg-[#f6f3f2] border-[#e9e5dd] text-[#4d4634]'
+              }`}
+            >
+              {detailRegInfo.helperText}
+            </div>
+
+            {/* Description */}
+            {selectedDetailHackathon.description && (
+              <div className="space-y-1.5">
+                <div className="font-semibold text-[#1c1b1b] text-xs">
+                  About this Hackathon
+                </div>
+                <p className="text-[#4d4634] whitespace-pre-line leading-relaxed text-xs">
+                  {selectedDetailHackathon.description}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setShowSubmitModal(false)}
-                className="text-xs text-slate-500 hover:text-slate-800 px-2.5 py-1 rounded-lg border border-slate-200 cursor-pointer"
-              >
-                Close
-              </button>
-            </div>
+            )}
 
-            <div className="p-5 space-y-4 max-h-[82vh] overflow-y-auto">
-              {/* Source Method Tabs */}
-              <div className="flex rounded-lg border border-slate-200 dark:border-slate-800 p-0.5 bg-slate-50 dark:bg-slate-800/60">
-                <button
-                  type="button"
-                  onClick={() => setSubmissionTab('url')}
-                  className={`flex-1 py-1.5 text-xs font-semibold rounded-md inline-flex items-center justify-center gap-1.5 cursor-pointer ${
-                    submissionTab === 'url'
-                      ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                      : 'text-slate-500'
-                  }`}
-                >
-                  <Link2 className="w-3.5 h-3.5" />
-                  <span>Public Event URL</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSubmissionTab('file')}
-                  className={`flex-1 py-1.5 text-xs font-semibold rounded-md inline-flex items-center justify-center gap-1.5 cursor-pointer ${
-                    submissionTab === 'file'
-                      ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                      : 'text-slate-500'
-                  }`}
-                >
-                  <Upload className="w-3.5 h-3.5" />
-                  <span>Upload Poster / PDF Brochure</span>
-                </button>
-              </div>
-
-              {submissionTab === 'url' ? (
-                <div className="space-y-2.5">
-                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    Step 1: Verify & Extract from Public Event URL (Optional)
-                  </label>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={rawUrl}
-                      onChange={(e) => setRawUrl(e.target.value)}
-                      placeholder="https://events.pes.edu/11629/ or Unstop / Devfolio link"
-                      className="flex-1 px-3 py-2 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono"
-                    />
-                    <button
-                      type="button"
-                      disabled={isExtractingLive}
-                      onClick={handleFetchUrlPreview}
-                      className="px-3 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold hover:opacity-90 shrink-0 cursor-pointer inline-flex items-center gap-1.5 disabled:opacity-50"
+            {/* Themes */}
+            {selectedDetailHackathon.themes &&
+              selectedDetailHackathon.themes.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {selectedDetailHackathon.themes.map((theme) => (
+                    <span
+                      key={theme}
+                      className="px-2.5 py-1 rounded-lg bg-[#f6f3f2] border border-[#e9e5dd] text-[#4d4634] text-[11px] font-medium"
                     >
-                      {isExtractingLive && (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      )}
-                      <span>
-                        {isExtractingLive ? 'Verifying...' : 'Verify & Extract'}
-                      </span>
-                    </button>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
-                    <div className="flex flex-wrap gap-1.5">
-                      <span>Quick fill:</span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setRawUrl('https://events.pes.edu/11629/')
-                        }
-                        className="text-blue-600 hover:underline cursor-pointer"
-                      >
-                        events.pes.edu Hackathon
-                      </button>
-                      <span>·</span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setRawUrl('https://events.pes.edu/11632/')
-                        }
-                        className="text-amber-600 hover:underline cursor-pointer"
-                      >
-                        events.pes.edu Talk (Excluded)
-                      </button>
-                    </div>
-
-                    <label className="inline-flex items-center gap-1 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={useAiFallbackForUrl}
-                        onChange={(e) =>
-                          setUseAiFallbackForUrl(e.target.checked)
-                        }
-                        className="rounded border-slate-300"
-                      />
-                      <span>AI fallback if unstructured</span>
-                    </label>
-                  </div>
-
-                  {originalSubmissionUrl && (
-                    <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-[11px] space-y-1">
-                      <div className="flex items-center justify-between">
-                        <span className="font-semibold text-slate-600 dark:text-slate-300">
-                          URL Status:
-                        </span>
-                        <span className="font-mono font-semibold uppercase text-blue-600">
-                          {sourceUrlStatus}
-                        </span>
-                      </div>
-                      {verifiedCanonicalUrl && (
-                        <div className="font-mono text-emerald-700 dark:text-emerald-400 truncate">
-                          Canonical: {verifiedCanonicalUrl}
-                        </div>
-                      )}
-                      {redirectChainInfo.length > 1 && (
-                        <div className="text-slate-400 truncate">
-                          Redirects: {redirectChainInfo.join(' → ')}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="space-y-2.5">
-                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    Step 1: Upload Official Event Brochure (PDF) or Poster (PNG/JPG/WebP)
-                  </label>
-                  <div className="border-2 border-dashed border-slate-200 dark:border-slate-700 rounded-xl p-4 text-center space-y-2 bg-slate-50/50 dark:bg-slate-800/30">
-                    <FileText className="w-6 h-6 text-slate-400 mx-auto" />
-                    <div className="text-xs text-slate-600 dark:text-slate-300">
-                      <label className="text-blue-600 font-semibold hover:underline cursor-pointer">
-                        <span>Choose PDF or Poster Image</span>
-                        <input
-                          type="file"
-                          accept=".pdf,image/png,image/jpeg,image/webp"
-                          onChange={handleFileUpload}
-                          className="hidden"
-                        />
-                      </label>{' '}
-                      (Max 10MB)
-                    </div>
-                    {isExtractingLive && (
-                      <div className="inline-flex items-center gap-1.5 text-xs text-blue-600 font-medium">
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>Extracting grounded text from file...</span>
-                      </div>
-                    )}
-                    {uploadedAttachmentMeta && (
-                      <div className="text-[11px] font-mono text-emerald-700 dark:text-emerald-400">
-                        Attached: {uploadedAttachmentMeta.fileName} (
-                        {Math.round(uploadedAttachmentMeta.byteSize / 1024)} KB)
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {urlError && (
-                <div className="p-3 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 flex items-start gap-2 text-xs text-rose-800 dark:text-rose-200">
-                  <XCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                  <span>{urlError}</span>
-                </div>
-              )}
-
-              {urlWarnings.length > 0 && (
-                <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 space-y-1 text-xs text-amber-800 dark:text-amber-200">
-                  {urlWarnings.map((w, idx) => (
-                    <div key={idx} className="flex items-start gap-2">
-                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                      <span>{w}</span>
-                    </div>
+                      {theme}
+                    </span>
                   ))}
                 </div>
               )}
 
-              {/* Candidate Form */}
-              <form
-                onSubmit={handleSubmitCandidate}
-                className="space-y-3 pt-2 border-t border-slate-200 dark:border-slate-800"
-              >
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                      Event Title *
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={title}
-                      onChange={(e) => setTitle(e.target.value)}
-                      placeholder="e.g., HackPES 2026: Systems & AI"
-                      className="w-full px-3 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                      Organizer / Club *
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={organizer}
-                      onChange={(e) => setOrganizer(e.target.value)}
-                      placeholder="e.g., PES CSE & ACM Student Chapter"
-                      className="w-full px-3 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                    Description & Format Details
-                  </label>
-                  <textarea
-                    rows={2}
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    placeholder="Grounded event overview..."
-                    className="w-full px-3 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
-                  />
-                </div>
-
-                {/* Live Rule-Based Classifier Preview */}
-                <div
-                  className={`p-2.5 rounded-lg border text-xs flex items-start gap-2 ${
-                    liveClassification.matchable
-                      ? 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-200 text-emerald-900 dark:text-emerald-200'
-                      : 'bg-amber-50/70 dark:bg-amber-950/30 border-amber-200 text-amber-900 dark:text-amber-200'
-                  }`}
-                >
-                  <Info className="w-4 h-4 shrink-0 mt-0.5" />
-                  <div>
-                    <div className="font-semibold">
-                      Detected Type:{' '}
-                      <span className="uppercase font-mono">
-                        {liveClassification.eventType}
-                      </span>{' '}
-                      (team matchable = {String(liveClassification.matchable)})
-                    </div>
-                    <div className="text-[11px] opacity-85">
-                      {liveClassification.reason}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      Campus
-                    </label>
-                    <select
-                      value={campus}
-                      onChange={(e) =>
-                        setCampus(e.target.value as CampusType | '')
-                      }
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
+            {/* Official Links */}
+            <div className="space-y-2 pt-3 border-t border-[#f1ede6]">
+              <div className="font-semibold text-[#1c1b1b] text-xs">
+                Official Links
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {selectedDetailHackathon.registrationUrl &&
+                  selectedDetailHackathon.registrationUrl.startsWith(
+                    'http'
+                  ) && (
+                    <a
+                      href={selectedDetailHackathon.registrationUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-[#1c1b1b] font-bold transition-colors duration-150"
                     >
-                      <option value="">Unconfirmed</option>
-                      <option value="RR Campus">RR Campus</option>
-                      <option value="EC Campus">EC Campus</option>
-                      <option value="HN Campus">HN Campus</option>
-                      <option value="Online">Online</option>
-                      <option value="Cross-Campus">Cross-Campus</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      Venue / Room
-                    </label>
-                    <input
-                      type="text"
-                      value={venueName}
-                      onChange={(e) => setVenueName(e.target.value)}
-                      placeholder="Leave blank if TBA"
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      Min Team
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      placeholder="Null"
-                      value={minTeamSize}
-                      onChange={(e) => setMinTeamSize(e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      Max Team
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      placeholder="Null"
-                      value={maxTeamSize}
-                      onChange={(e) => setMaxTeamSize(e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      Start Date (blank = Date TBA)
-                    </label>
-                    <input
-                      type="date"
-                      value={startAt}
-                      onChange={(e) => setStartAt(e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      End Date
-                    </label>
-                    <input
-                      type="date"
-                      value={endAt}
-                      onChange={(e) => setEndAt(e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      Registration Deadline
-                    </label>
-                    <input
-                      type="date"
-                      value={registrationDeadline}
-                      onChange={(e) => setRegistrationDeadline(e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      Official Registration Link
-                    </label>
-                    <input
-                      type="url"
-                      value={registrationUrl}
-                      onChange={(e) => setRegistrationUrl(e.target.value)}
-                      placeholder="https://..."
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
-                      Themes (comma-separated)
-                    </label>
-                    <input
-                      type="text"
-                      value={themesInput}
-                      onChange={(e) => setThemesInput(e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
-                    />
-                  </div>
-                </div>
-
-                <div className="flex justify-end gap-2 pt-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowSubmitModal(false)}
-                    className="px-3.5 py-2 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 cursor-pointer"
+                      <span>Official Registration</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  )}
+                {Array.from(
+                  new Set(
+                    [
+                      selectedDetailHackathon.verifiedCanonicalUrl,
+                      ...(selectedDetailHackathon.sourceIds ?? []).filter((s) =>
+                        s.startsWith('http')
+                      ),
+                    ].filter(
+                      (u): u is string =>
+                        Boolean(u) &&
+                        u !== selectedDetailHackathon.registrationUrl
+                    )
+                  )
+                ).map((url, idx) => (
+                  <a
+                    key={url}
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-[#e9e5dd] bg-white hover:bg-[#f6f3eb] text-[#1c1b1b] font-semibold transition-colors duration-150"
                   >
-                    Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold cursor-pointer"
-                  >
-                    Stage for Admin Review
-                  </button>
-                </div>
-              </form>
+                    <span>
+                      Official Event Page{idx > 0 ? ` #${idx + 1}` : ''}
+                    </span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
+        </Modal>
+      )}
+
+      {/* ==================================================================== */}
+      {/* SUGGEST HACKATHON MODAL                                              */}
+      {/* ==================================================================== */}
+      {showSubmitModal && (
+        <Modal
+          title="Suggest a Hackathon"
+          subtitle="Submissions are verified before appearing in the upcoming catalog."
+          headerIcon={<Plus className="w-4 h-4 text-[#725c00]" />}
+          maxWidthClass="max-w-xl"
+          onClose={() => setShowSubmitModal(false)}
+        >
+          <div className="space-y-4">
+            {/* Source Method Tabs */}
+            <div className="flex rounded-xl border border-[#e9e5dd] p-1 bg-[#faf8f2]">
+              <button
+                type="button"
+                onClick={() => setSubmissionTab('url')}
+                className={`flex-1 py-1.5 text-xs font-semibold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 ${
+                  submissionTab === 'url'
+                    ? 'bg-white text-[#1c1b1b] shadow-2xs border border-[#e9e5dd]'
+                    : 'text-[#746e65] hover:text-[#1c1b1b]'
+                }`}
+              >
+                <Link2 className="w-3.5 h-3.5" />
+                <span>Public Event URL</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSubmissionTab('file')}
+                className={`flex-1 py-1.5 text-xs font-semibold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer transition-colors duration-150 ${
+                  submissionTab === 'file'
+                    ? 'bg-white text-[#1c1b1b] shadow-2xs border border-[#e9e5dd]'
+                    : 'text-[#746e65] hover:text-[#1c1b1b]'
+                }`}
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span>Upload Poster / PDF Brochure</span>
+              </button>
+            </div>
+
+            {submissionTab === 'url' ? (
+              <div className="space-y-2.5">
+                <label className="block text-xs font-semibold text-[#1c1b1b]">
+                  Step 1: Verify &amp; Extract from Public Event URL (Optional)
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={rawUrl}
+                    onChange={(e) => setRawUrl(e.target.value)}
+                    placeholder="https://events.pes.edu/... or Unstop / Devfolio link"
+                    className="flex-1 px-3 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] text-[#1c1b1b] font-mono focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                  />
+                  <button
+                    type="button"
+                    disabled={isExtractingLive}
+                    onClick={handleFetchUrlPreview}
+                    className="px-3.5 py-2 rounded-xl bg-[#24211c] hover:bg-[#3a352d] text-white text-xs font-semibold shrink-0 cursor-pointer inline-flex items-center gap-1.5 disabled:opacity-50 transition-colors duration-150"
+                  >
+                    {isExtractingLive && (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    )}
+                    <span>
+                      {isExtractingLive ? 'Verifying...' : 'Verify & Extract'}
+                    </span>
+                  </button>
+                </div>
+
+                <label className="inline-flex items-center gap-1.5 text-[11px] text-[#746e65] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useAiFallbackForUrl}
+                    onChange={(e) => setUseAiFallbackForUrl(e.target.checked)}
+                    className="rounded border-[#d0c6ae]"
+                  />
+                  <span>Use AI fallback if event page is unstructured</span>
+                </label>
+
+                {originalSubmissionUrl && (
+                  <div className="p-2.5 rounded-xl bg-[#faf8f2] border border-[#e9e5dd] text-[11px] space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-[#4d4634]">
+                        URL Status:
+                      </span>
+                      <span className="font-mono font-semibold uppercase text-[#725c00]">
+                        {sourceUrlStatus}
+                      </span>
+                    </div>
+                    {verifiedCanonicalUrl && (
+                      <div className="font-mono text-emerald-700 truncate">
+                        Canonical: {verifiedCanonicalUrl}
+                      </div>
+                    )}
+                    {redirectChainInfo.length > 1 && (
+                      <div className="text-[#746e65] truncate">
+                        Redirects: {redirectChainInfo.join(' → ')}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                <label className="block text-xs font-semibold text-[#1c1b1b]">
+                  Step 1: Upload Official Event Brochure (PDF) or Poster
+                  (PNG/JPG/WebP)
+                </label>
+                <div className="border-2 border-dashed border-[#e9e5dd] rounded-xl p-4 text-center space-y-2 bg-[#faf8f2]">
+                  <FileText className="w-6 h-6 text-[#746e65] mx-auto" />
+                  <div className="text-xs text-[#4d4634]">
+                    <label className="text-[#725c00] font-semibold hover:underline cursor-pointer">
+                      <span>Choose PDF or Poster Image</span>
+                      <input
+                        type="file"
+                        accept=".pdf,image/png,image/jpeg,image/webp"
+                        onChange={handleFileUpload}
+                        className="hidden"
+                      />
+                    </label>{' '}
+                    (Max 10MB)
+                  </div>
+                  {isExtractingLive && (
+                    <div className="inline-flex items-center gap-1.5 text-xs text-[#725c00] font-medium">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Extracting details from file...</span>
+                    </div>
+                  )}
+                  {uploadedAttachmentMeta && (
+                    <div className="text-[11px] font-mono text-emerald-700">
+                      Attached: {uploadedAttachmentMeta.fileName} (
+                      {Math.round(uploadedAttachmentMeta.byteSize / 1024)} KB)
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {urlError && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 flex items-start gap-2 text-xs text-rose-800">
+                <XCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span>{urlError}</span>
+              </div>
+            )}
+
+            {urlWarnings.length > 0 && (
+              <div className="p-3 rounded-xl bg-[#fff3c9]/60 border border-[#f0d98c] space-y-1 text-xs text-[#564500]">
+                {urlWarnings.map((w, idx) => (
+                  <div key={idx} className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-[#875200] shrink-0 mt-0.5" />
+                    <span>{w}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <form
+              onSubmit={handleSubmitCandidate}
+              className="space-y-3 pt-3 border-t border-[#f1ede6]"
+            >
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-[#1c1b1b] mb-1">
+                    Event Title *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                    placeholder="e.g., HackPES 2026"
+                    className="w-full px-3 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-[#1c1b1b] mb-1">
+                    Organizer / Club *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={organizer}
+                    onChange={(e) => setOrganizer(e.target.value)}
+                    placeholder="e.g., PES CSE & ACM Student Chapter"
+                    className="w-full px-3 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#1c1b1b] mb-1">
+                  Description &amp; Format Details
+                </label>
+                <textarea
+                  rows={2}
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  placeholder="Brief event overview..."
+                  className="w-full px-3 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
+                />
+              </div>
+
+              <div
+                className={`p-2.5 rounded-xl border text-xs flex items-start gap-2 ${
+                  liveClassification.matchable
+                    ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                    : 'bg-[#fff3c9]/60 border-[#f0d98c] text-[#564500]'
+                }`}
+              >
+                <Info className="w-4 h-4 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-semibold">
+                    Category:{' '}
+                    <span className="uppercase font-mono">
+                      {liveClassification.eventType}
+                    </span>
+                  </div>
+                  <div className="text-[11px] opacity-85">
+                    {liveClassification.reason}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    Campus
+                  </label>
+                  <select
+                    value={campus}
+                    onChange={(e) =>
+                      setCampus(e.target.value as CampusType | '')
+                    }
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-white"
+                  >
+                    <option value="">Unconfirmed</option>
+                    <option value="RR Campus">RR Campus</option>
+                    <option value="EC Campus">EC Campus</option>
+                    <option value="Online / Multi-Campus">
+                      Online / Multi-Campus
+                    </option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    Venue / Room
+                  </label>
+                  <input
+                    type="text"
+                    value={venueName}
+                    onChange={(e) => setVenueName(e.target.value)}
+                    placeholder="Leave blank if TBA"
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] focus:bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    Min Team
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    placeholder="2"
+                    value={minTeamSize}
+                    onChange={(e) => setMinTeamSize(e.target.value)}
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] focus:bg-white font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    Max Team
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    placeholder="4"
+                    value={maxTeamSize}
+                    onChange={(e) => setMaxTeamSize(e.target.value)}
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] focus:bg-white font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    Start Date
+                  </label>
+                  <input
+                    type="date"
+                    value={startAt}
+                    onChange={(e) => setStartAt(e.target.value)}
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    End Date
+                  </label>
+                  <input
+                    type="date"
+                    value={endAt}
+                    onChange={(e) => setEndAt(e.target.value)}
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    Registration Deadline
+                  </label>
+                  <input
+                    type="date"
+                    value={registrationDeadline}
+                    onChange={(e) => setRegistrationDeadline(e.target.value)}
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-white"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    Official Registration Link
+                  </label>
+                  <input
+                    type="url"
+                    value={registrationUrl}
+                    onChange={(e) => setRegistrationUrl(e.target.value)}
+                    placeholder="https://..."
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] focus:bg-white font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-[#4d4634] mb-1">
+                    Themes (comma-separated)
+                  </label>
+                  <input
+                    type="text"
+                    value={themesInput}
+                    onChange={(e) => setThemesInput(e.target.value)}
+                    className="w-full px-2.5 py-2 text-xs rounded-xl border border-[#e9e5dd] bg-[#faf8f2] focus:bg-white"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowSubmitModal(false)}
+                  className="px-4 py-2 rounded-xl border border-[#e9e5dd] bg-white hover:bg-[#f6f3eb] text-xs font-semibold text-[#4d4634] transition-colors duration-150 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-[#1c1b1b] text-xs font-bold transition-colors duration-150 cursor-pointer"
+                >
+                  Submit for Review
+                </button>
+              </div>
+            </form>
+          </div>
+        </Modal>
       )}
     </div>
   );

@@ -1,19 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  AlertTriangle,
-  ArrowLeft,
-  ArrowRight,
-  CheckCircle2,
-  ChevronDown,
-  ChevronUp,
-  FolderGit2,
-  Heart,
-  RotateCcw,
-  ShieldAlert,
-  Sparkles,
-  Users,
-  X,
-} from 'lucide-react';
+import React, { useMemo, useState, useRef, useEffect, useCallback } from 'react';
 import {
   BlockRecord,
   CandidateCard,
@@ -27,19 +12,36 @@ import {
   User,
 } from '../types/domain';
 import {
-  computeTeamCombinedCapabilities,
   isHackathonEligibleForMatching,
   rankPeopleForHackathon,
 } from '../services/matchingEngine';
+import { formatEventDateDisplayIST } from '../lib/eventsAndAnnouncements';
+import { filterUpcomingStudentHackathons } from '../lib/pagination';
 import { StudentAvatar } from './StudentAvatar';
+import { SelectMenu, SelectMenuOption } from './SelectMenu';
+import { QUACKATHON_MINI_LOGO_SRC } from './LoginPage';
+import {
+  AlertTriangle,
+  Calendar,
+  Check,
+  ExternalLink,
+  FlaskConical,
+  Github,
+  Heart,
+  RefreshCw,
+  RotateCcw,
+  UserPlus,
+  Users,
+  X,
+} from 'lucide-react';
 
 interface DiscoverViewProps {
   currentUser: User;
   hackathons: Hackathon[];
   selectedHackathonId: string;
   onSelectHackathon: (id: string) => void;
-  discoveryMode?: DiscoveryMode;
-  onChangeDiscoveryMode?: (mode: DiscoveryMode) => void;
+  discoveryMode: DiscoveryMode;
+  onChangeDiscoveryMode: (mode: DiscoveryMode) => void;
   users: User[];
   profiles: Record<string, Profile>;
   participations: Participation[];
@@ -60,95 +62,172 @@ interface DiscoverViewProps {
     card: CandidateCard,
     decision: 'interested' | 'passed',
     customNote?: string
-  ) => Promise<void> | void;
-  onResetPassedCards: (hackathonId: string) => void;
+  ) => void;
+  onResetPassedCards?: (hackathonId: string) => Promise<void> | void;
   onBlockUser: (targetUid: string) => void;
   onOpenMyTeam?: () => void;
   onOpenProfile?: () => void;
+  onOpenHackathons?: () => void;
+  /** Strictly development-only testing mode hooks (never exposed in production) */
+  devTestingAvailable?: boolean;
+  devTestingActive?: boolean;
+  onToggleDevTestingMode?: (enabled: boolean) => void;
+  onResetDevTestingSandbox?: () => void;
 }
 
-const SWIPE_THRESHOLD_PX = 85;
+export const DiscoverView: React.FC<DiscoverViewProps> = ({
+  currentUser,
+  hackathons,
+  selectedHackathonId,
+  onSelectHackathon,
+  users,
+  profiles,
+  participations,
+  teams,
+  memberships,
+  interests,
+  blocks,
+  onUpdateParticipation,
+  onSwipeDecision,
+  onResetPassedCards,
+  onOpenMyTeam,
+  onOpenHackathons,
+  devTestingAvailable = false,
+  devTestingActive = false,
+  onToggleDevTestingMode,
+  onResetDevTestingSandbox,
+}) => {
+  const [exitingCard, setExitingCard] = useState<{
+    id: string;
+    direction: 'left' | 'right';
+  } | null>(null);
+  const [dragOffsetX, setDragOffsetX] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isJoiningPool, setIsJoiningPool] = useState(false);
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
 
-export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
-  ({
-    currentUser,
-    hackathons,
-    selectedHackathonId,
-    onSelectHackathon,
-    users,
-    profiles,
-    participations,
-    teams,
-    memberships,
-    interests,
-    blocks,
-    onSwipeDecision,
-    onResetPassedCards,
-    onBlockUser,
-    onOpenMyTeam,
-    onOpenProfile,
-  }) => {
-    const [expandedDetails, setExpandedDetails] = useState(false);
-    const [showScoreBreakdown, setShowScoreBreakdown] = useState(false);
-    const [noteDraft, setNoteDraft] = useState('');
-    const [submittingCardId, setSubmittingCardId] = useState<string | null>(null);
-    const [exitDirection, setExitDirection] = useState<'left' | 'right' | null>(
-      null
+  // Separate upcoming matchable hackathons from closed/past ones
+  const upcomingMatchableHackathons = useMemo(
+    () =>
+      filterUpcomingStudentHackathons(hackathons).filter((h) =>
+        isHackathonEligibleForMatching(h)
+      ),
+    [hackathons]
+  );
+
+  // When in dev testing mode, only show the active matchable dev sandbox hackathon
+  const selectableHackathons = useMemo(() => {
+    if (devTestingActive) {
+      return hackathons.filter((h) => isHackathonEligibleForMatching(h));
+    }
+    return upcomingMatchableHackathons;
+  }, [devTestingActive, hackathons, upcomingMatchableHackathons]);
+
+  const selectedHackathon = useMemo(() => {
+    const exact = hackathons.find((h) => h.id === selectedHackathonId);
+    if (exact && isHackathonEligibleForMatching(exact)) return exact;
+    if (selectableHackathons.length > 0) return selectableHackathons[0];
+    return exact ?? null;
+  }, [hackathons, selectedHackathonId, selectableHackathons]);
+
+  // Keep parent selectedHackathonId aligned with first upcoming matchable event when needed
+  useEffect(() => {
+    if (
+      selectableHackathons.length > 0 &&
+      (!selectedHackathonId ||
+        !selectableHackathons.some((h) => h.id === selectedHackathonId))
+    ) {
+      onSelectHackathon(selectableHackathons[0].id);
+    }
+  }, [selectableHackathons, selectedHackathonId, onSelectHackathon]);
+
+  const hackathonSelectOptions: SelectMenuOption[] = useMemo(
+    () =>
+      selectableHackathons.map((h) => ({
+        value: h.id,
+        label: h.name,
+        description: formatEventDateDisplayIST(h),
+        badge: devTestingActive ? 'Dev Test' : undefined,
+      })),
+    [selectableHackathons, devTestingActive]
+  );
+
+  const selectedHackathonEligible = useMemo(
+    () =>
+      selectedHackathon
+        ? isHackathonEligibleForMatching(selectedHackathon)
+        : false,
+    [selectedHackathon]
+  );
+
+  // Real user explicit opt-in check (do NOT silently opt real users into discovery)
+  const viewerParticipation = useMemo(
+    () =>
+      selectedHackathon
+        ? participations.find(
+            (p) =>
+              p.uid === currentUser.uid &&
+              p.hackathonId === selectedHackathon.id
+          )
+        : undefined,
+    [participations, currentUser.uid, selectedHackathon]
+  );
+
+  const hasExplicitlyJoinedPool = Boolean(
+    devTestingActive || viewerParticipation?.discoverable === true
+  );
+
+  // Viewer's active team for the selected hackathon
+  const viewerActiveTeam = useMemo(() => {
+    if (!selectedHackathon) return undefined;
+    const myMem = memberships.find(
+      (m) =>
+        m.uid === currentUser.uid &&
+        m.status === 'active' &&
+        (m.hackathonId === selectedHackathon.id ||
+          teams.some(
+            (t) => t.id === m.teamId && t.hackathonId === selectedHackathon.id
+          ))
     );
-
-    // Pointer drag gesture state for Tinder-like swipe cards
-    const [dragOffsetX, setDragOffsetX] = useState(0);
-    const [isDragging, setIsDragging] = useState(false);
-    const dragStartXRef = useRef<number | null>(null);
-
-    const selectedHackathon =
-      hackathons.find((h) => h.id === selectedHackathonId) ?? hackathons[0];
-
-    const viewerProfile = profiles[currentUser.uid];
-
-    const teamCapabilities = useMemo(() => {
-      if (!selectedHackathon || !viewerProfile) return null;
-      return computeTeamCombinedCapabilities({
-        viewerUid: currentUser.uid,
-        viewerProfile,
-        hackathon: selectedHackathon,
-        allTeams: teams,
-        allMemberships: memberships,
-        allProfiles: Object.values(profiles),
-      });
-    }, [
-      selectedHackathon,
-      viewerProfile,
-      currentUser.uid,
-      teams,
-      memberships,
-      profiles,
-    ]);
-
-    const viewerActiveTeam = teamCapabilities?.activeTeam ?? null;
-    const isTeamFull = Boolean(
-      viewerActiveTeam &&
-        teamCapabilities &&
-        (viewerActiveTeam.status === 'full' ||
-          teamCapabilities.memberCount >= teamCapabilities.maxCapacity)
+    if (myMem) {
+      return teams.find(
+        (t) =>
+          t.id === myMem.teamId &&
+          t.hackathonId === selectedHackathon.id &&
+          t.status !== 'dissolved'
+      );
+    }
+    return teams.find(
+      (t) =>
+        t.hackathonId === selectedHackathon.id &&
+        t.leaderId === currentUser.uid &&
+        t.status !== 'dissolved'
     );
+  }, [memberships, teams, currentUser.uid, selectedHackathon]);
 
-    const studentCards = useMemo(() => {
-      if (!selectedHackathon) return [];
-      return rankPeopleForHackathon({
-        viewerUid: currentUser.uid,
-        hackathon: selectedHackathon,
-        users,
-        profiles,
-        participations,
-        teams,
-        memberships,
-        interests,
-        blocks,
-      }).cards;
-    }, [
-      currentUser.uid,
-      selectedHackathon,
+  const maxAllowedSize = selectedHackathon?.maxTeamSize ?? 4;
+  const viewerTeamIsFull = Boolean(
+    viewerActiveTeam &&
+      (viewerActiveTeam.status === 'full' ||
+        viewerActiveTeam.status === 'locked' ||
+        viewerActiveTeam.memberCount >=
+          Math.min(
+            maxAllowedSize,
+            viewerActiveTeam.targetSize || maxAllowedSize
+          ))
+  );
+
+  const candidateCards = useMemo(() => {
+    if (
+      !selectedHackathon ||
+      !selectedHackathonEligible ||
+      !hasExplicitlyJoinedPool
+    ) {
+      return [];
+    }
+    return rankPeopleForHackathon({
+      viewerUid: currentUser.uid,
+      hackathon: selectedHackathon,
       users,
       profiles,
       participations,
@@ -156,625 +235,687 @@ export const DiscoverView: React.FC<DiscoverViewProps> = React.memo(
       memberships,
       interests,
       blocks,
-    ]);
+    }).cards;
+  }, [
+    currentUser.uid,
+    selectedHackathon,
+    selectedHackathonEligible,
+    hasExplicitlyJoinedPool,
+    users,
+    profiles,
+    participations,
+    teams,
+    memberships,
+    interests,
+    blocks,
+  ]);
 
-    const topCard = studentCards[0] ?? null;
-    const nextCard = studentCards[1] ?? null;
-    const topCardUser = useMemo(
-      () => (topCard ? users.find((u) => u.uid === topCard.id) : undefined),
-      [topCard, users]
-    );
-    const topCardProfile = useMemo(
-      () => (topCard ? profiles[topCard.id] : undefined),
-      [topCard, profiles]
-    );
+  const passedCountForSelected = useMemo(() => {
+    if (!selectedHackathon) return 0;
+    return interests.filter(
+      (i) =>
+        i.hackathonId === selectedHackathon.id &&
+        i.fromUid === currentUser.uid &&
+        i.targetType === 'user' &&
+        i.decision === 'passed'
+    ).length;
+  }, [interests, selectedHackathon, currentUser.uid]);
 
-    // Reset card-local UI when the top card changes
-    useEffect(() => {
-      setExpandedDetails(false);
-      setDragOffsetX(0);
-      setIsDragging(false);
-      setExitDirection(null);
-    }, [topCard?.id]);
+  const swipedRightCountForSelected = useMemo(() => {
+    if (!selectedHackathon) return 0;
+    return interests.filter(
+      (i) =>
+        i.hackathonId === selectedHackathon.id &&
+        i.fromUid === currentUser.uid &&
+        i.targetType === 'user' &&
+        i.decision === 'interested'
+    ).length;
+  }, [interests, selectedHackathon, currentUser.uid]);
 
-    const triggerSwipe = useCallback(
-      async (decision: 'interested' | 'passed') => {
-        if (!topCard || submittingCardId === topCard.id || isTeamFull) return;
-        const cardToSwipe = topCard;
-        const noteToSend =
-          decision === 'interested' ? noteDraft.trim() || undefined : undefined;
+  const topCard = candidateCards[0] ?? null;
 
-        setSubmittingCardId(cardToSwipe.id);
-        setExitDirection(decision === 'interested' ? 'right' : 'left');
-        setDragOffsetX(decision === 'interested' ? 220 : -220);
+  const triggerDecision = useCallback(
+    (card: CandidateCard, decision: 'interested' | 'passed') => {
+      if (exitingCard) return;
+      setExitingCard({
+        id: card.id,
+        direction: decision === 'interested' ? 'right' : 'left',
+      });
+      setTimeout(() => {
+        onSwipeDecision(card, decision);
+        setExitingCard(null);
+        setDragOffsetX(0);
+      }, 175);
+    },
+    [exitingCard, onSwipeDecision]
+  );
 
-        try {
-          await onSwipeDecision(cardToSwipe, decision, noteToSend);
-          setNoteDraft('');
-        } finally {
-          setSubmittingCardId(null);
-          setExitDirection(null);
-          setDragOffsetX(0);
-        }
-      },
-      [topCard, submittingCardId, isTeamFull, noteDraft, onSwipeDecision]
-    );
-
-    // Keyboard accessibility: ArrowLeft -> Pass, ArrowRight -> Interested
-    useEffect(() => {
-      const onKeyDown = (e: KeyboardEvent) => {
-        if (!topCard || isTeamFull || submittingCardId) return;
-        const target = e.target as HTMLElement | null;
-        if (
-          target &&
-          (target.tagName === 'INPUT' ||
-            target.tagName === 'TEXTAREA' ||
-            target.tagName === 'SELECT' ||
-            target.isContentEditable)
-        ) {
-          return;
-        }
-        if (e.key === 'ArrowLeft') {
-          e.preventDefault();
-          void triggerSwipe('passed');
-        } else if (e.key === 'ArrowRight') {
-          e.preventDefault();
-          void triggerSwipe('interested');
-        }
-      };
-
-      window.addEventListener('keydown', onKeyDown);
-      return () => window.removeEventListener('keydown', onKeyDown);
-    }, [topCard, isTeamFull, submittingCardId, triggerSwipe]);
-
-    const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!topCard || isTeamFull || submittingCardId) return;
-      const target = e.target as HTMLElement;
+  // Keyboard accessibility: Left arrow = Pass, Right arrow = Interested
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!topCard || exitingCard) return;
+      const target = e.target as HTMLElement | null;
       if (
-        target.closest('button') ||
-        target.closest('input') ||
-        target.closest('textarea') ||
-        target.closest('select') ||
-        target.closest('a')
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
       ) {
         return;
       }
-      dragStartXRef.current = e.clientX;
-      setIsDragging(true);
-    };
-
-    const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!isDragging || dragStartXRef.current === null) return;
-      const deltaX = e.clientX - dragStartXRef.current;
-      setDragOffsetX(Math.max(-260, Math.min(260, deltaX)));
-    };
-
-    const handlePointerUpOrCancel = () => {
-      if (!isDragging) return;
-      const finalDelta = dragOffsetX;
-      dragStartXRef.current = null;
-      setIsDragging(false);
-
-      if (finalDelta >= SWIPE_THRESHOLD_PX) {
-        void triggerSwipe('interested');
-      } else if (finalDelta <= -SWIPE_THRESHOLD_PX) {
-        void triggerSwipe('passed');
-      } else {
-        setDragOffsetX(0);
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        triggerDecision(topCard, 'passed');
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        triggerDecision(topCard, 'interested');
       }
     };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [topCard, exitingCard, triggerDecision]);
 
-    if (!selectedHackathon) {
-      return (
-        <div className="p-10 bg-white border border-slate-200 rounded-2xl text-center space-y-2">
-          <Users className="w-8 h-8 text-slate-400 mx-auto" />
-          <h2 className="text-base font-bold text-slate-900">
-            No upcoming hackathons available
-          </h2>
-          <p className="text-sm text-slate-500 max-w-md mx-auto">
-            Browse the Hackathons tab or suggest an upcoming campus hackathon to start finding teammates.
-          </p>
-        </div>
-      );
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (
+      (e.target as HTMLElement).closest('button, a') ||
+      !topCard ||
+      exitingCard
+    ) {
+      return;
     }
+    dragStartRef.current = { x: e.clientX, y: e.clientY };
+    setIsDragging(true);
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  };
 
-    const viewerProfileRecord = profiles[currentUser.uid];
-    const isSparseViewerProfile =
-      (viewerProfileRecord?.skillTags?.length ?? 0) === 0 &&
-      (viewerProfileRecord?.interestTags?.length ?? 0) === 0;
-    const isEventMatchable = isHackathonEligibleForMatching(selectedHackathon);
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!isDragging || !dragStartRef.current) return;
+    setDragOffsetX(e.clientX - dragStartRef.current.x);
+  };
 
-    const maxTeamCapacity = Math.min(
-      4,
-      selectedHackathon.maxTeamSize && selectedHackathon.maxTeamSize > 0
-        ? selectedHackathon.maxTeamSize
-        : 4
-    );
-    const minTeamCapacity =
-      selectedHackathon.minTeamSize && selectedHackathon.minTeamSize > 0
-        ? Math.min(selectedHackathon.minTeamSize, maxTeamCapacity)
-        : Math.min(2, maxTeamCapacity);
+  const handlePointerUp = () => {
+    if (!isDragging) return;
+    setIsDragging(false);
+    dragStartRef.current = null;
+    if (!topCard) {
+      setDragOffsetX(0);
+      return;
+    }
+    if (dragOffsetX > 95) {
+      triggerDecision(topCard, 'interested');
+    } else if (dragOffsetX < -95) {
+      triggerDecision(topCard, 'passed');
+    } else {
+      setDragOffsetX(0);
+    }
+  };
 
-    const interestedActionLabel = viewerActiveTeam
-      ? `Interested · Propose to Team (${teamCapabilities?.memberCount ?? viewerActiveTeam.memberCount}/${maxTeamCapacity})`
-      : 'Interested';
+  const handleJoinPool = async () => {
+    if (!selectedHackathon || !selectedHackathonEligible || isJoiningPool) return;
+    setIsJoiningPool(true);
+    try {
+      await onUpdateParticipation(selectedHackathon.id, {
+        discoverable: true,
+        intent: 'looking',
+      });
+    } finally {
+      setIsJoiningPool(false);
+    }
+  };
+
+  const renderTopCard = (card: CandidateCard) => {
+    const candidateProfile = profiles[card.id];
+    const isSyntheticTestUser = card.id.startsWith('dev_test_');
+    const isExiting = exitingCard?.id === card.id;
+    const tx = isExiting
+      ? exitingCard.direction === 'right'
+        ? 380
+        : -380
+      : dragOffsetX;
+    const rot = isExiting
+      ? exitingCard.direction === 'right'
+        ? 11
+        : -11
+      : Math.max(-10, Math.min(10, dragOffsetX * 0.035));
+    const rightOpacity = isExiting
+      ? exitingCard.direction === 'right'
+        ? 1
+        : 0
+      : Math.min(1, Math.max(0, (dragOffsetX - 24) / 80));
+    const leftOpacity = isExiting
+      ? exitingCard.direction === 'left'
+        ? 1
+        : 0
+      : Math.min(1, Math.max(0, (-dragOffsetX - 24) / 80));
 
     return (
-      <div className="space-y-5">
-        {isSparseViewerProfile && (
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-200/80 bg-indigo-50/60 px-4 py-3 text-xs text-indigo-950">
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-4 h-4 text-indigo-600 shrink-0" />
-              <span>
-                Add a few interests, skills, or a preferred role in your profile to get stronger teammate recommendations.
-              </span>
+      <div
+        key={card.id}
+        data-testid={`discover-card-${card.id}`}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        style={{
+          transform: `translate3d(${tx}px, 0, 0) rotate(${rot}deg)`,
+          opacity: isExiting ? 0 : 1,
+          transition: isDragging
+            ? 'none'
+            : 'transform 175ms cubic-bezier(0.22, 1, 0.36, 1), opacity 175ms ease-out',
+        }}
+        className="quack-card-in relative select-none touch-pan-y bg-white rounded-3xl border border-[#e9e5dd] shadow-[0_14px_36px_-18px_rgba(36,33,28,0.16)] overflow-hidden cursor-grab active:cursor-grabbing"
+      >
+        {/* Directional Swipe Stamps */}
+        {rightOpacity > 0.02 && (
+          <div
+            style={{ opacity: rightOpacity }}
+            className="pointer-events-none absolute top-5 right-5 z-20 px-3.5 py-1.5 rounded-xl bg-[#ffd84d] border-2 border-[#725c00] text-[#1c1b1b] text-xs font-extrabold tracking-wider uppercase rotate-6 shadow-sm"
+          >
+            Interested
+          </div>
+        )}
+        {leftOpacity > 0.02 && (
+          <div
+            style={{ opacity: leftOpacity }}
+            className="pointer-events-none absolute top-5 left-5 z-20 px-3.5 py-1.5 rounded-xl bg-white border-2 border-rose-500 text-rose-700 text-xs font-extrabold tracking-wider uppercase -rotate-6 shadow-sm"
+          >
+            Pass
+          </div>
+        )}
+
+        <div className="p-6 sm:p-7 space-y-5">
+          {/* Student Header */}
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-start gap-3.5 min-w-0">
+              <StudentAvatar
+                uid={card.id}
+                name={card.title}
+                size="lg"
+                className="mt-0.5"
+              />
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-xl font-bold text-[#1c1b1b] tracking-tight truncate">
+                    {card.title}
+                  </h2>
+                  {isSyntheticTestUser && (
+                    <span className="px-2 py-0.5 rounded-md bg-[#fff3c9] border border-[#f0d98c] text-[#725c00] text-[10px] font-bold uppercase tracking-wide">
+                      Dev Test
+                    </span>
+                  )}
+                </div>
+                {card.rolesOfferedOrNeeded.length > 0 && (
+                  <p className="text-xs font-semibold text-[#725c00] mt-0.5">
+                    {card.rolesOfferedOrNeeded.join(' · ')}
+                  </p>
+                )}
+              </div>
             </div>
-            {onOpenProfile && (
-              <button
-                type="button"
-                onClick={onOpenProfile}
-                className="font-semibold text-indigo-700 hover:text-indigo-900 underline cursor-pointer shrink-0"
-              >
-                Update Profile
-              </button>
+
+            {card.overallScore !== undefined && (
+              <span className="shrink-0 px-2.5 py-1 rounded-full bg-[#fff3c9] border border-[#f0d98c] text-[#725c00] text-xs font-bold tabular-nums">
+                {Math.round(card.overallScore <= 1 ? card.overallScore * 100 : card.overallScore)}% match
+              </span>
             )}
           </div>
-        )}
 
-        {!isEventMatchable && (
-          <div className="flex items-center gap-2.5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
-            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-            <span>
-              Registration is closed or this event has ended. New teammate matching is disabled — choose an upcoming hackathon to find teammates.
-            </span>
+          {/* Headline & Bio */}
+          {(candidateProfile?.headline || candidateProfile?.about) && (
+            <div className="space-y-1.5">
+              {candidateProfile?.headline && (
+                <p className="text-sm font-medium text-[#1c1b1b] leading-snug">
+                  {candidateProfile.headline}
+                </p>
+              )}
+              {candidateProfile?.about && (
+                <p className="text-xs text-[#4d4634] leading-relaxed">
+                  {candidateProfile.about}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Recommendation Highlights */}
+          {card.compatibilityReasons.length > 0 && (
+            <div className="rounded-xl bg-[#faf8f2] border border-[#e9e5dd] p-3.5 space-y-1.5">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-[#725c00]">
+                Why you match
+              </div>
+              <ul className="space-y-1 text-xs text-[#4d4634]">
+                {card.compatibilityReasons.slice(0, 3).map((reason: string, idx: number) => (
+                  <li key={idx} className="flex items-start gap-2">
+                    <Check className="w-3.5 h-3.5 text-[#725c00] shrink-0 mt-0.5" />
+                    <span>{reason}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Skills */}
+          {card.skills.length > 0 && (
+            <div className="space-y-1.5">
+              <div className="text-[11px] font-semibold text-[#746e65] uppercase tracking-wider">
+                Skills
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {card.skills.slice(0, 8).map((skill) => (
+                  <span
+                    key={skill}
+                    className="px-2.5 py-1 rounded-lg bg-[#f6f3f2] border border-[#e9e5dd] text-[#24211c] text-xs font-medium"
+                  >
+                    {skill}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Interests */}
+          {((candidateProfile?.interestTags?.length ?? 0) > 0 || card.sharedInterests.length > 0) && (
+            <div className="space-y-1.5">
+              <div className="text-[11px] font-semibold text-[#746e65] uppercase tracking-wider">
+                Interests
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {(candidateProfile?.interestTags?.length
+                  ? candidateProfile.interestTags
+                  : card.sharedInterests
+                )
+                  .slice(0, 4)
+                  .map((interest: string) => (
+                    <span
+                      key={interest}
+                      className="px-2.5 py-1 rounded-lg bg-[#fff3c9]/65 border border-[#f2dc8c] text-[#564500] text-xs font-medium"
+                    >
+                      {interest}
+                    </span>
+                  ))}
+              </div>
+            </div>
+          )}
+
+          {/* Featured Projects & GitHub */}
+          {candidateProfile &&
+            (candidateProfile.featuredProjects.length > 0 ||
+              candidateProfile.githubUsername) && (
+              <div className="pt-3 border-t border-[#f1ede6] space-y-2">
+                {candidateProfile.featuredProjects.slice(0, 2).map((proj) => (
+                  <div
+                    key={proj.id}
+                    className="rounded-xl bg-[#faf8f2] border border-[#e9e5dd] px-3.5 py-2.5 text-xs"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-[#1c1b1b]">
+                        {proj.title}
+                      </span>
+                      {proj.sourceUrl && (
+                        <a
+                          href={proj.sourceUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-[#725c00] hover:underline inline-flex items-center gap-0.5 text-[11px]"
+                        >
+                          <span>View</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
+                    </div>
+                    {proj.description && (
+                      <p className="text-[#746e65] mt-0.5 leading-snug">
+                        {proj.description}
+                      </p>
+                    )}
+                  </div>
+                ))}
+
+                {candidateProfile.githubUsername && !isSyntheticTestUser && (
+                  <a
+                    href={`https://github.com/${candidateProfile.githubUsername}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 text-xs font-medium text-[#4d4634] hover:text-[#1c1b1b]"
+                  >
+                    <Github className="w-3.5 h-3.5" />
+                    <span>github.com/{candidateProfile.githubUsername}</span>
+                  </a>
+                )}
+              </div>
+            )}
+
+          {/* Swipe Actions */}
+          <div className="pt-4 border-t border-[#f1ede6] flex items-center justify-center gap-4">
+            <button
+              type="button"
+              data-testid="discover-pass-btn"
+              onClick={() => triggerDecision(card, 'passed')}
+              className="flex-1 max-w-[180px] inline-flex items-center justify-center gap-2 py-3 px-5 rounded-2xl border border-[#e9e5dd] bg-white hover:bg-rose-50 hover:border-rose-200 hover:text-rose-700 active:scale-[0.97] text-[#4d4634] text-sm font-bold transition-all duration-150 cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+              <span>Pass</span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="discover-interested-btn"
+              onClick={() => triggerDecision(card, 'interested')}
+              className="flex-1 max-w-[180px] inline-flex items-center justify-center gap-2 py-3 px-5 rounded-2xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] active:scale-[0.97] text-[#1c1b1b] text-sm font-bold shadow-xs transition-all duration-150 cursor-pointer"
+            >
+              <Heart className="w-4 h-4 fill-current" />
+              <span>Interested</span>
+            </button>
           </div>
-        )}
+        </div>
+      </div>
+    );
+  };
 
-        {/* Discovery Sub-header: Single clean contextual strip */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl sm:text-3xl font-bold text-[#1c1b1b] tracking-tight">
-              Discover
-            </h1>
-            <div className="relative inline-flex items-center">
-              <select
-                aria-label="Select Hackathon"
-                value={selectedHackathon.id}
-                onChange={(e) => onSelectHackathon(e.target.value)}
-                className="text-xs font-semibold bg-white border border-[#e9e5dd] rounded-full px-3.5 py-1.5 text-[#1c1b1b] shadow-xs cursor-pointer appearance-none pr-7 focus:outline-none focus:ring-1 focus:ring-[#725c00]"
-              >
-                {hackathons.map((h) => {
-                  const eligible = isHackathonEligibleForMatching(h);
-                  return (
-                    <option key={h.id} value={h.id}>
-                      {h.name} {!eligible ? '(Closed)' : ''}
-                    </option>
-                  );
-                })}
-              </select>
-              <ChevronDown className="w-3.5 h-3.5 text-[#746e65] absolute right-2.5 pointer-events-none" />
+  return (
+    <div className="max-w-2xl mx-auto space-y-5">
+      {/* Header + Hackathon Selector + Dev Mode Control (Dev-only) */}
+      <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[#1c1b1b]">
+            Discover
+          </h1>
+          <p className="text-xs text-[#746e65] mt-0.5 tabular-nums">
+            {candidateCards.length > 0
+              ? `${candidateCards.length} ${
+                  candidateCards.length === 1 ? 'student' : 'students'
+                } available`
+              : selectableHackathons.length === 0
+              ? 'No upcoming hackathons active'
+              : 'Teammate discovery'}
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          {hackathonSelectOptions.length > 0 && selectedHackathon && (
+            <SelectMenu
+              value={selectedHackathon.id}
+              options={hackathonSelectOptions}
+              onChange={onSelectHackathon}
+              ariaLabel="Select upcoming hackathon"
+              className="w-60 sm:w-64"
+              menuAlign="right"
+            />
+          )}
+
+          {devTestingAvailable && onToggleDevTestingMode && (
+            <button
+              type="button"
+              data-testid="toggle-dev-testing-mode"
+              onClick={() => onToggleDevTestingMode(!devTestingActive)}
+              className={`inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl border text-xs font-semibold transition-colors duration-150 cursor-pointer whitespace-nowrap ${
+                devTestingActive
+                  ? 'bg-[#ffd84d] border-[#e5be35] text-[#1c1b1b]'
+                  : 'bg-white border-[#e9e5dd] text-[#4d4634] hover:bg-[#f6f3eb]'
+              }`}
+              title="Isolated local development testing sandbox (never shown in production)"
+            >
+              <FlaskConical className="w-3.5 h-3.5" />
+              <span>{devTestingActive ? 'Exit Dev Test' : 'Dev Test Mode'}</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Isolated Dev Testing Mode Banner (Strictly Dev-Only) */}
+      {devTestingAvailable && devTestingActive && (
+        <div
+          data-testid="dev-testing-banner"
+          className="rounded-xl bg-[#fff3c9]/75 border border-[#f0d98c] px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-[#564500]"
+        >
+          <div className="flex items-start gap-2">
+            <FlaskConical className="w-4 h-4 text-[#875200] shrink-0 mt-0.5" />
+            <div>
+              <span className="font-bold text-[#1c1b1b]">
+                Development Testing Sandbox Active
+              </span>
+              <span className="block text-[11px] text-[#564500] mt-0.5">
+                Swiping against 8 synthetic student profiles in isolated local state. 3 profiles already expressed interest in you for testing mutual matches &amp; team formation.
+              </span>
             </div>
           </div>
+          {onResetDevTestingSandbox && (
+            <button
+              type="button"
+              onClick={onResetDevTestingSandbox}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white border border-[#e5be35] text-[#1c1b1b] text-[11px] font-semibold hover:bg-[#faf8f2] transition-colors duration-150 cursor-pointer shrink-0 self-start sm:self-center"
+            >
+              <RefreshCw className="w-3 h-3" />
+              <span>Reset Sandbox</span>
+            </button>
+          )}
+        </div>
+      )}
 
-          <div className="flex items-center gap-2 text-xs text-[#746e65]">
-            <span className="font-medium">
-              Candidate {studentCards.length > 0 ? 1 : 0} of {studentCards.length}
-            </span>
-            {viewerActiveTeam && onOpenMyTeam && (
-              <>
-                <span>·</span>
-                <button
-                  type="button"
-                  onClick={onOpenMyTeam}
-                  className="font-semibold text-[#725c00] hover:underline cursor-pointer"
-                >
-                  My Team ({teamCapabilities?.memberCount ?? viewerActiveTeam.memberCount}/{maxTeamCapacity}) →
-                </button>
-              </>
+      {/* Active Team Banner */}
+      {viewerActiveTeam && selectedHackathonEligible && (
+        <div className="rounded-xl bg-white border border-[#e9e5dd] px-4 py-3 flex items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <Users className="w-4 h-4 text-[#725c00] shrink-0" />
+            <div className="min-w-0">
+              <span className="font-bold text-[#1c1b1b] truncate block">
+                Your team: {viewerActiveTeam.name} ({viewerActiveTeam.memberCount}/
+                {viewerActiveTeam.targetSize})
+              </span>
+              <span className="text-[#746e65]">
+                {viewerTeamIsFull
+                  ? 'Your team is at full capacity.'
+                  : 'Swipe right to propose adding another teammate.'}
+              </span>
+            </div>
+          </div>
+          {onOpenMyTeam && (
+            <button
+              type="button"
+              onClick={onOpenMyTeam}
+              className="px-3 py-1.5 rounded-lg bg-[#fff3c9] border border-[#f0d98c] text-[#725c00] font-semibold hover:bg-[#ffd84d] hover:text-[#1c1b1b] transition-colors duration-150 cursor-pointer shrink-0"
+            >
+              My Team
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* ==================================================================== */}
+      {/* STATE 1: NO UPCOMING MATCHABLE HACKATHONS IN LIVE BACKEND            */}
+      {/* ==================================================================== */}
+      {selectableHackathons.length === 0 ? (
+        <div className="bg-white rounded-3xl border border-[#e9e5dd] p-8 sm:p-10 text-center space-y-4">
+          <div className="w-16 h-16 mx-auto rounded-2xl bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center p-2.5">
+            <img
+              src={QUACKATHON_MINI_LOGO_SRC}
+              alt="Quackathon"
+              className="w-full h-full object-contain"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <h2 className="text-lg font-bold text-[#1c1b1b]">
+              No upcoming hackathons open for matching
+            </h2>
+            <p className="text-xs text-[#746e65] max-w-md mx-auto leading-relaxed">
+              Teammate discovery opens automatically when an upcoming verified team hackathon is listed. Ended or closed competitions cannot be matched.
+            </p>
+          </div>
+
+          <div className="flex items-center justify-center gap-2.5 flex-wrap pt-1">
+            {onOpenHackathons && (
+              <button
+                type="button"
+                onClick={onOpenHackathons}
+                className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-[#e9e5dd] bg-white hover:bg-[#f6f3eb] text-xs font-semibold text-[#1c1b1b] transition-colors duration-150 cursor-pointer"
+              >
+                <Calendar className="w-3.5 h-3.5" />
+                <span>View Hackathons</span>
+              </button>
+            )}
+            {devTestingAvailable && onToggleDevTestingMode && (
+              <button
+                type="button"
+                data-testid="empty-enable-dev-testing"
+                onClick={() => onToggleDevTestingMode(true)}
+                className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-xs font-bold text-[#1c1b1b] shadow-2xs transition-colors duration-150 cursor-pointer"
+              >
+                <FlaskConical className="w-3.5 h-3.5" />
+                <span>Test Swiping in Dev Sandbox</span>
+              </button>
             )}
           </div>
         </div>
-
-        {/* Non-Matchable Event Notice */}
-        {!selectedHackathon.matchable ? (
-          <div className="p-8 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-center space-y-3">
-            <AlertTriangle className="w-7 h-7 text-amber-600 mx-auto" />
-            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-              Team matching isn’t enabled for {selectedHackathon.name}
-            </h2>
-            <p className="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto">
-              This event is classified as a{' '}
-              {selectedHackathon.eventType.replace('_', ' ')}. Switch to a team
-              hackathon to discover and match with fellow students.
-            </p>
-            {hackathons.find((h) => h.matchable) && (
-              <button
-                type="button"
-                onClick={() => {
-                  const firstMatchable = hackathons.find((h) => h.matchable);
-                  if (firstMatchable) onSelectHackathon(firstMatchable.id);
-                }}
-                className="px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer"
-              >
-                Switch to {hackathons.find((h) => h.matchable)?.name}
-              </button>
-            )}
+      ) : !selectedHackathon || !selectedHackathonEligible ? (
+        /* ================================================================== */
+        /* STATE 2: SELECTED HACKATHON ENDED OR CLOSED                        */
+        /* ================================================================== */
+        <div className="bg-white rounded-3xl border border-[#e9e5dd] p-8 text-center space-y-3">
+          <div className="w-12 h-12 mx-auto rounded-2xl bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center text-[#875200]">
+            <AlertTriangle className="w-6 h-6" />
           </div>
-        ) : isTeamFull && viewerActiveTeam ? (
-          /* Team Full Lock Banner */
-          <div className="p-8 bg-white dark:bg-slate-900 border border-emerald-200 dark:border-emerald-900/60 rounded-xl text-center space-y-3">
-            <CheckCircle2 className="w-8 h-8 text-emerald-600 mx-auto" />
-            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
-              Your team {viewerActiveTeam.name.split(' (')[0]} is full (
-              {teamCapabilities?.memberCount ?? viewerActiveTeam.memberCount}/
-              {maxTeamCapacity})
-            </h2>
-            <p className="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto">
-              Recruitment is locked because your roster has reached the maximum
-              size for {selectedHackathon.name}. Open My Team to coordinate in
-              Team Chat or complete official event registration.
-            </p>
-            {onOpenMyTeam && (
-              <button
-                type="button"
-                onClick={onOpenMyTeam}
-                className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg cursor-pointer"
-              >
-                Go to My Team
-              </button>
-            )}
+          <h2 className="text-base font-bold text-[#1c1b1b]">
+            Matching closed for {selectedHackathon?.name ?? 'this event'}
+          </h2>
+          <p className="text-xs text-[#746e65] max-w-md mx-auto leading-relaxed">
+            Registration has closed or this event has ended. Select an upcoming hackathon to discover teammates.
+          </p>
+        </div>
+      ) : !hasExplicitlyJoinedPool ? (
+        /* ================================================================== */
+        /* STATE 3: EXPLICIT OPT-IN REQUIRED FOR REAL USERS                   */
+        /* ================================================================== */
+        <div className="bg-white rounded-3xl border border-[#e9e5dd] p-8 sm:p-10 text-center space-y-4">
+          <div className="w-14 h-14 mx-auto rounded-2xl bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center text-[#725c00]">
+            <UserPlus className="w-6 h-6" />
           </div>
-        ) : !topCard ? (
-          /* All-Caught-Up State with Peaceful Vector Duck Mascot */
-          <div className="w-full bg-white rounded-3xl p-8 sm:p-12 flex flex-col items-center text-center relative overflow-hidden shadow-sm border border-[#e9e5dd]">
-            <div className="relative w-32 h-32 mb-4 flex items-center justify-center">
-              <div className="absolute inset-0 rounded-full bg-[#f6f3f2] scale-95 transition-transform duration-500 hover:scale-100" />
-              {/* Minimalist Vector Resting Duck */}
-              <svg className="relative w-28 h-28 drop-shadow-sm" fill="none" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
-                <path d="M18 92C32 90 44 94 60 92C76 90 88 94 102 92" stroke="#E5E2E1" strokeLinecap="round" strokeWidth="3" />
-                <path d="M30 100C42 98 52 101 64 100C76 99 86 101 94 100" stroke="#F0EDED" strokeLinecap="round" strokeWidth="2.5" />
-                <path d="M28 72C28 58 40 48 54 48H78C90 48 98 58 98 70C98 82 86 88 70 88H44C34 88 28 81 28 72Z" fill="#FFD84D" />
-                <path d="M28 66C22 62 20 54 22 48C25 54 30 58 35 60L28 66Z" fill="#E9C339" />
-                <path d="M46 64C46 59 52 55 62 55C72 55 78 61 78 67C78 74 70 77 60 77C50 77 46 71 46 64Z" fill="#F5CE40" />
-                <circle cx="78" cy="40" fill="#FFD84D" r="18" />
-                <path d="M92 40C98 40 105 42 107 45C104 48 97 49 92 48V40Z" fill="#FDAA40" />
-                <path d="M81 38C81 35 85 35 85 38" stroke="#1C1B1B" strokeLinecap="round" strokeWidth="2" />
-                <circle cx="76" cy="46" fill="#F7A53B" fillOpacity="0.5" r="3" />
-                <path className="opacity-80" d="M96 24H101L96 30H101" stroke="#875200" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
-              </svg>
-            </div>
-
-            <h2 className="text-xl sm:text-2xl font-bold text-[#1c1b1b] tracking-tight">
-              You're all caught up for {selectedHackathon.name}
+          <div className="space-y-1.5">
+            <h2 className="text-lg font-bold text-[#1c1b1b]">
+              Join matching pool for {selectedHackathon.name}
             </h2>
-            <p className="text-xs sm:text-sm text-[#746e65] mt-2 max-w-md leading-relaxed">
-              You have reviewed all student profiles currently available for this hackathon. New student builders join daily.
+            <p className="text-xs text-[#746e65] max-w-md mx-auto leading-relaxed">
+              Your profile stays private until you explicitly join an event&apos;s teammate pool. Join to view compatible PESU builders for this hackathon.
             </p>
-
-            <div className="mt-6 flex flex-col sm:flex-row items-center gap-3 w-full sm:w-auto">
+          </div>
+          <button
+            type="button"
+            disabled={isJoiningPool}
+            onClick={() => void handleJoinPool()}
+            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-[#1c1b1b] text-xs font-bold shadow-xs transition-colors duration-150 cursor-pointer disabled:opacity-60"
+          >
+            <UserPlus className="w-4 h-4" />
+            <span>
+              {isJoiningPool ? 'Joining...' : 'Join Teammate Matching Pool'}
+            </span>
+          </button>
+        </div>
+      ) : viewerTeamIsFull ? (
+        /* ================================================================== */
+        /* STATE 4: VIEWER'S TEAM IS ALREADY FULL                             */
+        /* ================================================================== */
+        <div className="bg-white rounded-3xl border border-[#e9e5dd] p-8 text-center space-y-3.5">
+          <div className="w-14 h-14 mx-auto rounded-2xl bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center p-2">
+            <img
+              src={QUACKATHON_MINI_LOGO_SRC}
+              alt="Quackathon"
+              className="w-full h-full object-contain"
+            />
+          </div>
+          <h2 className="text-base font-bold text-[#1c1b1b]">
+            Your team is full for {selectedHackathon.name}
+          </h2>
+          <p className="text-xs text-[#746e65] max-w-sm mx-auto">
+            You have reached the maximum team size. Coordinate with your teammates in My Team.
+          </p>
+          {onOpenMyTeam && (
+            <button
+              type="button"
+              onClick={onOpenMyTeam}
+              className="px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-[#1c1b1b] text-xs font-bold cursor-pointer"
+            >
+              Open My Team
+            </button>
+          )}
+        </div>
+      ) : topCard ? (
+        /* ================================================================== */
+        /* ACTIVE SWIPE DECK                                                  */
+        /* ================================================================== */
+        <div className="space-y-3">
+          {renderTopCard(topCard)}
+          <p className="text-center text-[11px] text-[#746e65]">
+            Drag card or press <kbd className="px-1.5 py-0.5 rounded bg-white border border-[#e9e5dd] font-mono text-[10px]">←</kbd> to pass,{' '}
+            <kbd className="px-1.5 py-0.5 rounded bg-white border border-[#e9e5dd] font-mono text-[10px]">→</kbd> if interested
+          </p>
+        </div>
+      ) : passedCountForSelected === 0 && swipedRightCountForSelected === 0 ? (
+        /* ================================================================== */
+        /* STATE 5A: NO OTHER ELIGIBLE STUDENTS IN POOL YET                   */
+        /* ================================================================== */
+        <div className="bg-white rounded-3xl border border-[#e9e5dd] p-8 sm:p-10 text-center space-y-4">
+          <div className="w-16 h-16 mx-auto rounded-2xl bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center p-2.5">
+            <img
+              src={QUACKATHON_MINI_LOGO_SRC}
+              alt="Quackathon"
+              className="w-full h-full object-contain"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <h2 className="text-base font-bold text-[#1c1b1b]">
+              No other eligible students in {selectedHackathon.name} yet
+            </h2>
+            <p className="text-xs text-[#746e65] max-w-md mx-auto leading-relaxed">
+              You&apos;re in the matching pool. As other verified PESU students join this hackathon, their ranked cards will appear here.
+            </p>
+          </div>
+          {devTestingAvailable && !devTestingActive && onToggleDevTestingMode && (
+            <button
+              type="button"
+              onClick={() => onToggleDevTestingMode(true)}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-xs font-bold text-[#1c1b1b] cursor-pointer"
+            >
+              <FlaskConical className="w-3.5 h-3.5" />
+              <span>Test Swiping with Dev Sandbox</span>
+            </button>
+          )}
+        </div>
+      ) : (
+        /* ================================================================== */
+        /* STATE 5B: ALL AVAILABLE CANDIDATES REVIEWED                        */
+        /* ================================================================== */
+        <div className="bg-white rounded-3xl border border-[#e9e5dd] p-8 sm:p-10 text-center space-y-4">
+          <div className="w-16 h-16 mx-auto rounded-2xl bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center p-2.5">
+            <img
+              src={QUACKATHON_MINI_LOGO_SRC}
+              alt="Quackathon"
+              className="w-full h-full object-contain"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <h2 className="text-base font-bold text-[#1c1b1b]">
+              You&apos;re all caught up for {selectedHackathon.name}
+            </h2>
+            <p className="text-xs text-[#746e65] max-w-md mx-auto">
+              You have reviewed every eligible student currently in this event&apos;s pool.
+            </p>
+          </div>
+          <div className="flex items-center justify-center gap-2.5 flex-wrap pt-1">
+            {passedCountForSelected > 0 && onResetPassedCards && (
               <button
                 type="button"
-                onClick={() => onResetPassedCards(selectedHackathon.id)}
-                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs shadow-xs inline-flex items-center justify-center gap-2 transition-transform cursor-pointer"
+                data-testid="reset-passed-students-btn"
+                onClick={() => void onResetPassedCards(selectedHackathon.id)}
+                className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] border border-[#e5be35] text-[#1c1b1b] text-xs font-bold shadow-2xs transition-colors duration-150 cursor-pointer"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>Review Passed Students Again</span>
-              </button>
-              {onOpenMyTeam && (
-                <button
-                  type="button"
-                  onClick={onOpenMyTeam}
-                  className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-[#f6f3f2] hover:bg-[#eae7e7] text-[#1c1b1b] font-semibold text-xs border border-[#e9e5dd] transition-colors cursor-pointer"
-                >
-                  View My Team
-                </button>
-              )}
-            </div>
-          </div>
-        ) : (
-          /* Primary Centered Focus Card Container */
-          <div className="w-full max-w-2xl mx-auto relative">
-            {/* Atmospheric Underlay Card Edge Stack */}
-            <div className="absolute inset-0 translate-y-2 scale-[0.985] bg-[#f6f3f2] border border-[#e9e5dd] rounded-2xl -z-10 shadow-xs opacity-70 pointer-events-none" />
-
-            {/* Active Profile Card */}
-            <article
-              data-testid="student-swipe-card"
-              onPointerDown={handlePointerDown}
-              onPointerMove={handlePointerMove}
-              onPointerUp={handlePointerUpOrCancel}
-              onPointerCancel={handlePointerUpOrCancel}
-              className={`w-full bg-white rounded-2xl shadow-sm border border-[#e9e5dd] p-6 sm:p-8 flex flex-col gap-5 select-none transition-transform duration-150 ${
-                isDragging ? 'cursor-grabbing' : 'cursor-grab'
-              } ${
-                dragOffsetX > 45
-                  ? 'ring-2 ring-emerald-500/50'
-                  : dragOffsetX < -45
-                    ? 'ring-2 ring-rose-500/50'
-                    : ''
-              } ${
-                exitDirection === 'right'
-                  ? 'translate-x-10 opacity-75'
-                  : exitDirection === 'left'
-                    ? '-translate-x-10 opacity-75'
-                    : ''
-              }`}
-            >
-              {/* Drag Swipe Visual Stamp */}
-              {Math.abs(dragOffsetX) > 35 && (
-                <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider">
-                  <span
-                    className={`px-2.5 py-1 rounded-full border ${
-                      dragOffsetX < -35
-                        ? 'border-rose-500 text-rose-600 bg-rose-50 opacity-100'
-                        : 'opacity-0'
-                    }`}
-                  >
-                    Pass
-                  </span>
-                  <span
-                    className={`px-2.5 py-1 rounded-full border ${
-                      dragOffsetX > 35
-                        ? 'border-emerald-500 text-emerald-600 bg-emerald-50 opacity-100'
-                        : 'opacity-0'
-                    }`}
-                  >
-                    Interested
-                  </span>
-                </div>
-              )}
-
-              {/* Student Profile Header Block */}
-              <div className="flex items-start justify-between gap-4">
-                <div className="flex items-center gap-4 min-w-0">
-                  <div className="w-16 h-16 rounded-full bg-[#ffd84d]/30 border border-[#ffd84d]/50 flex items-center justify-center shrink-0 shadow-xs overflow-hidden">
-                    <StudentAvatar
-                      uid={topCard.id}
-                      name={topCard.title}
-                      size="lg"
-                    />
-                  </div>
-                  <div className="flex flex-col min-w-0">
-                    <div className="flex items-center gap-2 mb-1 flex-wrap">
-                      <h2 className="text-xl sm:text-2xl font-bold text-[#1c1b1b] tracking-tight truncate">
-                        {topCard.title}
-                      </h2>
-                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-[#f6f3f2] text-[#615e56] text-[11px] font-medium border border-[#e9e5dd]">
-                        <span className="w-1.5 h-1.5 rounded-full bg-[#875200]" />
-                        Looking for team
-                      </span>
-                    </div>
-                    <p className="text-xs text-[#746e65]">
-                      {topCard.subtitle} · PES University ({topCardUser?.campus || 'RR Campus'})
-                    </p>
-                  </div>
-                </div>
-
-                <div className="text-right shrink-0">
-                  <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-[#fff3c9] text-[#725c00] font-mono tabular-nums text-xs font-bold border border-[#ffd84d]/60">
-                    <Sparkles className="w-3.5 h-3.5 text-[#875200]" />
-                    {topCard.featureBreakdown.totalScore ??
-                      Math.round((topCard.overallScore ?? 0) * 100)}% Match
-                  </span>
-                </div>
-              </div>
-
-              {/* Concise Builder Bio in quotes */}
-              <div className="pt-1">
-                <p className="text-sm sm:text-base text-[#24211c] italic leading-relaxed">
-                  &ldquo;{topCardProfile?.about || (topCard as { bio?: string }).bio || 'Passionate about building intuitive web experiences and scalable backends. Looking for a high-energy team.'}&rdquo;
-                </p>
-              </div>
-
-              {/* Verified Core Stack */}
-              <div className="flex flex-col gap-1.5">
-                <span className="text-[11px] uppercase tracking-wider font-bold text-[#746e65]">
-                  Core Stack
+                <span>
+                  Review {passedCountForSelected} Passed{' '}
+                  {passedCountForSelected === 1 ? 'Student' : 'Students'} Again
                 </span>
-                <div className="flex flex-wrap gap-2">
-                  {topCard.skills.slice(0, 6).map((skill) => (
-                    <span
-                      key={skill}
-                      className="inline-flex items-center px-3 py-1 rounded-full bg-[#f6f3f2] text-xs font-medium text-[#1c1b1b] hover:bg-[#eae7e7] transition-colors"
-                    >
-                      {skill}
-                    </span>
-                  ))}
-                  {topCard.rolesOfferedOrNeeded.map((role) => (
-                    <span
-                      key={role}
-                      className="inline-flex items-center px-3 py-1 rounded-full bg-[#fff3c9] text-xs font-bold text-[#272015] border border-[#ffd84d]/50"
-                    >
-                      {role}
-                    </span>
-                  ))}
-                </div>
-              </div>
-
-              {/* Featured Project Row (if available) */}
-              {topCard.featuredEvidence.length > 0 && (
-                <div className="flex flex-col gap-1.5 pt-1">
-                  <span className="text-[11px] uppercase tracking-wider font-bold text-[#746e65]">
-                    Featured Work
-                  </span>
-                  {topCard.featuredEvidence.slice(0, 1).map((ev, idx) => (
-                    <div
-                      key={idx}
-                      className="flex items-center justify-between p-3.5 rounded-xl bg-[#f6f3f2] border border-[#e9e5dd] hover:bg-[#eae7e7] transition-all"
-                    >
-                      <div className="flex items-center gap-3 min-w-0">
-                        <div className="w-8 h-8 rounded-lg bg-white flex items-center justify-center shrink-0 shadow-xs text-[#875200]">
-                          <FolderGit2 className="w-4 h-4" />
-                        </div>
-                        <div className="flex items-center gap-1.5 flex-wrap min-w-0 text-xs">
-                          <span className="font-bold text-[#1c1b1b]">{ev.title}</span>
-                          <span className="text-[#746e65]">·</span>
-                          <span className="text-[#875200] font-medium">
-                            {(ev.tech ?? []).slice(0, 3).join(', ')}
-                          </span>
-                          <span className="text-[#746e65]">—</span>
-                          <span className="text-[#746e65] truncate max-w-[220px]">
-                            {ev.description}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Quiet Match Reason Callout */}
-              {topCard.compatibilityReasons.length > 0 && (
-                <div className="flex items-start gap-2.5 p-3.5 rounded-xl bg-[#ffd84d]/20 text-[#1c1b1b] border border-[#ffd84d]/30">
-                  <div className="w-6 h-6 rounded-full bg-[#ffd84d] flex items-center justify-center shrink-0 text-[#725c00] mt-0.5">
-                    <Sparkles className="w-3.5 h-3.5" />
-                  </div>
-                  <div className="flex flex-col text-xs">
-                    <span className="font-bold text-[#1c1b1b]">Why this match</span>
-                    <p className="text-[#615e56] mt-0.5 leading-relaxed">
-                      {topCard.compatibilityReasons[0]}
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {/* Expandable Details: intro note & score breakdown */}
-              <div className="pt-1">
-                <button
-                  type="button"
-                  onClick={() => setExpandedDetails(!expandedDetails)}
-                  className="text-xs font-medium text-[#746e65] hover:text-[#1c1b1b] inline-flex items-center gap-1 cursor-pointer"
-                >
-                  {expandedDetails ? (
-                    <>
-                      <ChevronUp className="w-3.5 h-3.5" />
-                      <span>Hide optional intro note &amp; weights</span>
-                    </>
-                  ) : (
-                    <>
-                      <ChevronDown className="w-3.5 h-3.5" />
-                      <span>Add intro note or inspect match math</span>
-                    </>
-                  )}
-                </button>
-
-                {expandedDetails && (
-                  <div className="mt-3 space-y-3 text-xs">
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-[#1c1b1b] block">
-                        Optional intro note (sent when you both match)
-                      </label>
-                      <input
-                        type="text"
-                        value={noteDraft}
-                        onChange={(e) => setNoteDraft(e.target.value)}
-                        placeholder="Write a quick note about what you want to build..."
-                        className="w-full px-3.5 py-2 bg-[#f6f3f2] border border-[#e9e5dd] rounded-xl text-[#1c1b1b] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#725c00]"
-                      />
-                    </div>
-
-                    <div className="flex items-center justify-between pt-1">
-                      <button
-                        type="button"
-                        onClick={() => setShowScoreBreakdown(!showScoreBreakdown)}
-                        className="text-[#746e65] hover:text-[#1c1b1b] cursor-pointer"
-                      >
-                        {showScoreBreakdown ? 'Hide weights' : 'Show weights (45 / 35 / 20)'}
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => onBlockUser(topCard.id)}
-                        className="inline-flex items-center gap-1 text-[#746e65] hover:text-rose-600 cursor-pointer"
-                      >
-                        <ShieldAlert className="w-3.5 h-3.5" />
-                        <span>Block student</span>
-                      </button>
-                    </div>
-
-                    {showScoreBreakdown && (
-                      <div className="p-3 bg-[#f6f3f2] rounded-xl grid grid-cols-3 gap-2 font-mono tabular-nums text-[11px] text-[#615e56]">
-                        <div>
-                          <span className="block text-[#746e65]">Skill Complement</span>
-                          <strong>
-                            {topCard.featureBreakdown.skillComplementarityScore ??
-                              topCard.featureBreakdown.interestOrRoleSim}%
-                          </strong>
-                        </div>
-                        <div>
-                          <span className="block text-[#746e65]">Shared Interests</span>
-                          <strong>
-                            {topCard.featureBreakdown.sharedInterestsScore ??
-                              topCard.featureBreakdown.tfidfThemeSim}%
-                          </strong>
-                        </div>
-                        <div>
-                          <span className="block text-[#746e65]">Swipe Affinity</span>
-                          <strong>
-                            {topCard.featureBreakdown.pastSwipeAffinityScore ?? 50}%
-                          </strong>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Action Button Dock */}
-              <div className="pt-2 flex items-center justify-between gap-3">
-                {/* Pass Action Button */}
-                <button
-                  type="button"
-                  data-testid="swipe-pass-btn"
-                  disabled={submittingCardId === topCard.id}
-                  onClick={() => void triggerSwipe('passed')}
-                  title="Pass profile (Press Left Arrow)"
-                  className="flex-1 flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-[#f6f3f2] hover:bg-[#eae7e7] text-[#4d4634] font-semibold text-xs sm:text-sm transition-all active:scale-[0.99] cursor-pointer disabled:opacity-50"
-                >
-                  <X className="w-4 h-4" />
-                  <span>Pass</span>
-                  <kbd className="hidden sm:inline-block px-1.5 py-0.5 text-[10px] rounded bg-white text-[#746e65] shadow-xs font-mono">
-                    ←
-                  </kbd>
-                </button>
-
-                {/* Interested in Teaming Button */}
-                <button
-                  type="button"
-                  data-testid="swipe-interested-btn"
-                  disabled={submittingCardId === topCard.id}
-                  onClick={() => void triggerSwipe('interested')}
-                  title="Interested in teaming (Right Arrow)"
-                  className="flex-[1.4] flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] font-bold text-xs sm:text-sm shadow-sm transition-all active:scale-[0.99] cursor-pointer disabled:opacity-50"
-                >
-                  <Heart className="w-4 h-4 fill-current text-[#1a1a1a]" />
-                  <span>{interestedActionLabel}</span>
-                  <kbd className="hidden sm:inline-block px-1.5 py-0.5 text-[10px] rounded bg-white/70 text-[#1a1a1a] shadow-xs font-mono">
-                    →
-                  </kbd>
-                </button>
-              </div>
-            </article>
-
-            {/* Quiet Keyboard & Gestural Footer Hint */}
-            <div className="mt-4 flex items-center justify-center gap-4 text-xs text-[#746e65]">
-              <div className="flex items-center gap-1.5">
-                <kbd className="px-1.5 py-0.5 rounded bg-white border border-[#e9e5dd] shadow-xs text-[#1c1b1b] font-mono font-medium">
-                  ←
-                </kbd>
-                <span>to pass</span>
-              </div>
-              <span className="text-[#dcd9d9]">•</span>
-              <div className="flex items-center gap-1.5">
-                <kbd className="px-1.5 py-0.5 rounded bg-white border border-[#e9e5dd] shadow-xs text-[#1c1b1b] font-mono font-medium">
-                  →
-                </kbd>
-                <span>to match</span>
-              </div>
-            </div>
+              </button>
+            )}
           </div>
-        )}
-      </div>
-    );
-  }
-);
+        </div>
+      )}
+    </div>
+  );
+};

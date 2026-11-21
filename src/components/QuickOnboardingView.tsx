@@ -3,6 +3,7 @@ import { ArrowRight, Check, Loader2, Plus, Sparkles, X } from 'lucide-react';
 import { Profile, User } from '../types/domain';
 import { normalizeHumanDisplayName } from '../lib/displayName';
 import { StudentAvatar } from './StudentAvatar';
+import { QUACKATHON_MINI_LOGO_SRC } from './LoginPage';
 
 export const QUICK_INTEREST_OPTIONS = [
   'AI/ML',
@@ -161,18 +162,16 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
   return (
     <div className="min-h-screen bg-[#faf8f2] text-[#1c1b1b] py-10 px-4 sm:px-6 antialiased">
       <div className="max-w-2xl mx-auto">
-        <div className="bg-white border border-[#e9e5dd] rounded-2xl shadow-sm p-6 sm:p-8">
+        <div className="bg-white border border-[#e9e5dd] rounded-2xl shadow-xs p-6 sm:p-8">
           <div className="flex items-start justify-between gap-4 pb-6 border-b border-[#f1ede6]">
             <div>
-              <div className="flex items-center gap-2 mb-2">
-                <span className="w-7 h-7 rounded-lg bg-[#ffd84d] flex items-center justify-center">
-                  <svg viewBox="0 0 48 48" width="20" height="20" aria-hidden="true" focusable="false">
-                    <ellipse cx="24" cy="27" rx="15.5" ry="14.5" fill="#ffdc63" />
-                    <path d="M13 17c2-10 18-12 22 0" fill="#ffdc63" />
-                    <circle cx="19" cy="25" r="1.7" fill="#25221c" />
-                    <circle cx="28.5" cy="25" r="1.7" fill="#25221c" />
-                    <path d="M19 30h10c0 5-10 5-10 0z" fill="#eba64a" />
-                  </svg>
+              <div className="flex items-center gap-2 mb-2.5">
+                <span className="w-8 h-8 rounded-lg bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center p-1">
+                  <img
+                    src={QUACKATHON_MINI_LOGO_SRC}
+                    alt="Quackathon"
+                    className="w-full h-full object-contain"
+                  />
                 </span>
                 <span className="text-xs font-bold uppercase tracking-wider text-[#725c00]">
                   Quick Setup
@@ -218,7 +217,7 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
                   }}
                   placeholder="e.g. Aarav Sharma"
                   maxLength={60}
-                  className="mt-2 w-full rounded-xl border border-[#e9e5dd] bg-[#f6f3f2] px-3.5 py-2.5 text-sm text-[#1c1b1b] placeholder:text-[#7e7662] focus:bg-white focus:border-[#725c00] focus:outline-none focus:ring-1 focus:ring-[#725c00]"
+                  className="mt-2 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2.5 text-sm text-[#1c1b1b] placeholder:text-[#7e7662] focus:bg-white focus:border-[#d0c6ae] focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
                 />
                 {nameError && (
                   <p className="mt-1.5 text-xs text-rose-600">{nameError}</p>
@@ -232,7 +231,7 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
                 <h2 className="text-sm font-semibold text-[#1c1b1b]">
                   1. Interests
                 </h2>
-                <span className="text-xs text-[#746e65]">
+                <span className="text-xs text-[#746e65] tabular-nums">
                   Choose up to 3 ({selectedInterests.length}/3)
                 </span>
               </div>
@@ -246,15 +245,15 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
                       type="button"
                       disabled={disabled}
                       onClick={() => toggleInterest(interest)}
-                      className={`inline-flex items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                      className={`quack-chip inline-flex items-center gap-1.5 rounded-lg border px-3.5 py-1.5 text-xs font-medium cursor-pointer ${
                         active
-                          ? 'border-[#ffd84d] bg-[#fff3c9] text-[#272015] font-bold shadow-xs'
+                          ? 'border-[#e5be35] bg-[#ffd84d] text-[#1c1b1b] font-semibold shadow-2xs'
                           : disabled
-                          ? 'border-[#e9e5dd] bg-[#f6f3f2] text-[#746e65]/50 cursor-not-allowed'
-                          : 'border-[#e9e5dd] bg-[#f6f3f2] text-[#514b43] hover:border-[#d0c6ae] hover:bg-white'
+                          ? 'border-[#e9e5dd] bg-[#f6f3f2] text-[#a8a29e] cursor-not-allowed'
+                          : 'border-[#e9e5dd] bg-white text-[#24211c] hover:border-[#d0c6ae] hover:bg-[#f6f3eb]'
                       }`}
                     >
-                      {active && <Check className="w-3.5 h-3.5 text-[#725c00]" />}
+                      {active && <Check className="w-3.5 h-3.5 text-[#1c1b1b]" />}
                       <span>{interest}</span>
                     </button>
                   );
@@ -280,13 +279,13 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
                       key={skill}
                       type="button"
                       onClick={() => toggleSkill(skill)}
-                      className={`inline-flex items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                      className={`quack-chip inline-flex items-center gap-1.5 rounded-lg border px-3.5 py-1.5 text-xs font-medium cursor-pointer ${
                         active
-                          ? 'border-[#ffd84d] bg-[#fff3c9] text-[#272015] font-bold shadow-xs'
-                          : 'border-[#e9e5dd] bg-[#f6f3f2] text-[#514b43] hover:border-[#d0c6ae] hover:bg-white'
+                          ? 'border-[#e5be35] bg-[#ffd84d] text-[#1c1b1b] font-semibold shadow-2xs'
+                          : 'border-[#e9e5dd] bg-white text-[#24211c] hover:border-[#d0c6ae] hover:bg-[#f6f3eb]'
                       }`}
                     >
-                      {active && <Check className="w-3.5 h-3.5 text-[#725c00]" />}
+                      {active && <Check className="w-3.5 h-3.5 text-[#1c1b1b]" />}
                       <span>{skill}</span>
                     </button>
                   );
@@ -294,14 +293,15 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
                 {customSkillsOnly.map((skill) => (
                   <span
                     key={skill}
-                    className="inline-flex items-center gap-1.5 rounded-full border border-[#ffd84d] bg-[#fff3c9] px-3.5 py-1.5 text-xs font-bold text-[#272015]"
+                    className="quack-chip inline-flex items-center gap-1.5 rounded-lg border border-[#e5be35] bg-[#ffd84d] px-3.5 py-1.5 text-xs font-semibold text-[#1c1b1b] shadow-2xs"
                   >
+                    <Check className="w-3.5 h-3.5 text-[#1c1b1b]" />
                     <span>{skill}</span>
                     <button
                       type="button"
                       onClick={() => toggleSkill(skill)}
                       aria-label={`Remove ${skill}`}
-                      className="text-[#725c00] hover:text-red-700 cursor-pointer"
+                      className="text-[#1c1b1b]/70 hover:text-[#1c1b1b] cursor-pointer ml-0.5"
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
@@ -320,13 +320,13 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
                     }
                   }}
                   placeholder="Add a custom skill (e.g. Rust, Flutter, Unity)"
-                  className="flex-1 rounded-xl border border-[#e9e5dd] bg-[#f6f3f2] px-3.5 py-2 text-sm text-[#1c1b1b] placeholder:text-[#7e7662] focus:bg-white focus:border-[#725c00] focus:outline-none focus:ring-1 focus:ring-[#725c00]"
+                  className="flex-1 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] placeholder:text-[#7e7662] focus:bg-white focus:border-[#d0c6ae] focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
                 />
                 <button
                   type="button"
                   onClick={handleAddCustomSkill}
                   disabled={!customSkillInput.trim()}
-                  className="inline-flex items-center gap-1 rounded-xl border border-[#e9e5dd] bg-white px-3.5 py-2 text-sm font-semibold text-[#1c1b1b] hover:bg-[#f6f3eb] disabled:opacity-40 cursor-pointer"
+                  className="inline-flex items-center gap-1 rounded-xl border border-[#e9e5dd] bg-white px-3.5 py-2 text-sm font-semibold text-[#1c1b1b] hover:bg-[#f6f3eb] disabled:opacity-40 transition-colors duration-150 cursor-pointer"
                 >
                   <Plus className="w-4 h-4" />
                   <span>Add</span>
@@ -352,13 +352,14 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
                       onClick={() =>
                         setSelectedRole((prev) => (prev === role ? '' : role))
                       }
-                      className={`rounded-xl border px-3.5 py-2.5 text-xs font-semibold text-left transition-colors cursor-pointer ${
+                      className={`quack-chip rounded-xl border px-3.5 py-2.5 text-xs font-semibold text-left flex items-center justify-between cursor-pointer ${
                         active
-                          ? 'border-[#ffd84d] bg-[#fff3c9] text-[#272015] shadow-xs'
-                          : 'border-[#e9e5dd] bg-[#f6f3f2] text-[#514b43] hover:border-[#d0c6ae] hover:bg-white'
+                          ? 'border-[#e5be35] bg-[#ffd84d] text-[#1c1b1b] shadow-2xs'
+                          : 'border-[#e9e5dd] bg-white text-[#24211c] hover:border-[#d0c6ae] hover:bg-[#f6f3eb]'
                       }`}
                     >
-                      {role}
+                      <span>{role}</span>
+                      {active && <Check className="w-3.5 h-3.5 text-[#1c1b1b]" />}
                     </button>
                   );
                 })}
@@ -367,10 +368,10 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
           </div>
 
           {/* Info Note */}
-          <div className="mt-7 flex items-start gap-2.5 rounded-xl bg-[#fff3c9]/40 border border-[#ffd84d]/60 px-4 py-3 text-xs text-[#564500] leading-relaxed">
+          <div className="mt-7 flex items-start gap-2.5 rounded-xl bg-[#fff3c9]/45 border border-[#f0d98c] px-4 py-3 text-xs text-[#564500] leading-relaxed">
             <Sparkles className="w-4 h-4 text-[#875200] shrink-0 mt-0.5" />
             <p>
-              GitHub, bio, and projects are completely optional. You can add them anytime under Profile → More Details to improve teammate recommendations.
+              GitHub, bio, and projects are optional. You can add them anytime under Profile to strengthen teammate recommendations.
             </p>
           </div>
 
@@ -380,7 +381,7 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
               type="button"
               disabled={submitting}
               onClick={() => handleSubmit(true)}
-              className="text-sm font-medium text-[#746e65] hover:text-[#1c1b1b] px-2 py-2 transition-colors cursor-pointer disabled:opacity-50"
+              className="text-sm font-medium text-[#746e65] hover:text-[#1c1b1b] px-2 py-2 transition-colors duration-150 cursor-pointer disabled:opacity-50"
             >
               Skip for now
             </button>
@@ -389,7 +390,7 @@ export const QuickOnboardingView: React.FC<QuickOnboardingViewProps> = ({
               type="button"
               disabled={submitting}
               onClick={() => handleSubmit(false)}
-              className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] px-6 py-2.5 text-sm font-bold shadow-sm transition-all cursor-pointer disabled:opacity-60"
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] active:scale-[0.98] border border-[#e5be35] text-[#1c1b1b] px-6 py-2.5 text-sm font-bold shadow-xs transition-all duration-150 cursor-pointer disabled:opacity-60"
             >
               {submitting ? (
                 <>

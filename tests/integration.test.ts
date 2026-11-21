@@ -6519,5 +6519,453 @@ test('45. P3 Discover UI filter removal & P4 strict team hackathon catalog eligi
   }
 });
 
+test('46. Hackathons conventional numbered pagination edge cases (0, 5, 10, 11, 25 items)', async () => {
+  const { paginateItems } = await import('../src/lib/pagination.ts');
+
+  const makeItems = (n: number) => Array.from({ length: n }, (_, i) => `hack_${i + 1}`);
+
+  // 0 items
+  const p0 = paginateItems(makeItems(0), 1, 10);
+  assert.equal(p0.pageItems.length, 0);
+  assert.equal(p0.currentPage, 1);
+  assert.equal(p0.totalPages, 1);
+  assert.equal(p0.showPagination, false);
+  assert.equal(p0.hasPrevious, false);
+  assert.equal(p0.hasNext, false);
+
+  // 5 items (fits on one page -> hide pagination)
+  const p5 = paginateItems(makeItems(5), 1, 10);
+  assert.equal(p5.pageItems.length, 5);
+  assert.equal(p5.totalPages, 1);
+  assert.equal(p5.showPagination, false);
+  assert.equal(p5.hasPrevious, false);
+  assert.equal(p5.hasNext, false);
+  assert.equal(p5.startIndex, 1);
+  assert.equal(p5.endIndex, 5);
+
+  // 10 items (exact max per page -> hide pagination)
+  const p10 = paginateItems(makeItems(10), 1, 10);
+  assert.equal(p10.pageItems.length, 10);
+  assert.equal(p10.totalPages, 1);
+  assert.equal(p10.showPagination, false);
+  assert.equal(p10.hasPrevious, false);
+  assert.equal(p10.hasNext, false);
+
+  // 11 items (2 pages: 1-10 and 11)
+  const p11Page1 = paginateItems(makeItems(11), 1, 10);
+  assert.equal(p11Page1.showPagination, true);
+  assert.equal(p11Page1.totalPages, 2);
+  assert.deepEqual(p11Page1.pageNumbers, [1, 2]);
+  assert.equal(p11Page1.pageItems.length, 10);
+  assert.equal(p11Page1.pageItems[0], 'hack_1');
+  assert.equal(p11Page1.pageItems[9], 'hack_10');
+  assert.equal(p11Page1.hasPrevious, false);
+  assert.equal(p11Page1.hasNext, true);
+
+  const p11Page2 = paginateItems(makeItems(11), 2, 10);
+  assert.equal(p11Page2.currentPage, 2);
+  assert.equal(p11Page2.pageItems.length, 1);
+  assert.equal(p11Page2.pageItems[0], 'hack_11');
+  assert.equal(p11Page2.hasPrevious, true);
+  assert.equal(p11Page2.hasNext, false);
+
+  // 25 items (3 pages: 1-10, 11-20, 21-25) + clamping out-of-range page requests
+  const p25Page2 = paginateItems(makeItems(25), 2, 10);
+  assert.equal(p25Page2.totalPages, 3);
+  assert.deepEqual(p25Page2.pageNumbers, [1, 2, 3]);
+  assert.equal(p25Page2.pageItems.length, 10);
+  assert.equal(p25Page2.pageItems[0], 'hack_11');
+  assert.equal(p25Page2.pageItems[9], 'hack_20');
+  assert.equal(p25Page2.hasPrevious, true);
+  assert.equal(p25Page2.hasNext, true);
+
+  const p25ClampedHigh = paginateItems(makeItems(25), 99, 10);
+  assert.equal(p25ClampedHigh.currentPage, 3);
+  assert.equal(p25ClampedHigh.pageItems.length, 5);
+  assert.equal(p25ClampedHigh.pageItems[0], 'hack_21');
+  assert.equal(p25ClampedHigh.pageItems[4], 'hack_25');
+  assert.equal(p25ClampedHigh.hasNext, false);
+
+  const p25ClampedLow = paginateItems(makeItems(25), 0, 10);
+  assert.equal(p25ClampedLow.currentPage, 1);
+});
+
+test('47. Upcoming-only hackathon catalog filtering, not-yet-open distinction, and ended-event matching block', async () => {
+  const {
+    filterUpcomingStudentHackathons,
+    describeHackathonRegistrationDetail,
+  } = await import('../src/lib/pagination.ts');
+  const { isHackathonEligibleForMatching, rankPeopleForHackathon } = await import(
+    '../src/services/matchingEngine.ts'
+  );
+
+  const baseHackathon = {
+    organizer: 'PESU Tech Club',
+    description: '24-hour team hackathon for PESU students.',
+    eventType: 'hackathon' as const,
+    matchable: true,
+    themes: ['AI / ML'],
+    venue: { name: 'MRD Auditorium', campus: 'RR Campus' as const },
+    format: 'onsite' as const,
+    datePrecision: 'exact_instant' as const,
+    timezone: 'Asia/Kolkata',
+    minTeamSize: 2,
+    maxTeamSize: 4,
+    eligibilityNotes: 'Open to PESU teams of 2-4.',
+    registrationUrl: 'https://events.pes.edu/event',
+    sourceIds: ['events_pes_edu'],
+    fieldProvenance: {},
+    suggestedByCount: 0,
+    classification: {
+      category: 'hackathon' as const,
+      ruleGatePassed: true,
+      mlConfidenceScore: 0.96,
+      reason: 'Verified team hackathon',
+    },
+    lastVerifiedAt: '2026-11-20T00:00:00.000Z',
+    verificationStatus: 'verified' as const,
+    status: 'published' as const,
+    createdBy: 'system',
+  };
+
+  const refDate = new Date('2026-11-21T10:00:00+05:30');
+
+  const upcomingOpen = {
+    ...baseHackathon,
+    id: 'hack_upcoming_open',
+    name: 'PESU AI Buildathon 2026',
+    startAt: '2026-12-05T09:00:00+05:30',
+    endAt: '2026-12-06T18:00:00+05:30',
+    registrationDeadline: '2026-12-02T23:59:59+05:30',
+    registrationStatus: 'OPEN' as const,
+  };
+
+  const upcomingNotYetOpen = {
+    ...baseHackathon,
+    id: 'hack_upcoming_soon',
+    name: 'Winter Systems Hackathon',
+    startAt: '2026-12-18T09:00:00+05:30',
+    endAt: '2026-12-19T18:00:00+05:30',
+    registrationDeadline: null,
+    registrationStatus: 'UNKNOWN' as const,
+    registrationUrl: null,
+  };
+
+  const endedHackathon = {
+    ...baseHackathon,
+    id: 'hack_ended',
+    name: 'Quantum Hackathon 2026',
+    startAt: '2026-11-14T09:00:00+05:30',
+    endAt: '2026-11-14T18:00:00+05:30',
+    registrationDeadline: '2026-11-12T23:59:59+05:30',
+    registrationStatus: 'CLOSED' as const,
+  };
+
+  const expiredRegistrationHackathon = {
+    ...baseHackathon,
+    id: 'hack_expired_reg',
+    name: 'Closed Registration Hack',
+    startAt: '2026-11-29T09:00:00+05:30',
+    endAt: '2026-11-30T18:00:00+05:30',
+    registrationDeadline: '2026-11-18T23:59:59+05:30',
+    registrationStatus: 'CLOSED' as const,
+  };
+
+  const upcomingWorkshop = {
+    ...baseHackathon,
+    id: 'workshop_upcoming',
+    name: 'Docker Hands-on Workshop',
+    description: 'Introductory hands-on workshop.',
+    eventType: 'workshop' as const,
+    matchable: false,
+    startAt: '2026-12-10T09:00:00+05:30',
+    endAt: '2026-12-10T12:00:00+05:30',
+    registrationDeadline: '2026-12-08T23:59:59+05:30',
+    registrationStatus: 'OPEN' as const,
+  };
+
+  const filtered = filterUpcomingStudentHackathons(
+    [
+      endedHackathon,
+      upcomingNotYetOpen,
+      upcomingOpen,
+      expiredRegistrationHackathon,
+      upcomingWorkshop,
+    ],
+    refDate
+  );
+
+  // Only verified upcoming team hackathons remain (both OPEN and not-yet-open), sorted chronologically
+  assert.deepEqual(
+    filtered.map((h) => h.id),
+    ['hack_upcoming_open', 'hack_upcoming_soon']
+  );
+
+  // Registration state distinguishes not_yet_open from closed and ended
+  assert.equal(describeHackathonRegistrationDetail(upcomingOpen, '2026-11-21').kind, 'open');
+  assert.equal(
+    describeHackathonRegistrationDetail(upcomingNotYetOpen, '2026-11-21').kind,
+    'not_yet_open'
+  );
+  assert.equal(
+    describeHackathonRegistrationDetail(expiredRegistrationHackathon, '2026-11-21').kind,
+    'closed'
+  );
+  assert.equal(describeHackathonRegistrationDetail(endedHackathon, '2026-11-21').kind, 'ended');
+
+  // Ended hackathon is NEVER eligible for matching and yields 0 candidates
+  assert.equal(isHackathonEligibleForMatching(endedHackathon), false);
+  const endedCandidates = rankPeopleForHackathon({
+    viewerUid: 'viewer_1',
+    hackathon: endedHackathon,
+    users: [],
+    profiles: {},
+    participations: [],
+    teams: [],
+    memberships: [],
+    interests: [],
+    blocks: [],
+  }).cards;
+  assert.equal(endedCandidates.length, 0);
+});
+
+test('48. Development-only testing sandbox: synthetic student swiping, reset passed, mutual matching & production isolation', async () => {
+  const {
+    createDevTestingFixtures,
+    isDevTestingEnvironment,
+    DEV_TEST_HACKATHON_ID,
+  } = await import('../src/data/devTestingMode.ts');
+  const { rankPeopleForHackathon, isHackathonEligibleForMatching } = await import(
+    '../src/services/matchingEngine.ts'
+  );
+
+  // Test environment allows dev testing mode (QUACKATHON_TEST_MODE=true & NODE_ENV !== production)
+  assert.equal(isDevTestingEnvironment(), true);
+
+  const viewerUid = 'usr_dev_tester_1';
+  const fixtures = createDevTestingFixtures(viewerUid);
+
+  // 1 active upcoming synthetic hackathon + 8 clearly labeled synthetic students
+  assert.equal(fixtures.hackathon.id, DEV_TEST_HACKATHON_ID);
+  assert.equal(isHackathonEligibleForMatching(fixtures.hackathon), true);
+  assert.equal(fixtures.users.length, 8);
+  assert.ok(fixtures.users.every((u) => u.displayName.includes('[Dev Test]')));
+  assert.ok(fixtures.incomingInterests.length >= 2);
+
+  // Build viewer profile & participation (explicit opt-in)
+  const nowIso = new Date().toISOString();
+  const viewerUser = {
+    uid: viewerUid,
+    displayName: 'Test Student',
+    campus: 'RR Campus' as const,
+    program: 'CSE',
+    graduationYear: 2027,
+    verified: true,
+    verificationStatus: 'verified_pesu_oidc' as const,
+    pesuOidcSub: 'sub_dev_tester_1',
+    personaLabel: 'PESU Student',
+    accountStatus: 'active' as const,
+    createdAt: nowIso,
+    privacyPreferences: {
+      profileVisible: true,
+      githubConsent: false,
+      aiEnrichmentConsent: false,
+      academyAnnouncementsOptIn: false,
+      academyTimetableOptIn: false,
+      onboardingCompleted: true,
+    },
+  };
+  const viewerProfile = {
+    uid: viewerUid,
+    headline: 'Full-Stack Builder',
+    about: 'Building practical hackathon apps.',
+    skillTags: ['TypeScript', 'React', 'Node.js'],
+    interestTags: ['AI/ML', 'Web Development', 'Cloud/Systems'],
+    projectDomains: ['AI/ML', 'Web Development'],
+    topicsToExplore: ['AI/ML'],
+    preferredRoles: ['Full-Stack'],
+    rolesWantToLearn: [],
+    workingStyleTags: [],
+    hackathonGoals: [],
+    portfolioLinks: [],
+    featuredProjects: [],
+    isFirstTimeHacker: false,
+    visibility: 'public_verified_students' as const,
+    updatedAt: nowIso,
+  };
+  const viewerParticipation = {
+    id: `dev_part_${viewerUid}`,
+    hackathonId: fixtures.hackathon.id,
+    uid: viewerUid,
+    intent: 'looking' as const,
+    desiredRoles: ['Full-Stack'],
+    skillsOffered: ['TypeScript', 'React', 'Node.js'],
+    availabilityWindows: ['Flexible'],
+    commitmentLevel: 'standard' as const,
+    workPreferences: [],
+    discoverable: true,
+    updatedAt: nowIso,
+  };
+
+  const allUsers = [viewerUser, ...fixtures.users];
+  const allProfiles = { [viewerUid]: viewerProfile, ...fixtures.profiles };
+  const allParticipations = [viewerParticipation, ...fixtures.participations];
+
+  // Candidate pipeline yields all 8 ranked synthetic students
+  const initialRanked = rankPeopleForHackathon({
+    viewerUid,
+    hackathon: fixtures.hackathon,
+    users: allUsers,
+    profiles: allProfiles,
+    participations: allParticipations,
+    teams: [],
+    memberships: [],
+    interests: fixtures.incomingInterests,
+    blocks: [],
+  }).cards;
+  assert.equal(initialRanked.length, 8);
+
+  // Swipe left (pass) hides candidate; resetting passed candidates restores them
+  const firstCandidateUid = initialRanked[0].id;
+  const passInterest = {
+    id: 'dev_swipe_pass_1',
+    hackathonId: fixtures.hackathon.id,
+    fromUid: viewerUid,
+    targetType: 'user' as const,
+    targetId: firstCandidateUid,
+    decision: 'passed' as const,
+    createdAt: nowIso,
+  };
+  const afterPass = rankPeopleForHackathon({
+    viewerUid,
+    hackathon: fixtures.hackathon,
+    users: allUsers,
+    profiles: allProfiles,
+    participations: allParticipations,
+    teams: [],
+    memberships: [],
+    interests: [...fixtures.incomingInterests, passInterest],
+    blocks: [],
+  }).cards;
+  assert.equal(afterPass.length, 7);
+  assert.equal(
+    afterPass.some((c) => c.id === firstCandidateUid),
+    false
+  );
+
+  // Reset passed -> returns to 8
+  const afterReset = rankPeopleForHackathon({
+    viewerUid,
+    hackathon: fixtures.hackathon,
+    users: allUsers,
+    profiles: allProfiles,
+    participations: allParticipations,
+    teams: [],
+    memberships: [],
+    interests: fixtures.incomingInterests,
+    blocks: [],
+  }).cards;
+  assert.equal(afterReset.length, 8);
+
+  // Swipe right on a pre-interested synthetic student produces a mutual match
+  const mutualTargetUid = fixtures.incomingInterests[0].fromUid;
+  const hasIncomingInterest = fixtures.incomingInterests.some(
+    (item) =>
+      item.fromUid === mutualTargetUid &&
+      item.targetId === viewerUid &&
+      item.decision === 'interested'
+  );
+  assert.equal(hasIncomingInterest, true);
+
+  // Production guard check: NODE_ENV=production disables isDevTestingEnvironment
+  const prevNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = 'production';
+    assert.equal(isDevTestingEnvironment(), false);
+  } finally {
+    if (prevNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = prevNodeEnv;
+    }
+  }
+});
+
+test('49. Deterministic student avatars, mini duck logo branding, and Profile/Matches/Hackathons UI simplification regressions', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { getAnimalVariantForStudent } = await import('../src/components/StudentAvatar.tsx');
+
+  // Deterministic avatar seeded by uid regardless of display name edits, never 'panda'
+  for (let i = 0; i < 40; i++) {
+    const uid = `usr_pesu_student_${i}`;
+    const v1 = getAnimalVariantForStudent(uid, 'Alice');
+    const v2 = getAnimalVariantForStudent(uid, 'Completely Different Name');
+    assert.equal(v1, v2, 'Avatar must remain identical for the same uid');
+    assert.notEqual(v1, 'panda', 'Monochrome panda avatar must not be used');
+  }
+
+  const readSrc = (rel: string) => fs.readFileSync(path.resolve(process.cwd(), rel), 'utf8');
+
+  // Profile page removed clutter assertions
+  const profileSrc = readSrc('src/components/OnboardingAndProfileModal.tsx');
+  for (const forbidden of [
+    'Academic Credentials',
+    'Verified via PESU Student Portal',
+    'Primary Campus',
+    'Graduating Term',
+    'Profile Active',
+    'This is my first hackathon',
+    'Draft Suggestions for Review',
+    'Collaboration Style',
+    'Roles to Explore',
+    'Conversation Starter',
+    'Privacy & Account Settings',
+    'Visible in teammate discovery',
+    'Enable private PESU Academy announcements',
+  ]) {
+    assert.equal(
+      profileSrc.includes(forbidden),
+      false,
+      `OnboardingAndProfileModal.tsx must not contain removed section/copy: ${forbidden}`
+    );
+  }
+
+  // Matches & Shortlist page removed clutter assertions
+  const matchesSrc = readSrc('src/components/MatchesAndChatView.tsx');
+  for (const forbidden of [
+    'PESU Chapter',
+    'Matches are separate from team invitations and approvals',
+    'Messages (',
+    'Shortlist (',
+  ]) {
+    assert.equal(
+      matchesSrc.includes(forbidden),
+      false,
+      `MatchesAndChatView.tsx must not contain removed copy/tab: ${forbidden}`
+    );
+  }
+
+  // Hackathons page removed redundant time filters and secondary Academy toggle
+  const hackathonsSrc = readSrc('src/components/HackathonsView.tsx');
+  for (const forbidden of ['This Week', 'This Month', 'PESU Academy']) {
+    assert.equal(
+      hackathonsSrc.includes(forbidden),
+      false,
+      `HackathonsView.tsx must not contain removed filter/tab: ${forbidden}`
+    );
+  }
+
+  // Consistent uploaded mini duck logo used across key views (no animate-ping dot on login)
+  const loginSrc = readSrc('src/components/LoginPage.tsx');
+  assert.equal(loginSrc.includes('/assets/aistudio/mini_7f313967.png'), true);
+  assert.equal(loginSrc.includes('animate-ping'), false);
+
+  const appSrc = readSrc('src/App.tsx');
+  assert.equal(appSrc.includes('QUACKATHON_MINI_LOGO_SRC'), true);
+  assert.equal(appSrc.includes('<StudentAvatar'), true);
+});
+
+
 
 

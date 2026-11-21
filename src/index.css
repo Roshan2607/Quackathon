@@ -314,28 +314,79 @@ main.quack-page-main {
   }
 }
 
-/* Animations */
+/* Subtle, Compositor-Only Animations (<= 200ms) */
 @keyframes quack-enter {
-  from { opacity: 0; transform: translateY(8px); }
+  from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes quack-card-in {
-  from { opacity: 0; transform: translateY(14px) scale(0.985); }
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
-.quack-card-in {
-  animation: quack-card-in 0.27s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+@keyframes quack-dropdown-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
-.modal-enter {
-  animation: modalPop 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+@keyframes modalBackdropFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 @keyframes modalPop {
-  0% { opacity: 0; transform: scale(0.97) translateY(8px); }
+  0% { opacity: 0; transform: scale(0.97) translateY(6px); }
   100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.quack-card-in {
+  animation: quack-card-in 0.19s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.quack-dropdown-enter {
+  animation: quack-dropdown-in 0.16s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.modal-backdrop-enter {
+  animation: modalBackdropFade 0.16s ease-out both;
+}
+
+.modal-enter {
+  animation: modalPop 0.18s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.quack-interactive-card {
+  transition: transform 0.16s cubic-bezier(0.2, 0.7, 0.2, 1),
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    background-color 0.16s ease;
+}
+
+.quack-interactive-card:hover {
+  transform: translateY(-2px);
+  border-color: #d9cfa8;
+  box-shadow: 0 8px 20px -10px rgba(36, 33, 28, 0.14);
+}
+
+.quack-interactive-card:active {
+  transform: translateY(0) scale(0.992);
+}
+
+.quack-chip {
+  transition: transform 0.14s cubic-bezier(0.2, 0.7, 0.2, 1),
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.quack-chip:active:not(:disabled) {
+  transform: scale(0.965);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -348,3 +399,4 @@ main.quack-page-main {
     scroll-behavior: auto !important;
   }
 }
+

@@ -61,9 +61,14 @@ import { TeamsAndRequestsView } from './components/TeamsAndRequestsView';
 import { OnboardingAndProfileModal } from './components/OnboardingAndProfileModal';
 import { AdminReviewQueueView } from './components/AdminReviewQueueView';
 import { IntegrationTestingView } from './components/IntegrationTestingView';
-import { LoginPage } from './components/LoginPage';
+import { LoginPage, QUACKATHON_MINI_LOGO_SRC } from './components/LoginPage';
 import { QuickOnboardingView } from './components/QuickOnboardingView';
 import { StudentAvatar } from './components/StudentAvatar';
+import {
+  createDevTestingFixtures,
+  DEV_TEST_HACKATHON_ID,
+  isDevTestingEnvironment,
+} from './data/devTestingMode';
 
 type NavTab =
   | 'discover'
@@ -197,6 +202,23 @@ export function App() {
   const [blocks, setBlocks] = useState<BlockRecord[]>([]);
   const [reports, setReports] = useState<ReportRecord[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+
+  // Strictly Development-Only Isolated Testing Sandbox (Never active in production)
+  const devTestingAvailable = isDevTestingEnvironment();
+  const [devTestingActive, setDevTestingActive] = useState(false);
+  const previousLiveHackathonIdRef = useRef<string>('');
+  const [devSandbox, setDevSandbox] = useState<{
+    hackathon: Hackathon;
+    users: User[];
+    profiles: Record<string, Profile>;
+    participations: Participation[];
+    interests: Interest[];
+    teams: Team[];
+    memberships: Membership[];
+    teamProposals: TeamProposal[];
+    conversations: Conversation[];
+    messages: Message[];
+  } | null>(null);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [unregisteredRedirectInfo, setUnregisteredRedirectInfo] = useState<{
@@ -1589,6 +1611,403 @@ export function App() {
     [currentUser.uid, showToast]
   );
 
+  // Isolated Development-Only Sandbox Handlers (Never write to production DB)
+  const initializeDevSandbox = useCallback(
+    (viewerUid: string) => {
+      const fixtures = createDevTestingFixtures(viewerUid);
+      setDevSandbox({
+        hackathon: fixtures.hackathon,
+        users: fixtures.users,
+        profiles: fixtures.profiles,
+        participations: fixtures.participations,
+        interests: fixtures.incomingInterests,
+        teams: [],
+        memberships: [],
+        teamProposals: [],
+        conversations: [],
+        messages: [],
+      });
+    },
+    []
+  );
+
+  const handleToggleDevTestingMode = useCallback(
+    (enabled: boolean) => {
+      if (!devTestingAvailable) return;
+      if (enabled) {
+        previousLiveHackathonIdRef.current = selectedHackathonId;
+        initializeDevSandbox(currentUser.uid);
+        setDevTestingActive(true);
+        setSelectedHackathonId(DEV_TEST_HACKATHON_ID);
+        showToast(
+          'Development testing sandbox enabled with 8 synthetic profiles.'
+        );
+      } else {
+        setDevTestingActive(false);
+        setDevSandbox(null);
+        const restored =
+          previousLiveHackathonIdRef.current &&
+          hackathons.some((h) => h.id === previousLiveHackathonIdRef.current)
+            ? previousLiveHackathonIdRef.current
+            : hackathons.find((h) => isHackathonEligibleForMatching(h))?.id ??
+              hackathons[0]?.id ??
+              '';
+        setSelectedHackathonId(restored);
+        showToast('Exited development testing sandbox.');
+      }
+    },
+    [
+      devTestingAvailable,
+      selectedHackathonId,
+      initializeDevSandbox,
+      currentUser.uid,
+      hackathons,
+      showToast,
+    ]
+  );
+
+  const handleResetDevTestingSandbox = useCallback(() => {
+    if (!devTestingAvailable || !devTestingActive) return;
+    initializeDevSandbox(currentUser.uid);
+    showToast('Development testing sandbox reset.');
+  }, [devTestingAvailable, devTestingActive, initializeDevSandbox, currentUser.uid, showToast]);
+
+  const applyDevSandboxRightSwipe = useCallback(
+    (targetUid: string, targetName: string, hackathonId: string) => {
+      const nowIso = new Date().toISOString();
+      let toastMsg = `Interested in ${targetName} — added to your Shortlist.`;
+
+      setDevSandbox((prev) => {
+        if (!prev) return prev;
+        const newInterest: Interest = {
+          id: `dev_sw_${currentUser.uid}_${targetUid}_${Date.now()}`,
+          hackathonId,
+          fromUid: currentUser.uid,
+          targetType: 'user',
+          targetId: targetUid,
+          decision: 'interested',
+          createdAt: nowIso,
+        };
+        const nextInterests = [
+          ...prev.interests.filter(
+            (i) =>
+              !(
+                i.hackathonId === hackathonId &&
+                i.fromUid === currentUser.uid &&
+                i.targetId === targetUid
+              )
+          ),
+          newInterest,
+        ];
+
+        const hasIncoming = prev.interests.some(
+          (i) =>
+            i.hackathonId === hackathonId &&
+            i.fromUid === targetUid &&
+            i.targetId === currentUser.uid &&
+            i.decision === 'interested'
+        );
+
+        if (!hasIncoming) {
+          return { ...prev, interests: nextInterests };
+        }
+
+        // Mutual match! Check if viewer already has an active team in dev sandbox
+        const existingMem = prev.memberships.find(
+          (m) =>
+            m.uid === currentUser.uid &&
+            m.hackathonId === hackathonId &&
+            m.status === 'active'
+        );
+        const existingTeam = existingMem
+          ? prev.teams.find((t) => t.id === existingMem.teamId)
+          : undefined;
+
+        if (!existingTeam) {
+          const teamId = `dev_team_${Date.now()}`;
+          const convId = `dev_conv_${teamId}`;
+          const firstWord = targetName.split(' ')[0] || 'Teammate';
+          const newTeam: Team = {
+            id: teamId,
+            hackathonId,
+            name: `Dev Squad with ${firstWord}`,
+            pitch: 'Testing team collaboration and chat in the local dev sandbox.',
+            projectIdea: 'QuackHack Sandbox Prototype',
+            leaderId: currentUser.uid,
+            rolesNeeded: ['Backend', 'Design'],
+            customSpecializations: [],
+            desiredDomains: ['AI/ML', 'Web Development'],
+            availabilitySummary: 'Flexible (Dev Sandbox)',
+            workStyleTags: [],
+            targetSize: 4,
+            memberCount: 2,
+            status: 'open',
+            visibility: 'public',
+            createdAt: nowIso,
+          };
+          const newMemberships: Membership[] = [
+            {
+              id: `dev_mem_${teamId}_${currentUser.uid}`,
+              teamId,
+              hackathonId,
+              uid: currentUser.uid,
+              role: currentProfile.preferredRoles[0] || 'Builder',
+              status: 'active',
+              joinedAt: nowIso,
+            },
+            {
+              id: `dev_mem_${teamId}_${targetUid}`,
+              teamId,
+              hackathonId,
+              uid: targetUid,
+              role: prev.profiles[targetUid]?.preferredRoles[0] || 'Builder',
+              status: 'active',
+              joinedAt: nowIso,
+            },
+          ];
+          const newConv: Conversation = {
+            id: convId,
+            type: 'team_roster',
+            hackathonId,
+            teamId,
+            participantUids: [currentUser.uid, targetUid],
+            title: newTeam.name,
+            createdAt: nowIso,
+            lastMessageAt: nowIso,
+          };
+          const welcomeMsg: Message = {
+            id: `dev_msg_${Date.now()}`,
+            conversationId: convId,
+            senderUid: targetUid,
+            body: `Hey! Excited to team up for ${prev.hackathon.name} — ready to build!`,
+            createdAt: nowIso,
+            moderationStatus: 'clean',
+          };
+          toastMsg = `Mutual match with ${targetName}! Created team "${newTeam.name}" in My Team.`;
+          return {
+            ...prev,
+            interests: nextInterests,
+            teams: [newTeam, ...prev.teams],
+            memberships: [...prev.memberships, ...newMemberships],
+            conversations: [newConv, ...prev.conversations],
+            messages: [...prev.messages, welcomeMsg],
+          };
+        }
+
+        // Viewer already has a team -> create unanimous 3rd/4th member proposal
+        const activeMemberUids = prev.memberships
+          .filter((m) => m.teamId === existingTeam.id && m.status === 'active')
+          .map((m) => m.uid);
+        const alreadyProposed = prev.teamProposals.some(
+          (tp) =>
+            tp.teamId === existingTeam.id && tp.candidateUid === targetUid
+        );
+        if (alreadyProposed || existingTeam.memberCount >= existingTeam.targetSize) {
+          toastMsg = `Mutual match with ${targetName}!`;
+          return { ...prev, interests: nextInterests };
+        }
+
+        const proposalId = `dev_prop_${Date.now()}`;
+        const proposal: TeamProposal = {
+          id: proposalId,
+          teamId: existingTeam.id,
+          hackathonId,
+          candidateUid: targetUid,
+          proposedByUid: currentUser.uid,
+          proposedRole: prev.profiles[targetUid]?.preferredRoles[0] || 'Builder',
+          status: 'pending_votes',
+          votes: activeMemberUids.map((uid) => ({
+            id: `dev_vote_${proposalId}_${uid}`,
+            proposalId,
+            teamId: existingTeam.id,
+            voterUid: uid,
+            decision: 'approve',
+            votedAt: nowIso,
+          })),
+          requiredVoterUids: activeMemberUids,
+          approvedCount: activeMemberUids.length,
+          requiredCount: activeMemberUids.length,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+        // In dev sandbox, auto-approve synthetic teammate's vote so user can also test voting/joining
+        const nextTeams = prev.teams.map((t) =>
+          t.id === existingTeam.id
+            ? {
+                ...t,
+                memberCount: t.memberCount + 1,
+                status:
+                  t.memberCount + 1 >= t.targetSize
+                    ? ('full' as const)
+                    : t.status,
+              }
+            : t
+        );
+        const newMem: Membership = {
+          id: `dev_mem_${existingTeam.id}_${targetUid}`,
+          teamId: existingTeam.id,
+          hackathonId,
+          uid: targetUid,
+          role: prev.profiles[targetUid]?.preferredRoles[0] || 'Builder',
+          status: 'active',
+          joinedAt: nowIso,
+        };
+        const updatedConvs = prev.conversations.map((c) =>
+          c.teamId === existingTeam.id &&
+          !c.participantUids.includes(targetUid)
+            ? { ...c, participantUids: [...c.participantUids, targetUid] }
+            : c
+        );
+        toastMsg = `Mutual match with ${targetName}! Unanimous team approval added them to "${existingTeam.name}" in My Team.`;
+        return {
+          ...prev,
+          interests: nextInterests,
+          teams: nextTeams,
+          memberships: [...prev.memberships, newMem],
+          teamProposals: [
+            { ...proposal, status: 'accepted' },
+            ...prev.teamProposals,
+          ],
+          conversations: updatedConvs,
+        };
+      });
+
+      showToast(toastMsg);
+    },
+    [currentUser.uid, currentProfile.preferredRoles, showToast]
+  );
+
+  const handleDevSwipeDecision = useCallback(
+    (card: CandidateCard, decision: 'interested' | 'passed') => {
+      if (decision === 'passed') {
+        const nowIso = new Date().toISOString();
+        setDevSandbox((prev) => {
+          if (!prev) return prev;
+          const passedInterest: Interest = {
+            id: `dev_pass_${currentUser.uid}_${card.id}_${Date.now()}`,
+            hackathonId: card.hackathonId,
+            fromUid: currentUser.uid,
+            targetType: 'user',
+            targetId: card.id,
+            decision: 'passed',
+            createdAt: nowIso,
+          };
+          return {
+            ...prev,
+            interests: [
+              ...prev.interests.filter(
+                (i) =>
+                  !(
+                    i.hackathonId === card.hackathonId &&
+                    i.fromUid === currentUser.uid &&
+                    i.targetId === card.id
+                  )
+              ),
+              passedInterest,
+            ],
+          };
+        });
+        return;
+      }
+      applyDevSandboxRightSwipe(card.id, card.title, card.hackathonId);
+    },
+    [currentUser.uid, applyDevSandboxRightSwipe]
+  );
+
+  const handleDevSwipeBack = useCallback(
+    (targetUid: string, hackathonId: string) => {
+      const targetName =
+        devSandbox?.users.find((u) => u.uid === targetUid)?.displayName ??
+        'Student';
+      applyDevSandboxRightSwipe(targetUid, targetName, hackathonId);
+    },
+    [devSandbox?.users, applyDevSandboxRightSwipe]
+  );
+
+  const handleDevResetPassedCards = useCallback(
+    (hackathonId: string) => {
+      setDevSandbox((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          interests: prev.interests.filter(
+            (i) =>
+              !(
+                i.hackathonId === hackathonId &&
+                i.fromUid === currentUser.uid &&
+                i.decision === 'passed'
+              )
+          ),
+        };
+      });
+      showToast('Restored passed dev-test profiles.');
+    },
+    [currentUser.uid, showToast]
+  );
+
+  const handleDevSendTeamMessage = useCallback(
+    (teamId: string, body: string) => {
+      const nowIso = new Date().toISOString();
+      setDevSandbox((prev) => {
+        if (!prev) return prev;
+        const conv = prev.conversations.find((c) => c.teamId === teamId);
+        if (!conv) return prev;
+        const msg: Message = {
+          id: `dev_msg_${Date.now()}`,
+          conversationId: conv.id,
+          senderUid: currentUser.uid,
+          body,
+          createdAt: nowIso,
+          moderationStatus: 'clean',
+        };
+        return {
+          ...prev,
+          messages: [...prev.messages, msg],
+        };
+      });
+    },
+    [currentUser.uid]
+  );
+
+  const handleDevLeaveTeam = useCallback(
+    (teamId: string) => {
+      setDevSandbox((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          teams: prev.teams.filter((t) => t.id !== teamId),
+          memberships: prev.memberships.filter((m) => m.teamId !== teamId),
+          conversations: prev.conversations.filter((c) => c.teamId !== teamId),
+        };
+      });
+      showToast('Left dev sandbox team.');
+    },
+    [showToast]
+  );
+
+  // Active data slices (Live PostgreSQL data OR isolated client-only Dev Sandbox when explicitly enabled in DEV)
+  const isSandboxOn = Boolean(devTestingAvailable && devTestingActive && devSandbox);
+  const activeHackathons = isSandboxOn ? [devSandbox!.hackathon] : hackathons;
+  const activeUsers = isSandboxOn
+    ? [currentUser, ...devSandbox!.users]
+    : users;
+  const activeProfiles = isSandboxOn
+    ? { ...devSandbox!.profiles, [currentUser.uid]: currentProfile }
+    : profiles;
+  const activeParticipations = isSandboxOn
+    ? devSandbox!.participations
+    : participations;
+  const activeInterests = isSandboxOn ? devSandbox!.interests : interests;
+  const activeTeams = isSandboxOn ? devSandbox!.teams : teams;
+  const activeMemberships = isSandboxOn ? devSandbox!.memberships : memberships;
+  const activeTeamProposals = isSandboxOn
+    ? devSandbox!.teamProposals
+    : teamProposals;
+  const activeConversations = isSandboxOn
+    ? devSandbox!.conversations
+    : conversations;
+  const activeMessages = isSandboxOn ? devSandbox!.messages : messages;
+
   // Badges
   const pendingAdminCount =
     eventCandidates.filter(
@@ -1598,26 +2017,46 @@ export function App() {
   const myActiveTeamIds = useMemo(
     () =>
       new Set(
-        memberships
+        activeMemberships
           .filter((m) => m.uid === currentUser.uid && m.status === 'active')
           .map((m) => m.teamId)
       ),
-    [currentUser.uid, memberships]
+    [currentUser.uid, activeMemberships]
   );
 
   const pendingProposalsOrInvitesCount = useMemo(
     () =>
-      teamProposals.filter(
+      activeTeamProposals.filter(
         (p) =>
           (p.status === 'pending_votes' && myActiveTeamIds.has(p.teamId)) ||
           (p.status === 'invited' && p.candidateUid === currentUser.uid)
       ).length,
-    [currentUser.uid, myActiveTeamIds, teamProposals]
+    [currentUser.uid, myActiveTeamIds, activeTeamProposals]
   );
 
-  const myConversationsCount = conversations.filter((c) =>
-    c.participantUids.includes(currentUser.uid)
-  ).length;
+  const shortlistBadgeCount = useMemo(() => {
+    const outgoing = new Set(
+      activeInterests
+        .filter(
+          (i) =>
+            i.fromUid === currentUser.uid &&
+            i.targetType === 'user' &&
+            i.decision === 'interested'
+        )
+        .map((i) => `${i.hackathonId}:${i.targetId}`)
+    );
+    const incoming = activeInterests.filter(
+      (i) =>
+        i.targetId === currentUser.uid &&
+        i.targetType === 'user' &&
+        i.decision === 'interested'
+    );
+    const mutualCount = incoming.filter((i) =>
+      outgoing.has(`${i.hackathonId}:${i.fromUid}`)
+    ).length;
+    const pendingIncomingCount = incoming.length - mutualCount;
+    return mutualCount + pendingIncomingCount;
+  }, [activeInterests, currentUser.uid]);
 
   // Determine whether a newly authenticated student needs minimal first-time setup
   const hasExistingProfileData =
@@ -1636,15 +2075,17 @@ export function App() {
   // Gate 1: Session Restoration Loading State (never flash a signed-out screen!)
   if (authStatus === 'checking') {
     return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col items-center justify-center px-4">
+      <div className="min-h-screen bg-[#faf8f2] text-[#1c1b1b] flex flex-col items-center justify-center px-4">
         <div className="flex flex-col items-center gap-3 text-center">
-          <img
-            src="/assets/aistudio/mini_7f313967.png"
-            alt="Quackathon"
-            className="w-12 h-12 rounded-xl object-contain"
-          />
-          <div className="inline-flex items-center gap-2 text-sm font-medium text-slate-600">
-            <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
+          <div className="w-14 h-14 rounded-2xl bg-[#fff3c9] border border-[#f0d98c] flex items-center justify-center p-2 shadow-2xs">
+            <img
+              src={QUACKATHON_MINI_LOGO_SRC}
+              alt="Quackathon"
+              className="w-full h-full object-contain"
+            />
+          </div>
+          <div className="inline-flex items-center gap-2 text-sm font-medium text-[#746e65]">
+            <Loader2 className="w-4 h-4 animate-spin text-[#725c00]" />
             <span>Loading Quackathon...</span>
           </div>
         </div>
@@ -1694,7 +2135,7 @@ export function App() {
       id: 'matches',
       label: 'Matches & Shortlist',
       icon: <MessageSquare className="w-[19px] h-[19px]" />,
-      count: myConversationsCount > 0 ? myConversationsCount : undefined,
+      count: shortlistBadgeCount > 0 ? shortlistBadgeCount : undefined,
     },
     {
       id: 'my_team',
@@ -1721,14 +2162,12 @@ export function App() {
             className="quack-brand cursor-pointer border-0 bg-transparent"
             aria-label="Quackathon home"
           >
-            <span className="quack-brand-mark">
-              <svg viewBox="0 0 48 48" width="26" height="26" aria-hidden="true" focusable="false">
-                <ellipse cx="24" cy="27" rx="15.5" ry="14.5" fill="#ffdc63" />
-                <path d="M13 17c2-10 18-12 22 0" fill="#ffdc63" />
-                <circle cx="19" cy="25" r="1.7" fill="#25221c" />
-                <circle cx="28.5" cy="25" r="1.7" fill="#25221c" />
-                <path d="M19 30h10c0 5-10 5-10 0z" fill="#eba64a" />
-              </svg>
+            <span className="quack-brand-mark border border-[#f0d98c] bg-[#fff3c9] p-1">
+              <img
+                src={QUACKATHON_MINI_LOGO_SRC}
+                alt="Quackathon"
+                className="w-full h-full object-contain"
+              />
             </span>
             <span className="quack-brand-name">quackathon</span>
           </button>
@@ -1746,7 +2185,7 @@ export function App() {
                 {item.icon}
                 <span className="quack-nav-label">{item.label}</span>
                 {item.count !== undefined && (
-                  <span className="ml-auto text-[11px] font-semibold px-2 py-0.5 rounded-full bg-[#f1ede6] text-[#4d4634]">
+                  <span className="ml-auto text-[11px] font-semibold px-2 py-0.5 rounded-full bg-[#f1ede6] text-[#4d4634] tabular-nums">
                     {item.count}
                   </span>
                 )}
@@ -1764,34 +2203,32 @@ export function App() {
             aria-expanded={showAccountMenu}
             className="quack-account-chip"
           >
-            <span className="quack-account-avatar">
-              <svg viewBox="0 0 48 48" width="26" height="26" aria-hidden="true" focusable="false">
-                <ellipse cx="24" cy="27" rx="15.5" ry="14.5" fill="#ffdc63" />
-                <path d="M13 17c2-10 18-12 22 0" fill="#ffdc63" />
-                <circle cx="19" cy="25" r="1.7" fill="#25221c" />
-                <circle cx="28.5" cy="25" r="1.7" fill="#25221c" />
-                <path d="M19 30h10c0 5-10 5-10 0z" fill="#eba64a" />
-              </svg>
-            </span>
+            <StudentAvatar
+              uid={currentUser.uid}
+              name={currentUser.displayName}
+              size="sm"
+            />
             <span className="quack-user-info">
               <span className="quack-user-name">{currentUser.displayName}</span>
               <span className="quack-user-sub">Student profile</span>
             </span>
-            <span className="quack-account-chevron" aria-hidden="true">⌄</span>
+            <ChevronDown
+              className={`quack-account-chevron w-4 h-4 transition-transform duration-150 ${
+                showAccountMenu ? 'rotate-180' : ''
+              }`}
+              aria-hidden="true"
+            />
           </button>
 
           {showAccountMenu && (
             <div
               role="menu"
-              className="absolute bottom-16 left-0 right-0 rounded-xl bg-white border border-[#e9e5dd] shadow-xl p-2 z-50 text-xs"
+              className="quack-dropdown-enter absolute bottom-16 left-0 right-0 rounded-xl bg-white border border-[#e9e5dd] shadow-xl p-2 z-50 text-xs"
             >
               {/* Current User Summary */}
               <div className="px-3 py-2 border-b border-[#f1ede6]">
                 <div className="font-bold text-sm text-[#1c1b1b] truncate">
                   {currentUser.displayName}
-                </div>
-                <div className="text-xs text-[#746e65] truncate mt-0.5">
-                  {currentUser.campus} · {currentUser.program}
                 </div>
               </div>
 
@@ -1801,11 +2238,11 @@ export function App() {
                   type="button"
                   onClick={() => {
                     setShowAccountMenu(false);
-                    setShowProfileModal(true);
+                    navigateToTab('profile');
                   }}
-                  className="w-full px-3 py-2 text-left text-xs font-medium text-[#27221c] hover:bg-[#fff5d6] rounded-lg cursor-pointer"
+                  className="w-full px-3 py-2 text-left text-xs font-medium text-[#27221c] hover:bg-[#fff5d6] rounded-lg cursor-pointer transition-colors duration-150"
                 >
-                  Profile &amp; Settings
+                  Profile
                 </button>
                 <button
                   type="button"
@@ -1950,24 +2387,33 @@ export function App() {
           {activeTab === 'discover' && (
             <DiscoverView
               currentUser={currentUser}
-              hackathons={hackathons}
+              hackathons={activeHackathons}
               selectedHackathonId={selectedHackathonId}
               onSelectHackathon={setSelectedHackathonId}
               discoveryMode={discoveryMode}
               onChangeDiscoveryMode={setDiscoveryMode}
-              users={users}
-              profiles={profiles}
-              participations={participations}
-              teams={teams}
-              memberships={memberships}
-              interests={interests}
+              users={activeUsers}
+              profiles={activeProfiles}
+              participations={activeParticipations}
+              teams={activeTeams}
+              memberships={activeMemberships}
+              interests={activeInterests}
               blocks={blocks}
               onUpdateParticipation={handleUpdateParticipation}
-              onSwipeDecision={handleSwipeDecision}
-              onResetPassedCards={handleResetPassedCards}
+              onSwipeDecision={
+                isSandboxOn ? handleDevSwipeDecision : handleSwipeDecision
+              }
+              onResetPassedCards={
+                isSandboxOn ? handleDevResetPassedCards : handleResetPassedCards
+              }
               onBlockUser={handleBlockUser}
               onOpenMyTeam={() => navigateToTab('my_team')}
               onOpenProfile={() => navigateToTab('profile')}
+              onOpenHackathons={() => navigateToTab('hackathons')}
+              devTestingAvailable={devTestingAvailable}
+              devTestingActive={devTestingActive}
+              onToggleDevTestingMode={handleToggleDevTestingMode}
+              onResetDevTestingSandbox={handleResetDevTestingSandbox}
             />
           )}
 
@@ -1979,6 +2425,10 @@ export function App() {
               hackathons={hackathons}
               privateAcademyHints={[]}
               onSelectHackathonForDiscovery={(id) => {
+                if (devTestingActive) {
+                  setDevTestingActive(false);
+                  setDevSandbox(null);
+                }
                 setSelectedHackathonId(id);
                 navigateToTab('discover');
               }}
@@ -2001,21 +2451,24 @@ export function App() {
           {activeTab === 'matches' && (
             <MatchesAndChatView
               currentUser={currentUser}
-              conversations={conversations}
-              messages={messages}
-              users={users}
-              profiles={profiles}
-              hackathons={hackathons}
+              conversations={activeConversations}
+              messages={activeMessages}
+              users={activeUsers}
+              profiles={activeProfiles}
+              hackathons={activeHackathons}
               joinRequests={joinRequests}
-              teams={teams}
-              memberships={memberships}
-              interests={interests}
-              selectedHackathonId={selectedHackathonId}
+              teams={activeTeams}
+              memberships={activeMemberships}
+              teamProposals={activeTeamProposals}
+              interests={activeInterests}
+              selectedHackathonId={
+                isSandboxOn ? DEV_TEST_HACKATHON_ID : selectedHackathonId
+              }
               onSendMessage={handleSendMessage}
               onResolveJoinRequest={handleResolveJoinRequest}
               onCreateTeam={handleCreateTeam}
               onReportTarget={handleReportTarget}
-              onSwipeBack={handleSwipeBack}
+              onSwipeBack={isSandboxOn ? handleDevSwipeBack : handleSwipeBack}
               onOpenMyTeam={() => navigateToTab('my_team')}
             />
           )}
@@ -2023,26 +2476,34 @@ export function App() {
           {activeTab === 'my_team' && (
             <TeamsAndRequestsView
               currentUser={currentUser}
-              hackathons={hackathons}
-              selectedHackathonId={selectedHackathonId}
+              hackathons={activeHackathons}
+              selectedHackathonId={
+                isSandboxOn ? DEV_TEST_HACKATHON_ID : selectedHackathonId
+              }
               onSelectHackathon={setSelectedHackathonId}
-              teams={teams}
-              memberships={memberships}
-              joinRequests={joinRequests}
-              teamProposals={teamProposals}
-              teamRegistrations={teamRegistrations}
-              conversations={conversations}
-              messages={messages}
-              users={users}
-              profiles={profiles}
+              teams={activeTeams}
+              memberships={activeMemberships}
+              joinRequests={isSandboxOn ? [] : joinRequests}
+              teamProposals={activeTeamProposals}
+              teamRegistrations={isSandboxOn ? [] : teamRegistrations}
+              conversations={activeConversations}
+              messages={activeMessages}
+              users={activeUsers}
+              profiles={activeProfiles}
               onResolveJoinRequest={handleResolveJoinRequest}
               onUpdateTeamDetails={handleUpdateTeamDetails}
               onVoteTeamProposal={handleVoteTeamProposal}
               onRespondTeamProposal={handleRespondTeamProposal}
-              onLeaveTeam={handleLeaveTeam}
+              onLeaveTeam={
+                isSandboxOn ? handleDevLeaveTeam : handleLeaveTeam
+              }
               onUpdateTeamRegistration={handleUpdateTeamRegistration}
-              onSendTeamMessage={handleSendTeamMessage}
-              onRefreshTeamMessages={handleRefreshTeamMessages}
+              onSendTeamMessage={
+                isSandboxOn ? handleDevSendTeamMessage : handleSendTeamMessage
+              }
+              onRefreshTeamMessages={
+                isSandboxOn ? undefined : handleRefreshTeamMessages
+              }
               onOpenDiscover={() => navigateToTab('discover')}
             />
           )}

@@ -3,35 +3,27 @@ import {
   ExecutionMode,
   FeaturedProject,
   Profile,
-  ProfileEvidenceDraft,
   User,
 } from '../types/domain';
 import { GitHubRepositoryItem } from '../types/apiContracts';
-import { WORK_STYLE_TAXONOMY } from '../data/seedData';
 import {
   QUICK_INTEREST_OPTIONS,
   QUICK_ROLE_OPTIONS,
   QUICK_SKILL_OPTIONS,
 } from './QuickOnboardingView';
-import { normalizeHumanDisplayName } from '../lib/displayName';
 import {
   Github,
   Check,
-  Sparkles,
   Plus,
   Trash2,
   ChevronDown,
-  ChevronUp,
   Search,
   ExternalLink,
-  Shield,
   X,
   Loader2,
+  BadgeCheck,
 } from 'lucide-react';
-import {
-  fetchLiveGitHubRepositoriesDeterministically,
-  runLiveGitHubAndGeminiEnrichment,
-} from '../services/adapters';
+import { fetchLiveGitHubRepositoriesDeterministically } from '../services/adapters';
 import { Modal } from './Modal';
 import { StudentAvatar } from './StudentAvatar';
 
@@ -56,17 +48,11 @@ export const OnboardingAndProfileModal: React.FC<
 > = ({
   currentUser,
   profile,
-  executionMode,
   isInline = false,
   onSaveProfile,
   onClose,
   onNotify,
 }) => {
-  const [displayName, setDisplayName] = useState(
-    currentUser.needsDisplayNameSetup ? '' : currentUser.displayName
-  );
-  const [nameError, setNameError] = useState<string | null>(null);
-
   const [interestTags, setInterestTags] = useState<string[]>(
     profile.interestTags ?? []
   );
@@ -76,16 +62,12 @@ export const OnboardingAndProfileModal: React.FC<
     profile.preferredRoles ?? []
   );
 
-  // Progressive disclosure sections (collapsed by default)
+  // Progressive disclosure for optional project / link details
   const [showMoreDetails, setShowMoreDetails] = useState(false);
-  const [showPrivacySettings, setShowPrivacySettings] = useState(false);
 
   // Optional More Details fields
   const [headline, setHeadline] = useState(profile.headline ?? '');
   const [about, setAbout] = useState(profile.about ?? '');
-  const [isFirstTimeHacker, setIsFirstTimeHacker] = useState(
-    Boolean(profile.isFirstTimeHacker)
-  );
   const [githubUsername, setGithubUsername] = useState(
     profile.githubUsername ?? ''
   );
@@ -95,15 +77,6 @@ export const OnboardingAndProfileModal: React.FC<
   const [portfolioLinks, setPortfolioLinks] = useState<
     { label: string; url: string }[]
   >(profile.portfolioLinks ?? []);
-  const [workingStyleTags, setWorkingStyleTags] = useState<string[]>(
-    profile.workingStyleTags ?? []
-  );
-  const [rolesWantToLearn, setRolesWantToLearn] = useState<string[]>(
-    profile.rolesWantToLearn ?? []
-  );
-  const [icebreakerPrompt, setIcebreakerPrompt] = useState(
-    profile.icebreakerPrompt ?? ''
-  );
 
   // Manual project input
   const [newProjTitle, setNewProjTitle] = useState('');
@@ -114,32 +87,11 @@ export const OnboardingAndProfileModal: React.FC<
   const [newLinkLabel, setNewLinkLabel] = useState('');
   const [newLinkUrl, setNewLinkUrl] = useState('');
 
-  // GitHub picker state (user explicitly selects up to 3 repos; never auto-displays all)
+  // GitHub picker state (user explicitly selects up to 3 repos)
   const [githubRepos, setGithubRepos] = useState<GitHubRepositoryItem[]>([]);
   const [githubLoading, setGithubLoading] = useState(false);
   const [githubError, setGithubError] = useState<string | null>(null);
   const [repoSearch, setRepoSearch] = useState('');
-
-  // Optional AI enrichment (strictly inside More Details with explicit consent + review)
-  const [aiConsentChecked, setAiConsentChecked] = useState(
-    Boolean(currentUser.privacyPreferences?.aiEnrichmentConsent)
-  );
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiDraft, setAiDraft] = useState<{
-    draft: ProfileEvidenceDraft;
-    suggestedBio?: string;
-    suggestedIcebreaker?: string;
-  } | null>(null);
-  const [aiError, setAiError] = useState<string | null>(null);
-
-  // Privacy preferences
-  const [profileVisible, setProfileVisible] = useState(
-    currentUser.privacyPreferences?.profileVisible !== false &&
-      profile.visibility !== 'hidden'
-  );
-  const [academyOptIn, setAcademyOptIn] = useState(
-    Boolean(currentUser.privacyPreferences?.academyAnnouncementsOptIn)
-  );
 
   const interestOptions = useMemo(() => {
     const merged = new Set<string>([...QUICK_INTEREST_OPTIONS, ...interestTags]);
@@ -202,12 +154,6 @@ export const OnboardingAndProfileModal: React.FC<
     );
   };
 
-  const toggleWorkStyle = (style: string) => {
-    setWorkingStyleTags((prev) =>
-      prev.includes(style) ? prev.filter((s) => s !== style) : [...prev, style]
-    );
-  };
-
   const handleFetchGithubRepos = async () => {
     const handle = githubUsername.trim().replace(/^@/, '');
     if (!handle) {
@@ -222,7 +168,9 @@ export const OnboardingAndProfileModal: React.FC<
         githubUsername: handle,
       });
       if (!res.ok || !res.repositories) {
-        setGithubError(res.errorMessage || 'Could not load public repositories.');
+        setGithubError(
+          res.errorMessage || 'Could not load public repositories.'
+        );
         setGithubRepos([]);
       } else {
         setGithubRepos(res.repositories);
@@ -276,7 +224,9 @@ export const OnboardingAndProfileModal: React.FC<
         repo.description?.trim() ||
         `Public GitHub repository (${repo.language || 'Code'})`,
       tags: Array.from(
-        new Set([repo.language, ...(repo.topics ?? [])].filter(Boolean) as string[])
+        new Set(
+          [repo.language, ...(repo.topics ?? [])].filter(Boolean) as string[]
+        )
       ).slice(0, 5),
       sourceUrl: repo.htmlUrl,
     };
@@ -315,77 +265,8 @@ export const OnboardingAndProfileModal: React.FC<
     setNewLinkUrl('');
   };
 
-  const handleRunOptionalAiEnrichment = async () => {
-    if (!aiConsentChecked) {
-      setAiError('Please enable consent above before requesting an AI draft.');
-      return;
-    }
-    const handle = githubUsername.trim().replace(/^@/, '');
-    if (!handle) {
-      setAiError('Enter your GitHub username above to draft suggestions.');
-      return;
-    }
-    setAiLoading(true);
-    setAiError(null);
-    setAiDraft(null);
-    try {
-      const selectedRepos = githubRepos.filter((repo) => isRepoFeatured(repo));
-      const result = await runLiveGitHubAndGeminiEnrichment({
-        uid: currentUser.uid,
-        githubUsername: handle,
-        selectedRepositories: selectedRepos.length > 0 ? selectedRepos : undefined,
-        useGemini: true,
-      });
-      if (!result.ok || !result.draft) {
-        setAiError(result.errorMessage || 'Could not generate a draft right now.');
-      } else {
-        setAiDraft({
-          draft: result.draft,
-          suggestedBio: result.suggestedBio,
-          suggestedIcebreaker: result.suggestedIcebreaker,
-        });
-      }
-    } catch {
-      setAiError('Enrichment service unavailable.');
-    } finally {
-      setAiLoading(false);
-    }
-  };
-
-  const handleApplyAiDraft = () => {
-    if (!aiDraft) return;
-    if (aiDraft.suggestedBio) setAbout(aiDraft.suggestedBio);
-    if (aiDraft.suggestedIcebreaker) {
-      setIcebreakerPrompt(aiDraft.suggestedIcebreaker);
-    }
-    if (aiDraft.draft.suggestedSkills.length > 0) {
-      const names = aiDraft.draft.suggestedSkills.map((s) => s.name);
-      setSkillTags((prev) => Array.from(new Set([...prev, ...names])));
-    }
-    setAiDraft(null);
-    onNotify?.('Draft suggestions applied. Review and click Save Profile to persist.');
-  };
-
   const handleSave = () => {
-    setNameError(null);
-    let updatedDisplayName: string | undefined;
-
-    const trimmedName = displayName.trim();
-    const currentIsPlaceholder = Boolean(currentUser.needsDisplayNameSetup);
-    if (trimmedName && (currentIsPlaceholder || trimmedName !== currentUser.displayName)) {
-      const normalized = normalizeHumanDisplayName(trimmedName);
-      if (!normalized) {
-        setNameError(
-          'Enter a real display name (cannot be an SRN/PRN or email address).'
-        );
-        return;
-      }
-      updatedDisplayName = normalized;
-    } else if (currentIsPlaceholder && trimmedName.length === 0) {
-      // Optional; leave as-is if untouched
-      updatedDisplayName = undefined;
-    }
-
+    // Preserve existing stored fields & privacy protections untouched
     const updatedProfile: Profile = {
       ...profile,
       uid: currentUser.uid,
@@ -396,155 +277,70 @@ export const OnboardingAndProfileModal: React.FC<
       projectDomains:
         interestTags.length > 0 ? interestTags : profile.projectDomains ?? [],
       preferredRoles,
-      rolesWantToLearn,
-      workingStyleTags,
       featuredProjects: featuredProjects.slice(0, MAX_FEATURED_PROJECTS),
       portfolioLinks,
       githubUsername: githubUsername.trim().replace(/^@/, '') || undefined,
-      icebreakerPrompt: icebreakerPrompt.trim() || undefined,
-      isFirstTimeHacker,
-      visibility: profileVisible ? 'public_verified_students' : 'hidden',
       updatedAt: new Date().toISOString(),
     };
 
     const updatedPrivacy: User['privacyPreferences'] = {
       ...currentUser.privacyPreferences,
-      profileVisible,
       githubConsent: Boolean(githubUsername.trim()),
-      aiEnrichmentConsent: aiConsentChecked,
-      academyAnnouncementsOptIn: academyOptIn,
       onboardingCompleted: true,
-      ...(updatedDisplayName ? { customDisplayNameSet: true } : {}),
     };
 
-    onSaveProfile(updatedProfile, updatedPrivacy, updatedDisplayName);
+    onSaveProfile(updatedProfile, updatedPrivacy);
   };
+
+  const readOnlyDisplayName = currentUser.displayName.replace(
+    ' (Synthetic Demo)',
+    ''
+  );
 
   const formContent = (
     <div className="space-y-6">
-      {/* Core Essentials */}
+      {isInline && (
+        <div className="pb-2 border-b border-[#e9e5dd]">
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[#1c1b1b]">
+            Profile
+          </h1>
+        </div>
+      )}
+
+      {/* Core Profile Card */}
       <div className="bg-white border border-[#e9e5dd] rounded-2xl p-6 space-y-6">
-        {/* Profile Header / Avatar Section (Stitch Style) */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-xl bg-[#f6f3f2] border border-[#e9e5dd]">
-          <div className="flex items-center gap-4">
-            <StudentAvatar
-              uid={currentUser.uid}
-              name={displayName || currentUser.displayName}
-              size="lg"
-            />
-            <div className="flex flex-col min-w-0">
-              <div className="flex items-baseline gap-2">
-                <span className="text-base font-bold text-[#1c1b1b] truncate">
-                  {(displayName || currentUser.displayName).replace(' (Synthetic Demo)', '')}
-                </span>
-                <span className="text-xs text-[#746e65]">· {currentUser.personaLabel || 'Student'}</span>
-              </div>
-              <span className="text-xs text-[#4d4634] font-medium mt-0.5">
-                {currentUser.pesuOidcSub}
-              </span>
-              <div className="flex items-center gap-1.5 mt-1 text-[#746e65] text-xs">
-                <span>PES University · {currentUser.campus === 'EC Campus' ? 'Electronic City' : 'Ring Road'} Campus</span>
-              </div>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 self-start sm:self-center shrink-0">
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#e7e2d7] text-xs font-medium text-[#1d1c15]">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-600" />
-              Profile Active
-            </span>
-          </div>
-        </div>
-
-        {/* Academic Credentials Section */}
-        <div className="flex flex-col gap-2.5 pt-2 border-t border-[#f1ede6]">
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-bold text-[#1c1b1b] uppercase tracking-wider">
-              Academic Credentials
-            </label>
-            <span className="text-xs text-[#746e65] flex items-center gap-1 font-medium">
-              <Shield className="w-3.5 h-3.5 text-[#725c00]" />
-              Verified via PESU Student Portal
-            </span>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {/* Primary Campus */}
-            <div className="flex flex-col gap-1.5">
-              <span className="text-xs text-[#746e65] font-medium">Primary Campus</span>
-              <div className="flex items-center p-1 rounded-xl bg-[#f6f3f2] border border-[#e9e5dd]">
-                <div
-                  className={`flex-1 py-1 px-2.5 rounded-lg text-xs font-semibold text-center ${
-                    currentUser.campus !== 'EC Campus'
-                      ? 'bg-white text-[#1c1b1b] shadow-2xs border border-[#e9e5dd]'
-                      : 'text-[#746e65]'
-                  }`}
-                >
-                  RR Campus
-                </div>
-                <div
-                  className={`flex-1 py-1 px-2.5 rounded-lg text-xs font-semibold text-center ${
-                    currentUser.campus === 'EC Campus'
-                      ? 'bg-white text-[#1c1b1b] shadow-2xs border border-[#e9e5dd]'
-                      : 'text-[#746e65]'
-                  }`}
-                >
-                  EC Campus
-                </div>
-              </div>
-            </div>
-
-            {/* Graduating Year */}
-            <div className="flex flex-col gap-1.5">
-              <span className="text-xs text-[#746e65] font-medium">Graduating Term</span>
-              <div className="w-full bg-[#f6f3f2] border border-[#e9e5dd] text-[#1c1b1b] text-xs font-medium rounded-xl px-3 py-2 flex items-center justify-between">
-                <span>{currentUser.graduationYear ? `Class of ${currentUser.graduationYear}` : '3rd Year (Junior)'}</span>
-              </div>
-            </div>
-
-            {/* Program / Department */}
-            <div className="flex flex-col gap-1.5">
-              <span className="text-xs text-[#746e65] font-medium">Program</span>
-              <div className="w-full bg-[#f6f3f2] border border-[#e9e5dd] text-[#1c1b1b] text-xs font-medium rounded-xl px-3 py-2 truncate">
-                <span>{currentUser.program || 'Computer Science & Engg'}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Display Name */}
-        <div>
-          <label
-            htmlFor="profile-display-name"
-            className="block text-sm font-semibold text-[#1c1b1b]"
-          >
-            Display Name
-          </label>
-          <p className="text-xs text-[#746e65] mt-0.5">
-            Shown on your profile, teammate cards, and messages. Your PESU SRN is never shown publicly.
-          </p>
-          <input
-            id="profile-display-name"
-            type="text"
-            value={displayName}
-            onChange={(e) => {
-              setDisplayName(e.target.value);
-              if (nameError) setNameError(null);
-            }}
-            placeholder="Your full name"
-            maxLength={60}
-            className="mt-2 w-full max-w-md rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
+        {/* Simplified Profile Header: Display Name + Consistent Avatar + Subtle Verified Indicator */}
+        <div className="flex items-center gap-4 pb-5 border-b border-[#f1ede6]">
+          <StudentAvatar
+            uid={currentUser.uid}
+            name={readOnlyDisplayName}
+            size="lg"
           />
-          {nameError && (
-            <p className="mt-1.5 text-xs text-rose-600">{nameError}</p>
-          )}
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="text-lg font-bold text-[#1c1b1b] truncate">
+                {readOnlyDisplayName}
+              </h2>
+              {currentUser.verified && (
+                <span
+                  className="inline-flex items-center gap-1 text-xs font-medium text-[#725c00]"
+                  title="Verified PESU student"
+                >
+                  <BadgeCheck className="w-4 h-4 text-[#725c00]" />
+                  <span>Verified</span>
+                </span>
+              )}
+            </div>
+          </div>
         </div>
 
-        {/* A. Interests */}
+        {/* A. Interests / Domains */}
         <div>
           <div className="flex items-baseline justify-between gap-2">
             <label className="text-sm font-semibold text-[#1c1b1b]">
-              Interests
+              Interests &amp; Domains
             </label>
-            <span className="text-xs text-[#746e65]">
+            <span className="text-xs text-[#746e65] tabular-nums">
               Up to 3 ({interestTags.length}/3)
             </span>
           </div>
@@ -558,15 +354,15 @@ export const OnboardingAndProfileModal: React.FC<
                   type="button"
                   disabled={disabled}
                   onClick={() => toggleInterest(interest)}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
+                  className={`quack-chip inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium cursor-pointer ${
                     active
-                      ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
+                      ? 'border-[#e5be35] bg-[#ffd84d] text-[#1c1b1b] font-semibold shadow-2xs'
                       : disabled
-                      ? 'border-[#e9e5dd] bg-slate-50 text-[#a8a29e] cursor-not-allowed'
-                      : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
+                      ? 'border-[#e9e5dd] bg-[#f6f3f2] text-[#a8a29e] cursor-not-allowed'
+                      : 'border-[#e9e5dd] bg-white text-[#24211c] hover:bg-[#f6f3eb] hover:border-[#d0c6ae]'
                   }`}
                 >
-                  {active && <Check className="w-3.5 h-3.5" />}
+                  {active && <Check className="w-3.5 h-3.5 text-[#1c1b1b]" />}
                   <span>{interest}</span>
                 </button>
               );
@@ -587,13 +383,13 @@ export const OnboardingAndProfileModal: React.FC<
                   key={sk}
                   type="button"
                   onClick={() => toggleSkill(sk)}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
+                  className={`quack-chip inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium cursor-pointer ${
                     active
-                      ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
-                      : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
+                      ? 'border-[#e5be35] bg-[#ffd84d] text-[#1c1b1b] font-semibold shadow-2xs'
+                      : 'border-[#e9e5dd] bg-white text-[#24211c] hover:bg-[#f6f3eb] hover:border-[#d0c6ae]'
                   }`}
                 >
-                  {active && <Check className="w-3.5 h-3.5" />}
+                  {active && <Check className="w-3.5 h-3.5 text-[#1c1b1b]" />}
                   <span>{sk}</span>
                 </button>
               );
@@ -601,14 +397,15 @@ export const OnboardingAndProfileModal: React.FC<
             {customSkillsOnly.map((sk) => (
               <span
                 key={sk}
-                className="inline-flex items-center gap-1 rounded-lg border border-indigo-600 bg-[#fff3c9] px-3 py-1.5 text-sm font-medium text-[#725c00]"
+                className="quack-chip inline-flex items-center gap-1.5 rounded-lg border border-[#e5be35] bg-[#ffd84d] px-3 py-1.5 text-sm font-semibold text-[#1c1b1b] shadow-2xs"
               >
+                <Check className="w-3.5 h-3.5 text-[#1c1b1b]" />
                 <span>{sk}</span>
                 <button
                   type="button"
                   onClick={() => toggleSkill(sk)}
                   aria-label={`Remove ${sk}`}
-                  className="text-[#725c00] hover:text-[#1a1a1a] cursor-pointer"
+                  className="text-[#1c1b1b]/70 hover:text-[#1c1b1b] cursor-pointer ml-0.5"
                 >
                   <X className="w-3.5 h-3.5" />
                 </button>
@@ -627,13 +424,13 @@ export const OnboardingAndProfileModal: React.FC<
                 }
               }}
               placeholder="Add custom skill (e.g. Go, Tailwind, ROS2)"
-              className="flex-1 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
+              className="flex-1 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:border-[#d0c6ae] focus:bg-white transition-colors duration-150"
             />
             <button
               type="button"
               onClick={handleAddCustomSkill}
               disabled={!customSkillInput.trim()}
-              className="inline-flex items-center gap-1 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm font-medium text-[#4d4634] hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+              className="inline-flex items-center gap-1 rounded-xl border border-[#e9e5dd] bg-white px-3.5 py-2 text-sm font-semibold text-[#24211c] hover:bg-[#f6f3eb] disabled:opacity-40 transition-colors duration-150 cursor-pointer"
             >
               <Plus className="w-4 h-4" />
               <span>Add</span>
@@ -641,10 +438,10 @@ export const OnboardingAndProfileModal: React.FC<
           </div>
         </div>
 
-        {/* C. Preferred Role */}
+        {/* C. Preferred Technical Role */}
         <div>
           <label className="block text-sm font-semibold text-[#1c1b1b]">
-            Preferred Role
+            Preferred Technical Role
           </label>
           <div className="mt-2.5 flex flex-wrap gap-2">
             {roleOptions.map((role) => {
@@ -654,13 +451,14 @@ export const OnboardingAndProfileModal: React.FC<
                   key={role}
                   type="button"
                   onClick={() => toggleRole(role)}
-                  className={`rounded-lg border px-3.5 py-1.5 text-sm font-medium transition-colors cursor-pointer ${
+                  className={`quack-chip inline-flex items-center gap-1.5 rounded-lg border px-3.5 py-1.5 text-sm font-medium cursor-pointer ${
                     active
-                      ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
-                      : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
+                      ? 'border-[#e5be35] bg-[#ffd84d] text-[#1c1b1b] font-semibold shadow-2xs'
+                      : 'border-[#e9e5dd] bg-white text-[#24211c] hover:bg-[#f6f3eb] hover:border-[#d0c6ae]'
                   }`}
                 >
-                  {role}
+                  {active && <Check className="w-3.5 h-3.5 text-[#1c1b1b]" />}
+                  <span>{role}</span>
                 </button>
               );
             })}
@@ -668,30 +466,31 @@ export const OnboardingAndProfileModal: React.FC<
         </div>
       </div>
 
-      {/* Collapsible More Details (Progressive Disclosure) */}
+      {/* Collapsible Projects, Bio & Links */}
       <div className="bg-white border border-[#e9e5dd] rounded-2xl overflow-hidden">
         <button
           type="button"
           onClick={() => setShowMoreDetails((v) => !v)}
-          className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-slate-50 transition-colors cursor-pointer"
+          aria-expanded={showMoreDetails}
+          className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-[#faf8f2] transition-colors duration-150 cursor-pointer"
         >
           <div>
             <div className="text-sm font-semibold text-[#1c1b1b]">
-              More Details (Optional)
+              Projects &amp; Links (Optional)
             </div>
             <div className="text-xs text-[#746e65] mt-0.5">
-              Headline, bio, GitHub featured projects (up to 3), portfolio, collaboration style
+              Headline, short bio, GitHub featured projects (up to 3), and portfolio links
             </div>
           </div>
-          {showMoreDetails ? (
-            <ChevronUp className="w-4 h-4 text-[#746e65] shrink-0" />
-          ) : (
-            <ChevronDown className="w-4 h-4 text-[#746e65] shrink-0" />
-          )}
+          <ChevronDown
+            className={`w-4 h-4 text-[#746e65] shrink-0 transition-transform duration-150 ${
+              showMoreDetails ? 'rotate-180 text-[#1c1b1b]' : ''
+            }`}
+          />
         </button>
 
         {showMoreDetails && (
-          <div className="px-6 pb-6 pt-2 border-t border-[#f1ede6] space-y-6">
+          <div className="px-6 pb-6 pt-3 border-t border-[#f1ede6] space-y-6">
             {/* Headline & Bio */}
             <div className="grid grid-cols-1 gap-4">
               <div>
@@ -704,7 +503,7 @@ export const OnboardingAndProfileModal: React.FC<
                   onChange={(e) => setHeadline(e.target.value)}
                   placeholder="e.g. Full-stack & ML student building fast prototypes"
                   maxLength={120}
-                  className="mt-1.5 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
+                  className="mt-1.5 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:border-[#d0c6ae] focus:bg-white"
                 />
               </div>
               <div>
@@ -712,25 +511,19 @@ export const OnboardingAndProfileModal: React.FC<
                   <label className="block text-sm font-medium text-[#1c1b1b]">
                     About Me
                   </label>
-                  <span className="text-xs text-[#746e65] font-mono">{about.length} / 160</span>
+                  <span className="text-xs text-[#746e65] font-mono tabular-nums">
+                    {about.length} / 160
+                  </span>
                 </div>
-                <textarea maxLength={160}
+                <textarea
+                  maxLength={160}
                   rows={3}
                   value={about}
                   onChange={(e) => setAbout(e.target.value)}
                   placeholder="What do you like building during hackathons?"
-                  className="mt-1.5 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
+                  className="mt-1.5 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:border-[#d0c6ae] focus:bg-white"
                 />
               </div>
-              <label className="inline-flex items-center gap-2.5 text-sm text-[#4d4634] cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={isFirstTimeHacker}
-                  onChange={(e) => setIsFirstTimeHacker(e.target.checked)}
-                  className="rounded border-[#e9e5dd] text-[#725c00] focus:ring-[#ffd84d]"
-                />
-                <span>This is my first hackathon</span>
-              </label>
             </div>
 
             {/* GitHub & Featured Projects (max 3) */}
@@ -741,7 +534,7 @@ export const OnboardingAndProfileModal: React.FC<
                   <span>Featured Projects (Up to {MAX_FEATURED_PROJECTS})</span>
                 </h3>
                 <p className="text-xs text-[#746e65] mt-0.5">
-                  Optionally link GitHub to pick up to {MAX_FEATURED_PROJECTS} repositories, or add a project manually. Repositories are never added automatically.
+                  Link GitHub to pick up to {MAX_FEATURED_PROJECTS} public repositories, or add a project manually.
                 </p>
               </div>
 
@@ -751,13 +544,13 @@ export const OnboardingAndProfileModal: React.FC<
                   value={githubUsername}
                   onChange={(e) => setGithubUsername(e.target.value)}
                   placeholder="GitHub username (optional)"
-                  className="flex-1 min-w-[200px] rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:bg-white"
+                  className="flex-1 min-w-[200px] rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b] focus:outline-none focus:ring-1 focus:ring-[#ffd84d] focus:border-[#d0c6ae] focus:bg-white"
                 />
                 <button
                   type="button"
                   onClick={handleFetchGithubRepos}
                   disabled={githubLoading || !githubUsername.trim()}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm font-medium text-[#4d4634] hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-[#e9e5dd] bg-white px-3.5 py-2 text-sm font-medium text-[#24211c] hover:bg-[#f6f3eb] disabled:opacity-40 transition-colors duration-150 cursor-pointer"
                 >
                   {githubLoading ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -773,10 +566,10 @@ export const OnboardingAndProfileModal: React.FC<
               )}
 
               {githubRepos.length > 0 && (
-                <div className="rounded-xl border border-[#e9e5dd] bg-slate-50 p-3.5 space-y-3">
+                <div className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] p-3.5 space-y-3">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-medium text-[#4d4634]">
-                      Select up to {MAX_FEATURED_PROJECTS} to feature ({featuredProjects.length}/{MAX_FEATURED_PROJECTS} selected)
+                    <span className="text-xs font-medium text-[#4d4634] tabular-nums">
+                      Select up to {MAX_FEATURED_PROJECTS} ({featuredProjects.length}/{MAX_FEATURED_PROJECTS} selected)
                     </span>
                     <input
                       type="text"
@@ -786,7 +579,7 @@ export const OnboardingAndProfileModal: React.FC<
                       className="rounded-lg border border-[#e9e5dd] bg-white px-2.5 py-1 text-xs text-[#1c1b1b]"
                     />
                   </div>
-                  <div className="max-h-52 overflow-y-auto divide-y divide-slate-200/70 rounded-lg border border-[#e9e5dd] bg-white">
+                  <div className="max-h-52 overflow-y-auto divide-y divide-[#f1ede6] rounded-lg border border-[#e9e5dd] bg-white">
                     {filteredGithubRepos.slice(0, 20).map((repo) => {
                       const selected = isRepoFeatured(repo);
                       return (
@@ -807,10 +600,10 @@ export const OnboardingAndProfileModal: React.FC<
                           <button
                             type="button"
                             onClick={() => toggleRepoFeatured(repo)}
-                            className={`shrink-0 rounded-lg border px-2.5 py-1 text-xs font-medium cursor-pointer ${
+                            className={`quack-chip shrink-0 rounded-lg border px-2.5 py-1 text-xs font-medium cursor-pointer ${
                               selected
-                                ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
-                                : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
+                                ? 'border-[#e5be35] bg-[#ffd84d] text-[#1c1b1b] font-semibold'
+                                : 'border-[#e9e5dd] bg-white text-[#24211c] hover:bg-[#f6f3eb]'
                             }`}
                           >
                             {selected ? 'Selected' : 'Select'}
@@ -828,7 +621,7 @@ export const OnboardingAndProfileModal: React.FC<
                   {featuredProjects.map((proj) => (
                     <div
                       key={proj.id}
-                      className="flex items-start justify-between gap-3 rounded-xl border border-[#e9e5dd] bg-slate-50/70 px-3.5 py-2.5"
+                      className="flex items-start justify-between gap-3 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2.5"
                     >
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
@@ -861,7 +654,7 @@ export const OnboardingAndProfileModal: React.FC<
                           )
                         }
                         aria-label={`Remove ${proj.title}`}
-                        className="text-[#a8a29e] hover:text-rose-600 p-1 cursor-pointer"
+                        className="text-[#746e65] hover:text-rose-600 p-1 cursor-pointer transition-colors duration-150"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
@@ -878,14 +671,14 @@ export const OnboardingAndProfileModal: React.FC<
                     value={newProjTitle}
                     onChange={(e) => setNewProjTitle(e.target.value)}
                     placeholder="Project title"
-                    className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
+                    className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
                   />
                   <input
                     type="text"
                     value={newProjDesc}
                     onChange={(e) => setNewProjDesc(e.target.value)}
                     placeholder="Short description"
-                    className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
+                    className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
                   />
                   <div className="flex gap-2">
                     <input
@@ -893,93 +686,17 @@ export const OnboardingAndProfileModal: React.FC<
                       value={newProjUrl}
                       onChange={(e) => setNewProjUrl(e.target.value)}
                       placeholder="URL (optional)"
-                      className="flex-1 min-w-0 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
+                      className="flex-1 min-w-0 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
                     />
                     <button
                       type="button"
                       onClick={handleAddManualProject}
                       disabled={!newProjTitle.trim()}
-                      className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm font-medium text-[#4d4634] hover:bg-slate-50 disabled:opacity-50 cursor-pointer shrink-0"
+                      className="rounded-xl border border-[#e9e5dd] bg-white px-3 py-2 text-sm font-medium text-[#24211c] hover:bg-[#f6f3eb] disabled:opacity-40 cursor-pointer shrink-0 transition-colors duration-150"
                     >
                       Add
                     </button>
                   </div>
-                </div>
-              )}
-
-              {/* Optional AI Enrichment (strictly opt-in with explicit review) */}
-              {executionMode === 'live' && githubUsername.trim() && (
-                <div className="rounded-xl border border-[#e9e5dd] bg-slate-50/70 p-4 space-y-3">
-                  <label className="flex items-start gap-2.5 text-xs text-[#4d4634] cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={aiConsentChecked}
-                      onChange={(e) => setAiConsentChecked(e.target.checked)}
-                      className="mt-0.5 rounded border-[#e9e5dd] text-[#725c00] focus:ring-[#ffd84d]"
-                    />
-                    <span>
-                      Allow optional AI summary drafting from my public GitHub profile (you will review before anything is applied).
-                    </span>
-                  </label>
-                  <button
-                    type="button"
-                    disabled={!aiConsentChecked || aiLoading}
-                    onClick={handleRunOptionalAiEnrichment}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-[#e9e5dd] bg-[#faf8f2] px-3 py-1.5 text-xs font-medium text-[#4d4634] hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
-                  >
-                    {aiLoading ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <Sparkles className="w-3.5 h-3.5 text-indigo-500" />
-                    )}
-                    <span>Draft Suggestions for Review</span>
-                  </button>
-                  {aiError && (
-                    <p className="text-xs text-amber-700">{aiError}</p>
-                  )}
-                  {aiDraft && (
-                    <div className="rounded-lg border border-indigo-200 bg-white p-3 space-y-2 text-xs">
-                      <div className="font-semibold text-[#1c1b1b]">
-                        Review Draft Suggestions
-                      </div>
-                      {aiDraft.suggestedBio && (
-                        <p className="text-[#4d4634]">
-                          <span className="font-medium">About:</span>{' '}
-                          {aiDraft.suggestedBio}
-                        </p>
-                      )}
-                      {aiDraft.suggestedIcebreaker && (
-                        <p className="text-[#4d4634]">
-                          <span className="font-medium">Icebreaker:</span>{' '}
-                          {aiDraft.suggestedIcebreaker}
-                        </p>
-                      )}
-                      {aiDraft.draft.suggestedSkills.length > 0 && (
-                        <p className="text-[#4d4634]">
-                          <span className="font-medium">Skills:</span>{' '}
-                          {aiDraft.draft.suggestedSkills
-                            .map((s) => s.name)
-                            .join(', ')}
-                        </p>
-                      )}
-                      <div className="flex gap-2 pt-1">
-                        <button
-                          type="button"
-                          onClick={handleApplyAiDraft}
-                          className="rounded-lg bg-[#ffd84d] text-[#1a1a1a] px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 cursor-pointer"
-                        >
-                          Apply Draft
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setAiDraft(null)}
-                          className="rounded-lg border border-[#e9e5dd] px-3 py-1.5 text-xs font-medium text-[#746e65] hover:bg-slate-50 cursor-pointer"
-                        >
-                          Discard
-                        </button>
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
             </div>
@@ -1011,7 +728,8 @@ export const OnboardingAndProfileModal: React.FC<
                             prev.filter((_, i) => i !== idx)
                           )
                         }
-                        className="text-[#a8a29e] hover:text-rose-600 cursor-pointer"
+                        aria-label={`Remove ${link.label}`}
+                        className="text-[#746e65] hover:text-rose-600 cursor-pointer transition-colors duration-150"
                       >
                         <X className="w-4 h-4" />
                       </button>
@@ -1025,172 +743,36 @@ export const OnboardingAndProfileModal: React.FC<
                   value={newLinkLabel}
                   onChange={(e) => setNewLinkLabel(e.target.value)}
                   placeholder="Label (e.g. Portfolio, LinkedIn)"
-                  className="w-44 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
+                  className="w-44 rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
                 />
                 <input
                   type="url"
                   value={newLinkUrl}
                   onChange={(e) => setNewLinkUrl(e.target.value)}
                   placeholder="https://..."
-                  className="flex-1 min-w-[180px] rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b]"
+                  className="flex-1 min-w-[180px] rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3 py-2 text-sm text-[#1c1b1b] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#ffd84d]"
                 />
                 <button
                   type="button"
                   onClick={handleAddPortfolioLink}
                   disabled={!newLinkUrl.trim()}
-                  className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm font-medium text-[#4d4634] hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                  className="rounded-xl border border-[#e9e5dd] bg-white px-3.5 py-2 text-sm font-medium text-[#24211c] hover:bg-[#f6f3eb] disabled:opacity-40 cursor-pointer transition-colors duration-150"
                 >
                   Add
                 </button>
               </div>
             </div>
-
-            {/* Collaboration Style & Icebreaker */}
-            <div className="pt-4 border-t border-[#f1ede6] space-y-4">
-              <div>
-                <label className="block text-sm font-semibold text-[#1c1b1b]">
-                  Collaboration Style
-                </label>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {WORK_STYLE_TAXONOMY.map((style) => {
-                    const active = workingStyleTags.includes(style);
-                    return (
-                      <button
-                        key={style}
-                        type="button"
-                        onClick={() => toggleWorkStyle(style)}
-                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium cursor-pointer ${
-                          active
-                            ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
-                            : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
-                        }`}
-                      >
-                        {style}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-[#1c1b1b]">
-                  Roles to Explore
-                </label>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {QUICK_ROLE_OPTIONS.map((role) => {
-                    const active = rolesWantToLearn.includes(role);
-                    return (
-                      <button
-                        key={role}
-                        type="button"
-                        onClick={() =>
-                          setRolesWantToLearn((prev) =>
-                            prev.includes(role)
-                              ? prev.filter((r) => r !== role)
-                              : [...prev, role]
-                          )
-                        }
-                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium cursor-pointer ${
-                          active
-                            ? 'border-[#ffd84d] bg-[#ffd84d] text-[#1a1a1a] font-bold shadow-xs'
-                            : 'border-[#e9e5dd] bg-white text-[#1c1b1b] hover:bg-[#f6f3f2]'
-                        }`}
-                      >
-                        {role}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-[#1c1b1b]">
-                  Conversation Starter / Icebreaker
-                </label>
-                <input
-                  type="text"
-                  value={icebreakerPrompt}
-                  onChange={(e) => setIcebreakerPrompt(e.target.value)}
-                  placeholder="e.g. Ask me about shipping real-time web apps in 24 hours"
-                  className="mt-1.5 w-full rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-3.5 py-2 text-sm text-[#1c1b1b]"
-                />
-              </div>
-            </div>
           </div>
         )}
       </div>
 
-      {/* Collapsible Privacy & Account Settings */}
-      <div className="bg-white border border-[#e9e5dd] rounded-2xl overflow-hidden">
-        <button
-          type="button"
-          onClick={() => setShowPrivacySettings((v) => !v)}
-          className="w-full flex items-center justify-between px-6 py-4 text-left hover:bg-slate-50 transition-colors cursor-pointer"
-        >
-          <div className="flex items-center gap-2.5">
-            <Shield className="w-4 h-4 text-[#746e65] shrink-0" />
-            <div>
-              <div className="text-sm font-semibold text-[#1c1b1b]">
-                Privacy &amp; Account Settings
-              </div>
-              <div className="text-xs text-[#746e65] mt-0.5">
-                Control profile visibility and optional PESU Academy features
-              </div>
-            </div>
-          </div>
-          {showPrivacySettings ? (
-            <ChevronUp className="w-4 h-4 text-[#746e65] shrink-0" />
-          ) : (
-            <ChevronDown className="w-4 h-4 text-[#746e65] shrink-0" />
-          )}
-        </button>
-
-        {showPrivacySettings && (
-          <div className="px-6 pb-6 pt-3 border-t border-[#f1ede6] space-y-4">
-            <label className="flex items-start gap-3 text-sm text-[#4d4634] cursor-pointer">
-              <input
-                type="checkbox"
-                checked={profileVisible}
-                onChange={(e) => setProfileVisible(e.target.checked)}
-                className="mt-1 rounded border-[#e9e5dd] text-[#725c00] focus:ring-[#ffd84d]"
-              />
-              <span>
-                <span className="font-medium text-[#1c1b1b] block">
-                  Visible in teammate discovery
-                </span>
-                <span className="text-xs text-[#746e65]">
-                  Allow other verified PESU students to see your profile card in Discover. Your SRN is always hidden.
-                </span>
-              </span>
-            </label>
-
-            <label className="flex items-start gap-3 text-sm text-[#4d4634] cursor-pointer">
-              <input
-                type="checkbox"
-                checked={academyOptIn}
-                onChange={(e) => setAcademyOptIn(e.target.checked)}
-                className="mt-1 rounded border-[#e9e5dd] text-[#725c00] focus:ring-[#ffd84d]"
-              />
-              <span>
-                <span className="font-medium text-[#1c1b1b] block">
-                  Enable private PESU Academy announcements section
-                </span>
-                <span className="text-xs text-[#746e65]">
-                  Opt in to view your own private PESU Academy notices inside the Hackathons tab.
-                </span>
-              </span>
-            </label>
-          </div>
-        )}
-      </div>
-
-      {/* Single Primary Action */}
+      {/* Primary Action */}
       <div className="flex items-center justify-end gap-3">
         {!isInline && (
           <button
             type="button"
             onClick={onClose}
-            className="rounded-xl border border-[#e9e5dd] bg-[#faf8f2] px-4 py-2.5 text-sm font-medium text-[#4d4634] hover:bg-slate-50 cursor-pointer"
+            className="rounded-xl border border-[#e9e5dd] bg-white px-4 py-2.5 text-sm font-medium text-[#4d4634] hover:bg-[#f6f3eb] transition-colors duration-150 cursor-pointer"
           >
             Cancel
           </button>
@@ -1198,9 +780,10 @@ export const OnboardingAndProfileModal: React.FC<
         <button
           type="button"
           onClick={handleSave}
-          className="inline-flex items-center gap-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe07e] text-[#1a1a1a] text-xs font-bold px-6 py-2 rounded-xl shadow-xs active:scale-95 transition-all cursor-pointer"
+          className="inline-flex items-center gap-2 rounded-xl bg-[#ffd84d] hover:bg-[#ffe06b] active:scale-[0.98] border border-[#e5be35] text-[#1c1b1b] text-sm font-bold px-6 py-2.5 shadow-xs transition-all duration-150 cursor-pointer"
         >
-          <Check className="w-4 h-4 text-[#725c00]" /><span>Save Changes</span>
+          <Check className="w-4 h-4 text-[#1c1b1b]" />
+          <span>Save Changes</span>
         </button>
       </div>
     </div>
@@ -1211,7 +794,7 @@ export const OnboardingAndProfileModal: React.FC<
   }
 
   return (
-    <Modal onClose={onClose} title="Edit Student Profile">
+    <Modal onClose={onClose} title="Profile">
       {formContent}
     </Modal>
   );

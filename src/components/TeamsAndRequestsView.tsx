@@ -101,17 +101,17 @@ const REGISTRATION_STATUS_LABELS: Record<
   registration_in_progress: {
     label: 'Registration in Progress',
     badgeClass:
-      'bg-blue-50 dark:bg-blue-950/60 text-blue-800 dark:text-blue-300 border-blue-200 dark:border-blue-800',
+      'bg-[#fff3c9] text-[#725c00] border-[#f0d98c]',
   },
   registered: {
     label: 'Officially Registered',
     badgeClass:
-      'bg-[#e8f0fe] text-[#1a73e8] border-[#aecbfa]',
+      'bg-emerald-50 text-emerald-800 border-emerald-200',
   },
   registration_closed: {
     label: 'Registration Closed',
     badgeClass:
-      'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700',
+      'bg-[#f6f3f2] text-[#746e65] border-[#e9e5dd]',
   },
 };
 
